@@ -60,12 +60,18 @@ def write_profile(path, ranked):
 
 
 def main():
+    global N_LAYER, N_EXPERT
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("traces", nargs="*", help="routing traces from --dump-routing")
     ap.add_argument("--base", default=str(ROOT / "data" / "expert-profile.bin"), help="ranking to keep first")
     ap.add_argument("--no-base", action="store_true", help="rank by the traces only")
     ap.add_argument("--out", default=str(ROOT / "data" / "expert-profile.bin"))
+    # A derived (pruned) checkpoint has its own expert count: it writes LAYERS x EXPERTS pairs, and the shipped
+    # base profile describes the unpruned original, so such a model needs --no-base as well.
+    ap.add_argument("--layers", type=int, default=N_LAYER, help="model layers (default %(default)s)")
+    ap.add_argument("--experts", type=int, default=N_EXPERT, help="experts per layer (default %(default)s)")
     a = ap.parse_args()
+    N_LAYER, N_EXPERT = a.layers, a.experts
 
     ranked, seen = [], set()
 
@@ -88,7 +94,7 @@ def main():
     take((layer, e) for e in range(N_EXPERT) for layer in range(N_LAYER))   # the rest, across the layers
     write_profile(a.out, ranked)
     assert read_profile(a.out) == ranked, "the profile did not survive the round trip"
-    print(f"wrote {a.out}: {len(ranked)} ranked pairs ({n_base} from the base, {n_trace} from the traces, "
+    print(f"wrote {a.out}: {N_LAYER}x{N_EXPERT}, {len(ranked)} ranked pairs ({n_base} from the base, {n_trace} from the traces, "
           f"{len(ranked) - n_base - n_trace} filled in)")
 
 
