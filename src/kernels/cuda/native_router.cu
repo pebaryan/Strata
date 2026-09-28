@@ -41,29 +41,35 @@ __device__ __forceinline__ float warp_max(float value) {
     for (int mask = 16; mask; mask >>= 1) value = fmaxf(value, __shfl_xor_sync(0xffffffffu, value, mask, 32));
     return value;
 }
+// LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): upstream pinned 512 experts (32 lanes x 16 values) into this
+// kernel, and --native always turns this router on, so a pruned (256-expert) pack could not run at all.  The
+// warp layout now follows the artifact's expert count: 512 -> VEC 16, 256 -> VEC 8.
+template <int NEXP>
 __launch_bounds__(256, 1)
 __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ ids,
                       float* __restrict__ weights) {
+    static_assert(NEXP % 32 == 0, "the router's warp layout needs a multiple of 32 experts");
+    constexpr int VEC = NEXP / 32;
     // Preserve the pinned 32x8 block geometry; only row zero is active here.
     if (threadIdx.y != 0) return;
     const int lane = threadIdx.x;
-    float values[16];
+    float values[VEC];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) values[i] = logits[lane + i * 32];
+    for (int i = 0; i < VEC; ++i) values[i] = logits[lane + i * 32];
     __syncthreads();
     float maximum = -INFINITY;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) maximum = max(maximum, values[i]);
+    for (int i = 0; i < VEC; ++i) maximum = max(maximum, values[i]);
     maximum = warp_max(maximum);
     float sum = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < VEC; ++i) {
         values[i] = expf(values[i] - maximum);
         sum += values[i];
     }
     const float reciprocal = 1.0f / warp_sum(sum);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) {
+    for (int i = 0; i < VEC; ++i) {
         values[i] *= reciprocal;
         if (__isnanf(values[i])) values[i] = -FLT_MAX;
     }
@@ -72,7 +78,7 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
         float best = values[0];
         int expert = lane;
 #pragma unroll
-        for (int i = 1; i < 16; ++i) {
+        for (int i = 1; i < VEC; ++i) {
             if (values[i] > best) { best = values[i]; expert = lane + i * 32; }
         }
 #pragma unroll
@@ -105,12 +111,18 @@ bool overlap(const void* a, size_t an, const void* b, size_t bn) {
 }
 void native_router_set_enabled(bool value) { enabled.store(value, std::memory_order_relaxed); }
 bool native_router_enabled() { return enabled.load(std::memory_order_relaxed); }
-void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream) {
-    if (!stream || !valid(logits, 512 * 4) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4)
-        || overlap(logits, 512 * 4, ids, 10 * 4) || overlap(logits, 512 * 4, weights, 10 * 4)
+void native_router_top10(const float* logits, int32_t* ids, float* weights, int n_expert, void* stream) {
+    // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): the logits span scales with the expert count.
+    const size_t logits_bytes = (size_t) n_expert * 4;
+    if (!stream || !valid(logits, logits_bytes) || !valid(ids, 10 * 4) || !valid(weights, 10 * 4)
+        || overlap(logits, logits_bytes, ids, 10 * 4) || overlap(logits, logits_bytes, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
-    route<<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    if (n_expert == 256) {
+        route<256><<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    } else {
+        route<512><<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    }
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
 }

@@ -56,9 +56,12 @@ if(STRATA_ENABLE_CUDA)
     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
       continue()
     endif()
-    if(_base LESS 80)
+    # LOCAL PORT ATTEMPT (peb, 2026-09-28): upstream floor is 80 because of tf32 mma in the
+    # attention scorer and bf16 math. Lowered to 70 to enumerate what really fails on Volta.
+    # Revert to `LESS 80` if this experiment is abandoned.
+    if(_base LESS 70)
       message(FATAL_ERROR
-        "Strata needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
+        "Strata needs an NVIDIA GPU of compute capability 7.0 or newer, but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
     endif()
   endforeach()
@@ -215,6 +218,15 @@ if(STRATA_ENABLE_CUDA)
     src/kernels/cuda/native_qsa_indexer.cu
     src/kernels/cuda/native_qsa_score.cu
     PROPERTIES COMPILE_OPTIONS "--use_fast_math")
+
+  # LOCAL VOLTA PORT (peb, 2026-09-28): native_qsa_score.cu needs ldmatrix (sm_75+) and tf32
+  # m16n8k8 mma (sm_80+), neither of which exists on sm_70. It is an optional acceleration
+  # (--native-qsa, off by default), so for a 70-only build it is compiled out and the generic
+  # qsa.cu path serves instead. Replace with a Volta fp16-mma scorer to get the speed back.
+  if(CMAKE_CUDA_ARCHITECTURES MATCHES "70")
+    set_source_files_properties(src/kernels/cuda/native_qsa_score.cu
+      TARGET_DIRECTORY strata_kernels PROPERTIES HEADER_FILE_ONLY ON)
+  endif()
 
   set(STRATA_ORACLE_SOURCE_DIR "" CACHE PATH "Pinned llama.cpp source for independent CUDA parity tests")
   set(STRATA_ORACLE_BUILD_DIR "" CACHE PATH "Matching existing shared llama.cpp build")

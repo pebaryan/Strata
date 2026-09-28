@@ -56,14 +56,21 @@ DeviceInfo device_info(int ordinal) {
     check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
 
-    // The engine is written against sm_120.  Compiling for it is enforced by CMake; RUNNING on something else
-    // is caught here, because a binary can be carried to a machine with an older card and would otherwise
-    // silently take whatever path the driver chose.
-    if (d.cc_major != 12) {
+    // Upstream is written against sm_120 and refuses anything else here.
+    // LOCAL VOLTA PORT (peb, 2026-09-28): this build is compiled for sm_70, so accept cc 7.x and warn.
+    // sm_70 lacks tf32 mma, ldmatrix and bf16 tensor-core math, so its speed and numerics differ from
+    // the validated sm_120 path and must be measured, not assumed.
+    if (d.cc_major < 7) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) +
-                            "; Strata targets sm_120 (RTX 5000 series / Blackwell) only",
+                            "; this build needs compute capability 7.0 or newer",
                         -1);
+    }
+    if (d.cc_major != 12) {
+        std::fprintf(stderr,
+                     "strata: WARNING local Volta build: %s is sm_%d%d, not sm_120; speed and numerics "
+                     "are unvalidated on this architecture\n",
+                     d.name.c_str(), d.cc_major, d.cc_minor);
     }
     return d;
 }

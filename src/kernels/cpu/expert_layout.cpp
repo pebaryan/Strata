@@ -93,7 +93,23 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.max_blob = 0;
     std::string line;
     while (std::getline(in, line)) {
-        if (line.empty() || line[0] == '#') continue;
+        if (line.empty()) continue;
+        if (line[0] == '#') {
+            // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): the pack states its own expert count in this
+            // header, but the caller passes a default-constructed geometry (512) because this check runs
+            // before the model is opened.  Trust the file, or every pruned (256-expert) pack fails the
+            // contiguity check below.
+            const std::string key = "n_expert ";
+            const size_t at_key = line.find(key);
+            if (at_key != std::string::npos) {
+                int64_t n = 0;
+                for (size_t i = at_key + key.size(); i < line.size() && line[i] >= '0' && line[i] <= '9'; ++i) {
+                    n = n * 10 + (line[i] - '0');
+                }
+                if (n > 0) L.n_expert = n;
+            }
+            continue;
+        }
         std::istringstream ss(line);
         long long l = -1, gt = -1, dt = -1;
         unsigned long long off = 0, blob = 0, go = 0, uo = 0, dox = 0;
@@ -130,7 +146,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
         }
-        at += L.bytes[(size_t) l] * (uint64_t) n_expert;
+        at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
     }
     L.total = at;
     g_layout = L;

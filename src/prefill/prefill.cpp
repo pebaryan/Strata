@@ -59,7 +59,12 @@ namespace {
 
 using Clock = std::chrono::steady_clock;
 constexpr float EPS = 1e-6f;
-constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10, NE = 512;
+constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10;
+// LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): upstream compiled the artifact's expert count in as 512.
+// It sizes buffers AND drives the host-side expert loops (`host_res[l * NE + e]`, which is allocated as
+// g.n_layers * g.n_expert), so a pruned pack (256 experts) would both fail the geometry check below and
+// index past its own arrays.  Every NE site now resolves to the loaded layout's count.
+#define NE (strata::kernels::cpu::expert_layout().n_expert)
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
 inline int64_t MAXBLOB() { return (int64_t) strata::kernels::cpu::expert_layout().max_blob; }
@@ -1095,7 +1100,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     if (!wr || !wgi || !wsg || !wsu || !wsd) return false;
                     pt.mark(kPfRouter, cs);
                     if (!bf16_proj(m.gemm, wr, m.mixed_bf, m.logits, T, v.name("ffn_gate_inp.weight"), err)) return false;
-                    route(m.logits, m.ids, m.w, T, m.cs);
+                    route(m.logits, m.ids, m.w, T, (int) NE, m.cs);
                     // the shared expert and its scalar gate
                     if (!native_proj(m.gemm, wsg, m.mixed_h, m.sgate, T, v.name("ffn_gate_shexp.weight"), err)) return false;
                     if (!native_proj(m.gemm, wsu, m.mixed_h, m.sup, T, v.name("ffn_up_shexp.weight"), err)) return false;

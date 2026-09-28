@@ -201,31 +201,37 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
 }
 
 // ---------------------------------------------------------------- MoE
+// LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): upstream hardwired 512 experts (32 lanes x 16 values) into
+// this kernel.  The warp layout follows the expert count instead: 512 -> VEC 16, 256 -> VEC 8.  Same
+// reduction, same top-10, fewer values per lane.
+template <int NEXP>
 __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ wout,
                              int64_t T) {
+    static_assert(NEXP % 32 == 0, "the router's warp layout needs a multiple of 32 experts");
+    constexpr int VEC = NEXP / 32;
     const int64_t t = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (t >= T) return;
     const int lane = threadIdx.x & 31;
-    const float* lg = logits + t * 512;
-    float v[16];
+    const float* lg = logits + t * NEXP;
+    float v[VEC];
 #pragma unroll
-    for (int i = 0; i < 16; ++i) v[i] = lg[lane + i * 32];
+    for (int i = 0; i < VEC; ++i) v[i] = lg[lane + i * 32];
     float mx = -INFINITY;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) mx = fmaxf(mx, v[i]);
+    for (int i = 0; i < VEC; ++i) mx = fmaxf(mx, v[i]);
     mx = warp_max(mx);
     float sum = 0.0f;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) { v[i] = expf(v[i] - mx); sum += v[i]; }
+    for (int i = 0; i < VEC; ++i) { v[i] = expf(v[i] - mx); sum += v[i]; }
     const float rcp = 1.0f / warp_sum(sum);
 #pragma unroll
-    for (int i = 0; i < 16; ++i) { v[i] *= rcp; if (isnan(v[i])) v[i] = -FLT_MAX; }
+    for (int i = 0; i < VEC; ++i) { v[i] *= rcp; if (isnan(v[i])) v[i] = -FLT_MAX; }
     float selected = 0.0f, selected_sum = 0.0f;
     for (int rank = 0; rank < 10; ++rank) {
         float best = v[0];
         int ex = lane;
 #pragma unroll
-        for (int i = 1; i < 16; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
+        for (int i = 1; i < VEC; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
 #pragma unroll
         for (int m = 16; m; m >>= 1) {
             const float ob = __shfl_xor_sync(0xffffffffu, best, m);
@@ -455,8 +461,15 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
     check("gdn_recurrence");
 }
-void route(const float* logits, int32_t* ids, float* weights, int64_t T, void* stream) {
-    route_kernel<<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+void route(const float* logits, int32_t* ids, float* weights, int64_t T, int n_expert, void* stream) {
+    // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): the caller knows the artifact's expert count (512
+    // unpruned, 256 pruned); the kernel's warp layout is compiled per count.
+    const unsigned blocks = (unsigned) ((T + 7) / 8);
+    if (n_expert == 256) {
+        route_kernel<256><<<blocks, 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    } else {
+        route_kernel<512><<<blocks, 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    }
     check("route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {

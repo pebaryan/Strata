@@ -13,5 +13,5 @@ bool native_router_enabled();
 // computed probabilities select the lower expert index. All spans must be
 // four-byte aligned and outputs disjoint from each other and the input.
 // Requires a nonnull ordered CUDA stream. No allocation or synchronization.
-void native_router_top10(const float* logits, int32_t* ids, float* weights, void* stream);
+void native_router_top10(const float* logits, int32_t* ids, float* weights, int n_expert, void* stream);
 }

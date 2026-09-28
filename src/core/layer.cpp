@@ -363,11 +363,13 @@ if (!native_bf16_projections) f32_to_bf16_bulk(x, b.x_bf16, g.n_embd, stream);
 project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, g.n_expert, true, stream);
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 if (native_router_enabled()) {
-    if (g.n_expert != 512 || k != 10) {
-        err = v.name("router") + ": native router requires 512 experts and k=10";
+    // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): the kernel's warp layout is compiled per expert count
+    // (see native_router.cu), so a pruned 256-expert pack is accepted alongside the unpruned 512.
+    if ((g.n_expert != 512 && g.n_expert != 256) || k != 10) {
+        err = v.name("router") + ": native router requires 512 or 256 experts and k=10";
         return false;
     }
-    try { native_router_top10(b.logits, b.ids, b.weights, stream); }
+    try { native_router_top10(b.logits, b.ids, b.weights, (int) g.n_expert, stream); }
     catch (const std::exception& error) { err = v.name("router") + ": " + error.what(); return false; }
 } else router_top10(b.logits, 1, (int) g.n_expert, (int) k, b.ids, b.weights, stream);
 // ---- THE DOORBELL, AND IT IS THE WHOLE POINT OF THE PROTOCOL.  The routed experts' INPUT (`x`) and the

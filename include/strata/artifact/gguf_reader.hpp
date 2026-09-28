@@ -453,8 +453,11 @@ private:
 
 // ---- architecture guard (P1.S2). The engine is specialised to ONE model; anything else must be
 // refused with a precise error rather than silently mis-run.
+// experts = 0 means "accept the file's own count" (LOCAL PRUNED-MODEL SUPPORT, peb, 2026-09-28): the
+// pruned GSQ-RCO releases carry 256 of the base model's 512 experts, and the engine reads the real
+// count from the file anyway.  Every other field here still defines the architecture and is asserted.
 struct Qwen4ExpGuard {
-    uint32_t block_count = 48, hidden = 2560, experts = 512, experts_used = 10, head_count = 24,
+    uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 10, head_count = 24,
              head_count_kv = 2;
 };
 
@@ -477,6 +480,7 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
     for (const auto& r : reqs) {
         const MetaValue* v = g.get(r.key);
         if (!v) return std::string("missing ") + r.key;
+        if (r.want == 0) continue;   // 0 == "whatever the file says" (see Qwen4ExpGuard)
         if (v->u != r.want)
             return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
     }

@@ -1176,7 +1176,12 @@ int main(int argc, char** argv) {
         strata::kernels::mrope_table_set(d_mrope);
     }
     strata::kernels::ple_set_native_postops(o.native_ple_postops);
-    const strata::core::ModelGeometry g;
+    strata::core::ModelGeometry g;
+    // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): this geometry is default-constructed and nothing ever
+    // fills it in, which is invisible for the one model upstream targets (the defaults ARE that model).
+    // A pruned pack carries 256 of the base model's 512 experts, so take the real count from the loaded
+    // layout instead of the default.  block_count/hidden/heads are still asserted by the GGUF guard.
+    g.n_expert = strata::kernels::cpu::expert_layout().n_expert;
     const int64_t K = 10;
     // before session_init: every graph captured from here on has the vector's kernels where it applies
     std::string cvec_summary = "0";
