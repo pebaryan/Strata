@@ -2,9 +2,12 @@
 #include "strata/platform/direct_file.hpp"
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <mutex>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -185,12 +188,70 @@ void DirectFile::wake() {
 
 #else
 // ------------------------------------------------------------------------------------------------ POSIX
-// Phase L replaces this with io_uring. Until then a read completes inside `submit`, which is correct and
-// keeps the tree compiling on Linux (plan v0.3 section 5.1 rule 4).
+// Asynchronous reads without an async API: `submit` queues the request and returns immediately, a small pool
+// of reader threads runs the blocking O_DIRECT preads, and `wait` reaps the completions. Same contract the
+// Windows completion port gives, so PleReader's io_thread pipeline (up to `--ple-inflight` outstanding reads)
+// actually overlaps on Linux instead of degenerating to one read at a time: a budget SATA SSD answers ~2.6k
+// random 8 KB reads/s at depth 1 but ~21k at depth 64. (io_uring, plan v0.3 phase L, can replace the pool
+// later; it is not needed for the overlap.) Pool size: env STRATA_IO_THREADS, default 32.
 struct DirectFile::Impl {
+    struct Job {
+        uint64_t offset = 0;
+        void* buffer = nullptr;
+        uint32_t length = 0;
+        uint64_t tag = 0;
+    };
     int fd = -1;
     uint64_t size = 0;
-    std::deque<Completion> done;
+    std::deque<Completion> done;          // completed reads, guarded by `mu`
+    std::deque<Job> queue;                // queued by submit, not yet read
+    std::mutex mu;
+    std::condition_variable cv_work;      // readers: there is a job
+    std::condition_variable cv_done;      // wait(): a completion (or wake) may be ready
+    std::vector<std::thread> readers;
+    bool stopping = false;
+    int wakes = 0;                        // pending wake() packets
+
+    void read_loop() {
+        for (;;) {
+            Job j;
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv_work.wait(lk, [this] { return stopping || !queue.empty(); });
+                if (queue.empty()) return;    // only reachable once stopping
+                j = queue.front();
+                queue.pop_front();
+            }
+            const ssize_t got = pread(fd, j.buffer, j.length, (off_t) j.offset);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                done.push_back(Completion{j.tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
+            }
+            cv_done.notify_all();
+        }
+    }
+
+    void start_readers() {
+        int n = 32;
+        if (const char* e = std::getenv("STRATA_IO_THREADS")) {
+            const int v = std::atoi(e);
+            if (v > 0 && v <= 256) n = v;
+        }
+        for (int i = 0; i < n; ++i) readers.emplace_back([this] { read_loop(); });
+    }
+
+    void stop_readers() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stopping = true;
+        }
+        cv_work.notify_all();
+        for (std::thread& t : readers) {
+            if (t.joinable()) t.join();
+        }
+        readers.clear();
+        stopping = false;
+    }
 };
 
 DirectFile::DirectFile() : impl_(new Impl) {}
@@ -203,14 +264,19 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
+    impl_->start_readers();
     return true;
 }
 
 void DirectFile::close() {
+    impl_->stop_readers();
     if (impl_->fd >= 0) ::close(impl_->fd);
     impl_->fd = -1;
     impl_->size = 0;
+    std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->done.clear();
+    impl_->queue.clear();
+    impl_->wakes = 0;
 }
 
 bool DirectFile::is_open() const { return impl_->fd >= 0; }
@@ -221,14 +287,36 @@ bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t
         err = "DirectFile: unaligned request";
         return false;
     }
-    const ssize_t got = pread(impl_->fd, buffer, length, (off_t) offset);
-    impl_->done.push_back(Completion{tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->queue.push_back(Impl::Job{offset, buffer, length, tag});
+    }
+    impl_->cv_work.notify_one();
     return true;
 }
 
-void DirectFile::wake() {}   // reads complete inside submit; nothing ever blocks in wait
+void DirectFile::wake() {
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        ++impl_->wakes;
+    }
+    impl_->cv_done.notify_all();
+}
 
-int DirectFile::wait(Completion* out, int max, int) {
+int DirectFile::wait(Completion* out, int max, int timeout_ms) {
+    std::unique_lock<std::mutex> lk(impl_->mu);
+    if (max <= 0) return 0;
+    if (impl_->wakes > 0) {                  // deliver one wake packet, as the Windows port does
+        out[0] = Completion{WAKE_TAG, 0, true};
+        --impl_->wakes;
+        return 1;
+    }
+    const auto ready = [this] { return !impl_->done.empty() || impl_->wakes > 0; };
+    if (!ready()) {
+        if (timeout_ms < 0) impl_->cv_done.wait(lk, ready);
+        else if (timeout_ms > 0) impl_->cv_done.wait_for(lk, std::chrono::milliseconds(timeout_ms), ready);
+    }
+    if (impl_->wakes > 0)    { out[0] = Completion{WAKE_TAG, 0, true}; --impl_->wakes; return 1; }
     int n = 0;
     while (n < max && !impl_->done.empty()) {
         out[n++] = impl_->done.front();
