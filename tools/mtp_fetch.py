@@ -23,6 +23,21 @@ REPO = "https://huggingface.co/Qwen/Qwen3.8-Flash-Next/resolve/main/"
 DTYPE_BYTES = {"BF16": 2, "F16": 2, "F32": 4, "F8_E4M3": 1, "I64": 8, "I32": 4}
 
 
+# LOCAL (peb, 2026-09-28): this box has no working IPv6 and huggingface.co publishes CloudFront AAAA
+# records first, so urllib resolves to a dead route and dies with "Errno 113 No route to host" while curl
+# (which falls back to IPv4) works.  Pin this tool's name resolution to IPv4.
+import socket as _socket
+
+_original_getaddrinfo = _socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(*args, **kwargs):
+    return [info for info in _original_getaddrinfo(*args, **kwargs) if info[0] == _socket.AF_INET]
+
+
+_socket.getaddrinfo = _ipv4_getaddrinfo
+
+
 def get(url, start=None, end=None, retries=4):
     for attempt in range(retries):
         try:
