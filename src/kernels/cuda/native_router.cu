@@ -124,6 +124,11 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, int 
         || overlap(logits, logits_bytes, ids, 10 * 4) || overlap(logits, logits_bytes, weights, 10 * 4)
         || overlap(ids, 10 * 4, weights, 10 * 4))
         throw std::invalid_argument("native router requires a stream, aligned spans, and disjoint outputs");
+    // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-29): a count with no layout used to fall through to the 512-expert
+    // kernel, which then read past the caller's logits and returned plausible junk with no error.  Two layouts
+    // exist (512 -> 16 values per lane, 256 -> 8); anything else is refused, like every other bad argument here.
+    if (n_expert != 512 && n_expert != 256)
+        throw std::invalid_argument("native router has no layout for this expert count (512 or 256)");
     if (n_expert == 256) {
         route<256><<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
     } else {
@@ -140,6 +145,10 @@ void native_router_top10_multi(const float* logits, int32_t* ids, float* weights
     if (!stream || n_tok < 1 || !valid(logits, logits_bytes) || !valid(ids, (size_t) n_tok * 10 * 4) ||
         !valid(weights, (size_t) n_tok * 10 * 4))
         throw std::invalid_argument("native router (multi) requires a stream and aligned [n,n_expert]/[n,10] buffers");
+    // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-29): same refusal as the single-row entry - this path used to
+    // validate [n,512] and launch the 512 kernel for ANY count, so a pruned pack's batch read past its logits.
+    if (n_expert != 512 && n_expert != 256)
+        throw std::invalid_argument("native router (multi) has no layout for this expert count (512 or 256)");
     if (n_expert == 256) {
         route<256><<<(unsigned) n_tok, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
     } else {
