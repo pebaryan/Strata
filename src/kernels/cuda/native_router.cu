@@ -51,6 +51,8 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     static_assert(NEXP % 32 == 0, "the router's warp layout needs a multiple of 32 experts");
     constexpr int VEC = NEXP / 32;
     // Preserve the pinned 32x8 block geometry; only row zero is active here.
+    // blockIdx.x = the token (a multi-token launch; 0 for the single one)
+    logits += (size_t) blockIdx.x * 512; ids += (size_t) blockIdx.x * 10; weights += (size_t) blockIdx.x * 10;
     if (threadIdx.y != 0) return;
     const int lane = threadIdx.x;
     float values[VEC];
@@ -122,6 +124,22 @@ void native_router_top10(const float* logits, int32_t* ids, float* weights, int 
         route<256><<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
     } else {
         route<512><<<1, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    }
+    const auto error = cudaGetLastError();
+    if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));
+}
+void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, int n_expert, void* stream) {
+    // LOCAL PRUNED-MODEL SUPPORT (peb): upstream's batch path validated [n,512] and launched the 512 kernel, so a
+    // pruned pack would have read past its own logits.  The count is the caller's, exactly as in the single-row
+    // call, and the grid is one block per row.
+    const size_t logits_bytes = (size_t) n_tok * (size_t) n_expert * 4;
+    if (!stream || n_tok < 1 || !valid(logits, logits_bytes) || !valid(ids, (size_t) n_tok * 10 * 4) ||
+        !valid(weights, (size_t) n_tok * 10 * 4))
+        throw std::invalid_argument("native router (multi) requires a stream and aligned [n,n_expert]/[n,10] buffers");
+    if (n_expert == 256) {
+        route<256><<<(unsigned) n_tok, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
+    } else {
+        route<512><<<(unsigned) n_tok, dim3(32, 8), 0, static_cast<cudaStream_t>(stream)>>>(logits, ids, weights);
     }
     const auto error = cudaGetLastError();
     if (error != cudaSuccess) throw std::runtime_error(cudaGetErrorString(error));

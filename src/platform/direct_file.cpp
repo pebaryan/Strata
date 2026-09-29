@@ -1,6 +1,7 @@
 // src/platform/direct_file.cpp - see include/strata/platform/direct_file.hpp.
 #include "strata/platform/direct_file.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -45,6 +46,26 @@ void DirectFile::free_aligned(void* p) {
 #endif
 }
 
+namespace {
+/// A queued read: `submit` only queues it; the pool's threads issue it (perf-review C-4 / F-2).  One thread
+/// issuing every read was the limit of the n-gram table's prompt reads: ~12 us of kernel time per read, ~80K
+/// reads/s, while an NVMe drive serves several times that at depth.
+struct Pending {
+    uint64_t offset;
+    void* buffer;
+    uint32_t length;
+    uint64_t tag;
+};
+
+/// The number of issuing threads: STRATA_IO_THREADS, else 4 (Windows: overlapped submits) / 16 (Linux: each
+/// thread does one blocking pread, so the thread count is the queue depth).
+int io_threads(int dflt) {
+    const char* v = std::getenv("STRATA_IO_THREADS");
+    const int n = v ? std::atoi(v) : dflt;
+    return std::clamp(n, 1, 64);
+}
+}  // namespace
+
 #if defined(_WIN32)
 // ------------------------------------------------------------------------------------------------ Windows
 namespace {
@@ -60,9 +81,14 @@ struct DirectFile::Impl {
     HANDLE file = INVALID_HANDLE_VALUE;
     HANDLE port = nullptr;
     uint64_t size = 0;
+    std::mutex mu;                      // everything below
     std::deque<Req*> free_reqs;
     std::vector<Req*> all_reqs;
-    std::deque<Completion> immediate;   // requests that failed after being counted as queued
+    std::deque<Completion> immediate;   // requests that completed without a port packet (EOF) or failed
+    std::deque<Pending> queue;          // submitted, not yet issued
+    std::condition_variable cv;
+    bool stop = false;
+    std::vector<std::thread> pool;
 
     Req* take() {
         if (free_reqs.empty()) {
@@ -73,6 +99,52 @@ struct DirectFile::Impl {
         Req* r = free_reqs.front();
         free_reqs.pop_front();
         return r;
+    }
+
+    void issue(const Pending& p) {
+        Req* r;
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            r = take();
+        }
+        std::memset(&r->ov, 0, sizeof r->ov);
+        r->ov.Offset = (DWORD) (p.offset & 0xFFFFFFFFull);
+        r->ov.OffsetHigh = (DWORD) (p.offset >> 32);
+        r->tag = p.tag;
+        if (!ReadFile(file, p.buffer, p.length, nullptr, &r->ov)) {
+            const DWORD e = GetLastError();
+            if (e != ERROR_IO_PENDING) {
+                std::lock_guard<std::mutex> lk(mu);
+                free_reqs.push_back(r);
+                // at or past end of file: a zero-byte completion; anything else: a failed one
+                immediate.push_back(Completion{p.tag, 0, e == ERROR_HANDLE_EOF});
+                PostQueuedCompletionStatus(port, 0, 0, nullptr);   // wake a waiter to collect it
+            }
+        }
+    }
+
+    void worker() {
+        std::unique_lock<std::mutex> lk(mu);
+        for (;;) {
+            cv.wait(lk, [&] { return stop || !queue.empty(); });
+            if (stop && queue.empty()) return;
+            const Pending p = queue.front();
+            queue.pop_front();
+            lk.unlock();
+            issue(p);
+            lk.lock();
+        }
+    }
+
+    void stop_pool() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop = true;
+        }
+        cv.notify_all();
+        for (std::thread& t : pool) t.join();
+        pool.clear();
+        stop = false;
     }
 };
 
@@ -109,18 +181,22 @@ bool DirectFile::open(const std::string& path, std::string& err) {
         close();
         return false;
     }
-    // Completions of reads that finish synchronously must still be queued to the port, so every submit
-    // produces exactly one packet and `wait` is the only completion path.
+    // Completions of reads that finish synchronously are still queued to the port, so every issued read
+    // produces exactly one packet; `wait` is the only completion path.
+    const int n = io_threads(4);
+    for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }
 
 void DirectFile::close() {
+    impl_->stop_pool();
     if (impl_->port != nullptr) CloseHandle(impl_->port);
     if (impl_->file != INVALID_HANDLE_VALUE) CloseHandle(impl_->file);
     impl_->port = nullptr;
     impl_->file = INVALID_HANDLE_VALUE;
     impl_->size = 0;
     impl_->immediate.clear();
+    impl_->queue.clear();
 }
 
 bool DirectFile::is_open() const { return impl_->file != INVALID_HANDLE_VALUE; }
@@ -132,31 +208,22 @@ bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t
         err = "DirectFile: unaligned request";
         return false;
     }
-    Req* r = impl_->take();
-    std::memset(&r->ov, 0, sizeof r->ov);
-    r->ov.Offset = (DWORD) (offset & 0xFFFFFFFFull);
-    r->ov.OffsetHigh = (DWORD) (offset >> 32);
-    r->tag = tag;
-    if (!ReadFile(impl_->file, buffer, length, nullptr, &r->ov)) {
-        const DWORD e = GetLastError();
-        if (e != ERROR_IO_PENDING) {
-            impl_->free_reqs.push_back(r);
-            if (e == ERROR_HANDLE_EOF) {           // at or past end of file: a zero-byte completion
-                impl_->immediate.push_back(Completion{tag, 0, true});
-                return true;
-            }
-            err = "DirectFile: ReadFile failed (error " + std::to_string(e) + ")";
-            return false;
-        }
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        impl_->queue.push_back(Pending{offset, buffer, length, tag});
     }
+    impl_->cv.notify_one();
     return true;
 }
 
 int DirectFile::wait(Completion* out, int max, int timeout_ms) {
     int n = 0;
-    while (n < max && !impl_->immediate.empty()) {
-        out[n++] = impl_->immediate.front();
-        impl_->immediate.pop_front();
+    {
+        std::lock_guard<std::mutex> lk(impl_->mu);
+        while (n < max && !impl_->immediate.empty()) {
+            out[n++] = impl_->immediate.front();
+            impl_->immediate.pop_front();
+        }
     }
     if (n == max || !is_open()) return n;
     OVERLAPPED_ENTRY entries[64];
@@ -164,9 +231,14 @@ int DirectFile::wait(Completion* out, int max, int timeout_ms) {
     ULONG got = 0;
     const DWORD t = timeout_ms < 0 ? INFINITE : (DWORD) timeout_ms;
     if (!GetQueuedCompletionStatusEx(impl_->port, entries, want, &got, n > 0 ? 0 : t, FALSE)) return n;
+    std::lock_guard<std::mutex> lk(impl_->mu);
     for (ULONG i = 0; i < got; ++i) {
-        if (entries[i].lpOverlapped == nullptr) {          // a wake() packet, not a read
-            out[n++] = Completion{WAKE_TAG, 0, true};
+        if (entries[i].lpOverlapped == nullptr) {          // a wake() packet (or an immediate completion's nudge)
+            while (n < max && !impl_->immediate.empty()) {
+                out[n++] = impl_->immediate.front();
+                impl_->immediate.pop_front();
+            }
+            if (n < max) out[n++] = Completion{WAKE_TAG, 0, true};
             continue;
         }
         Req* r = (Req*) entries[i].lpOverlapped;
@@ -188,12 +260,9 @@ void DirectFile::wake() {
 
 #else
 // ------------------------------------------------------------------------------------------------ POSIX
-// Asynchronous reads without an async API: `submit` queues the request and returns immediately, a small pool
-// of reader threads runs the blocking O_DIRECT preads, and `wait` reaps the completions. Same contract the
-// Windows completion port gives, so PleReader's io_thread pipeline (up to `--ple-inflight` outstanding reads)
-// actually overlaps on Linux instead of degenerating to one read at a time: a budget SATA SSD answers ~2.6k
-// random 8 KB reads/s at depth 1 but ~21k at depth 64. (io_uring, plan v0.3 phase L, can replace the pool
-// later; it is not needed for the overlap.) Pool size: env STRATA_IO_THREADS, default 32.
+// perf-review F-2: a pool of threads, each doing blocking O_DIRECT preads, so reads run in parallel (the thread
+// count is the queue depth).  It replaced one synchronous pread inside `submit`, which read the n-gram table's
+// rows one at a time.
 struct DirectFile::Impl {
     struct Job {
         uint64_t offset = 0;
@@ -203,54 +272,37 @@ struct DirectFile::Impl {
     };
     int fd = -1;
     uint64_t size = 0;
-    std::deque<Completion> done;          // completed reads, guarded by `mu`
-    std::deque<Job> queue;                // queued by submit, not yet read
     std::mutex mu;
-    std::condition_variable cv_work;      // readers: there is a job
-    std::condition_variable cv_done;      // wait(): a completion (or wake) may be ready
-    std::vector<std::thread> readers;
-    bool stopping = false;
-    int wakes = 0;                        // pending wake() packets
+    std::condition_variable cv_work, cv_done;
+    std::deque<Pending> queue;
+    std::deque<Completion> done;
+    bool stop = false;
+    std::vector<std::thread> pool;
 
-    void read_loop() {
+    void worker() {
+        std::unique_lock<std::mutex> lk(mu);
         for (;;) {
-            Job j;
-            {
-                std::unique_lock<std::mutex> lk(mu);
-                cv_work.wait(lk, [this] { return stopping || !queue.empty(); });
-                if (queue.empty()) return;    // only reachable once stopping
-                j = queue.front();
-                queue.pop_front();
-            }
-            const ssize_t got = pread(fd, j.buffer, j.length, (off_t) j.offset);
-            {
-                std::lock_guard<std::mutex> lk(mu);
-                done.push_back(Completion{j.tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
-            }
+            cv_work.wait(lk, [&] { return stop || !queue.empty(); });
+            if (stop && queue.empty()) return;
+            const Pending p = queue.front();
+            queue.pop_front();
+            lk.unlock();
+            const ssize_t got = pread(fd, p.buffer, p.length, (off_t) p.offset);
+            lk.lock();
+            done.push_back(Completion{p.tag, got < 0 ? 0u : (uint32_t) got, got >= 0});
             cv_done.notify_all();
         }
     }
 
-    void start_readers() {
-        int n = 32;
-        if (const char* e = std::getenv("STRATA_IO_THREADS")) {
-            const int v = std::atoi(e);
-            if (v > 0 && v <= 256) n = v;
-        }
-        for (int i = 0; i < n; ++i) readers.emplace_back([this] { read_loop(); });
-    }
-
-    void stop_readers() {
+    void stop_pool() {
         {
             std::lock_guard<std::mutex> lk(mu);
-            stopping = true;
+            stop = true;
         }
         cv_work.notify_all();
-        for (std::thread& t : readers) {
-            if (t.joinable()) t.join();
-        }
-        readers.clear();
-        stopping = false;
+        for (std::thread& t : pool) t.join();
+        pool.clear();
+        stop = false;
     }
 };
 
@@ -264,19 +316,19 @@ bool DirectFile::open(const std::string& path, std::string& err) {
     struct stat st;
     if (fstat(impl_->fd, &st) != 0) { err = "DirectFile: cannot size " + path; close(); return false; }
     impl_->size = (uint64_t) st.st_size;
-    impl_->start_readers();
+    const int n = io_threads(16);
+    for (int i = 0; i < n; ++i) impl_->pool.emplace_back([this] { impl_->worker(); });
     return true;
 }
 
 void DirectFile::close() {
-    impl_->stop_readers();
+    impl_->stop_pool();
     if (impl_->fd >= 0) ::close(impl_->fd);
     impl_->fd = -1;
     impl_->size = 0;
     std::lock_guard<std::mutex> lk(impl_->mu);
     impl_->done.clear();
     impl_->queue.clear();
-    impl_->wakes = 0;
 }
 
 bool DirectFile::is_open() const { return impl_->fd >= 0; }
@@ -289,34 +341,25 @@ bool DirectFile::submit(uint64_t offset, void* buffer, uint32_t length, uint64_t
     }
     {
         std::lock_guard<std::mutex> lk(impl_->mu);
-        impl_->queue.push_back(Impl::Job{offset, buffer, length, tag});
+        impl_->queue.push_back(Pending{offset, buffer, length, tag});
     }
     impl_->cv_work.notify_one();
     return true;
 }
 
 void DirectFile::wake() {
-    {
-        std::lock_guard<std::mutex> lk(impl_->mu);
-        ++impl_->wakes;
-    }
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->done.push_back(Completion{WAKE_TAG, 0, true});
     impl_->cv_done.notify_all();
 }
 
 int DirectFile::wait(Completion* out, int max, int timeout_ms) {
     std::unique_lock<std::mutex> lk(impl_->mu);
-    if (max <= 0) return 0;
-    if (impl_->wakes > 0) {                  // deliver one wake packet, as the Windows port does
-        out[0] = Completion{WAKE_TAG, 0, true};
-        --impl_->wakes;
-        return 1;
-    }
-    const auto ready = [this] { return !impl_->done.empty() || impl_->wakes > 0; };
-    if (!ready()) {
+    if (impl_->done.empty() && timeout_ms != 0) {
+        auto ready = [&] { return !impl_->done.empty(); };
         if (timeout_ms < 0) impl_->cv_done.wait(lk, ready);
-        else if (timeout_ms > 0) impl_->cv_done.wait_for(lk, std::chrono::milliseconds(timeout_ms), ready);
+        else impl_->cv_done.wait_for(lk, std::chrono::milliseconds(timeout_ms), ready);
     }
-    if (impl_->wakes > 0)    { out[0] = Completion{WAKE_TAG, 0, true}; --impl_->wakes; return 1; }
     int n = 0;
     while (n < max && !impl_->done.empty()) {
         out[n++] = impl_->done.front();

@@ -4,33 +4,47 @@ The technical side of Strata: every measured number, the API, images, all settin
 New here? Start with the [README](../README.md) - it has everything you need to install and use it.
 
 > **On this page:** [Speed](#speed-measured) · [Other GPUs](#other-gpus-estimated) · [Which model?](#which-model) ·
-> [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) · [Images](#images-vision) ·
+> [Requirements](#before-you-start) · [Windows](#windows) · [Linux](#linux) · [API](#using-it) ·
+> [MCP tools](#tools-from-mcp-servers) · [Images](#images-vision) ·
 > [Troubleshooting](#troubleshooting) · [How it works](#how-it-works)
 
 ---
 
 ## Speed (measured)
 
-RTX 5070 **12 GB**, Ryzen 5 7600 (6 cores), 64 GB DDR5-5200, Windows. One code-agent prompt per length, 256 generated
-tokens, MTP speculative decoding on. "262K" is the model's full context window (a 259,943-token prompt).
+RTX 5070 **12 GB**, Ryzen 5 7600 (6 cores), 64 GB DDR5-5200, Windows, engine 0.1.22 (prompts) / 0.1.14 (output) with the settings setup writes
+(`--prefill auto`, 8-bit KV above 4K, KV streaming from 64K). One code-agent prompt per length, 256 generated tokens,
+MTP speculative decoding on. "262K" is the model's full context window (a 259,943-token prompt). The IQ2_XS row was
+measured with Swift 1.5's IQ2_XS, which runs at the original's speed.
 
 ### Prompt processing (tokens/s)
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Q2_0** | 389 | 539 | 571 | 561 | 543 | 496 |
-| **IQ2_XS** | 332 | 463 | 495 | 486 | 472 | 437 |
-| **IQ3_XXS** | 285 | 410 | 435 | 427 | 414 | - |
-| **IQ3_S** | 260 | 374 | 397 | - | 378 | - |
+| **Q2_0** | 519 | 1,226 | 1,844 | 1,836 | 1,682 | 1,304 |
+| **IQ2_XS** | 524 | 1,196 | 1,799 | 1,611 | 1,495 | 1,181* |
+| **IQ3_XXS** | 472 | 974 | 1,555 | 1,449 | 1,386 | - |
+| **IQ3_S** | 419 | 893 | 1,499 | 1,285 | 1,245 | - |
+| **Coder** | 660 | 1,522 | 1,871 | 1,938 | 1,779 | 1,034** |
+
+Engine 0.1.22 (the prompt path of 0.1.23 is the same); `bench/results/2026-09-29-speed-0122`. \* measured with
+images on (the image encoder's VRAM reserve leaves fewer experts cached). \*\* not measured again: 0.1.14.
 
 ### Output (tokens/s)
 
 | Model | 1K | 4K | 32K | 64K | 128K | 262K |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **Q2_0** | 88.7 | 94.6 | 87.5 | 76.4 | 65.1 | 56.3 |
-| **IQ2_XS** | 82.0 | 78.0 | 65.3 | 63.7 | 52.0 | 48.0 |
-| **IQ3_XXS** | 64.6 | 65.6 | 57.3 | 54.4 | 44.8 | - |
-| **IQ3_S** | 51.2 | 54.4 | 51.1 | - | 42.2 | - |
+| **Q2_0** | 84.3 | 90.3 | 73.6 | 69.0 | 67.2 | 60.3 |
+| **IQ2_XS** | 74.4 | 73.8 | 71.5 | 64.3 | 59.8 | 52.8 |
+| **IQ3_XXS** | 60.3 | 62.1 | 51.4 | 50.0 | 45.8 | - |
+| **IQ3_S** | 51.5 | 51.6 | 48.2 | 48.8 | 40.5 | - |
+| **Coder** | 53.3 | 50.6 | 53.3 | 50.8 | 44.0 | 42.8 |
+
+Output speed depends on the text as well: speculative decoding runs faster when more of the drafted tokens are
+accepted, so a different answer to the same prompt moves it by several percent. Run back to back on the 4K prompt,
+0.1.14 writes 88.5 tokens/s and 0.1.12 85.7. The numbers before 0.1.13 (prompts about half as fast):
+[`bench/results/2026-09-24-final`](../bench/results/2026-09-24-final/matrix.md); these:
+[`bench/results/2026-09-28-speed-0114`](../bench/results/2026-09-28-speed-0114/README.md).
 
 IQ3_XXS and IQ3_S at 262K are not measured: with their 43 / 50 GB of experts, a 260K-token context brings a 64 GB PC
 to its memory limit. Use up to 128K with them on 64 GB (setup caps it). IQ3_S (engine 0.1.4 or newer) is only published
@@ -47,8 +61,8 @@ halves the KV cache's memory with a Hadamard rotation before 4-bit rounding (PR 
 is measurably less precise on long documents (perplexity +8-12%; needle tests still pass). 8-bit stays the default.
 Details: [`bench/results/2026-09-27-kv-q4`](../bench/results/2026-09-27-kv-q4/README.md).
 
-Time to first token is prompt length / prompt speed: about 7 s at 4K, 55 s at 32K, 4 minutes at 128K and 9 minutes at
-262K (engine 0.1.12; long prompts are about twice as fast since 0.1.13, below).
+Time to first token is prompt length / prompt speed: with Q2_0 about 4 s at 4K, 25 s at 32K, under 2 minutes at 128K
+and 4.5 minutes at 262K (engine 0.1.13 made long prompts about twice as fast, below).
 
 **Faster prompts (engine 0.1.13):** the prompt is read in chunks of up to 8,192 tokens instead of 2,048 (`--prefill
 auto`: the largest chunk whose buffers fit in the expert-cache slots it borrows, and a request borrows only what its
@@ -66,6 +80,8 @@ switch to `--prefill auto` the next time START-HERE / setup.sh starts them. The 
 
 Not measured - estimated from the runs above (same CPU and 64 GB RAM): the GPU part scaled by memory bandwidth, the CPU
 part by how many more experts the card's VRAM holds. Treat as **±20%**. Numbers are *prompt / output* tokens/s.
+The prompt figures predate engine 0.1.13, which about doubled prompt speed on the measured card; how much of that a
+card gains depends on its PCIe link (the experts stream over it), so they are still the older estimates.
 
 | GPU | Model | 1K | 4K | 32K | 64K | 128K | 262K |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -92,7 +108,24 @@ of [Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next).
 | **IQ2_XS** | 68 GB | ~36 GB experts + ~6 GB | close to Q2_0 | a bit better |
 | **IQ3_XXS** | 76 GB | ~43 GB experts + ~6 GB | slower (more CPU work) | best |
 
-With 64 GB of RAM all three fit (close the browser for IQ3_XXS, and keep its context at 128K or less). With 48 GB only Q2_0 / IQ2_XS may fit. 32 GB is not enough.
+With 64 GB of RAM all three fit (close the browser for IQ3_XXS, and keep its context at 128K or less). With 48 GB only Q2_0 / IQ2_XS may fit. With 32 GB: the Coder (below).
+
+### Or: the Coder (half the experts, for code)
+
+**[Qwen3.8-Flash-Next GSQ-RCO Coder](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)** is
+ISTA-DASLab's expert-pruned release: 256 of each layer's 512 experts are kept (still 10 active per token), chosen with
+RCO on code, agentic and vision calibration data; its authors report 91.3% of the full model's SWE-bench Verified and
+98.7% of LiveCodeBench v6. One size, named IQ1_M for its 1.89 bits per *original* parameter; the kept experts are
+stored like IQ3_S (IQ2_S-IQ4_XS gate/up, IQ4_NL/Q2_0 down). Shard 1 is 29.6 GB (experts: 23 GB of RAM), so it runs
+on **32 GB of RAM**, and at 262K on 64 GB. Its shard 2 and its vision encoder are the original's files: with the
+original installed, setup downloads only shard 1. Strata ships its expert profile (`data/expert-profile-coder.bin`,
+the shipped ranking mapped onto the kept experts through the release's `rco-allocation.txt`: 72% of the expert
+reads hit the GPU on a 12 GB card). Images work; the experimental speed projection loads and runs on it (it was made
+for the full model).
+
+```
+START-HERE.bat --setup --family coder
+```
 
 ### Or: Swift 1.5 (a fine-tune that thinks shorter)
 
@@ -124,7 +157,11 @@ You need **only an NVIDIA driver** (version 580 or newer; update it with the NVI
 | Disk | ~70-80 GB free for the model, ~6 GB for the MTP layer (+1 GB with images). **Q2_0 on an AVX-512 CPU** also writes a one-time ~40 GB copy of its experts for the fast CPU kernel. An NVMe SSD is strongly recommended. |
 | OS | Windows 10/11, or Linux (Ubuntu 22.04/24.04 get everything installed automatically). |
 
-What the first start installs, all inside this folder (`.venv/`, `engine/`, `third_party/`, `models/`, `packs/`, `mtp/`):
+What the first start installs: in this folder `.venv/`, `engine/` and `third_party/`; the model files (`models/`,
+`packs/`, `mtp/`, 70-120 GB) in **`Strata-data` next to this folder**, so a new copy of Strata (an update unzipped
+elsewhere) finds them and sets itself up the same way. The place is remembered per user (`%APPDATA%\Strata\settings.json`,
+`~/.config/strata/settings.json`); `--data-dir` chooses another. Installs from before 0.1.16 are moved there by the next
+start (a rename on the same drive; files on another drive are used where they are).
 Python 3.12 if you have none (for your user account, no admin), a private Python environment, NVIDIA's CUDA libraries
 (from pip, ~0.4 GB), the ready-made Strata engine for RTX 30/40/50, the model and the MTP draft layer. If no
 ready-made engine fits your PC, it offers to install the build tools (Visual Studio Build Tools + CUDA Toolkit on
@@ -160,12 +197,49 @@ downloaded again. Closing the window stops the model.
 
 ```
 START-HERE.bat --setup                          install another model, or change context / images
+SETUP.bat                                       the same (double-click it)
 START-HERE.bat --model IQ2_XS --context 32768 --vision yes --yes     no questions
 START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have
+START-HERE.bat --data-dir E:\Strata-data         keep the model files somewhere else
 START-HERE.bat --port 8081                      another port
+START-HERE.bat --gpu 1                          another GPU (numbered as nvidia-smi; setup picks the one with the most VRAM)
+START-HERE.bat --calibrate                      tune the engine for this PC (about 5-10 minutes), then start
 ```
 
 With more than one model installed, it asks which one to start. `run-<model>.bat` starts a model directly.
+
+**Tuning for your PC (`--calibrate`, engine 0.1.19).** Three engine settings depend on the PC more than on the model:
+- the share of the experts missing from VRAM that are copied to the GPU instead of computed by the CPU
+  (`--pcie-frac`: a fast PCIe link and a slower CPU want more, a laptop's narrower link less);
+- how sure the draft layer must be to add another guess to a check (`--spec-min-p`);
+- how many CPU threads compute experts (`--pool-workers`: on CPUs with efficiency cores, fewer can be faster).
+
+The defaults were measured on a Ryzen 5 7600 with an RTX 5070. Setup offers to measure them on your PC after an
+install; `START-HERE.bat --calibrate` (Linux: `./setup.sh --calibrate`) does it any time. It measures the output
+speed with each setting and keeps one only when it is more than 3% faster. The result is remembered per PC and model
+(in the settings file next to the data folder's record), so updates keep it.
+
+### Running it at startup (Task Scheduler)
+
+To have the model up at logon, people start the serve from **Task Scheduler** (or a service). Beware: Windows
+throttles such contexts, and the model's ~40 GB expert load then crawls at **~0.05 GiB/s (13-14 minutes)**
+instead of **~1.4-1.5 GiB/s (~35 seconds)** - a 24x slower start. Measured on an RTX 5070 Ti + Ryzen 7 9800X3D
++ NVMe, same binary, same args, same cache state:
+
+| How the serve starts | Expert load |
+| --- | ---: |
+| Double-click / terminal / SSH | 1.42-1.52 GiB/s (~35 s) |
+| Task Scheduler with its defaults | 0.05 GiB/s (821-841 s) |
+| Task Scheduler with the two settings below | 1.42 GiB/s (35 s) |
+
+In the task's properties set both of these (the defaults are the opposite):
+
+- **Priority level: Normal** (Options tab; the default is Below normal), and
+- **Run with highest privileges** (General tab; without it the task runs with a limited user token - which
+  also strips `SeLockMemoryPrivilege`, the privilege Windows large pages need).
+
+(Both were changed at once, so the isolated effect of each is not measured.) If the model still starts
+slowly, the engine prints a hint under its `loaded ... GiB at ...` line naming this cause.
 
 ### Chat in the terminal (optional)
 
@@ -205,9 +279,13 @@ The server listens on `http://127.0.0.1:8080` (change with `--port` in setup, or
 | --- | --- |
 | OpenAI Chat Completions (stream and non-stream, tools) | `POST /v1/chat/completions` |
 | Anthropic Messages (stream and non-stream, tools) | `POST /v1/messages` |
-| Model list / health | `GET /v1/models`, `GET /health` |
-| What the model is doing right now | `GET /status` |
+| Model list / health | `GET /v1/models`, `GET /models`, `GET /health` |
+| Model properties | `GET /props` (also accepts `?model=<loaded-model-id>`) |
+| What the model is doing right now | `GET /status`, `GET /slots` (single slot, busy or idle) |
 | Everything the Monitor tab shows (engine, live state, last requests, hardware) | `GET /metrics` |
+| The MCP servers, their state and tools ([below](#tools-from-mcp-servers)) | `GET /mcp` |
+
+`/models` and `/v1/models` list only the loaded model, with its context limit and input modalities. `/props` exposes the original chat template, context limit, configured generation defaults (shared settings take precedence), model path and engine version when available. Context means the full engine context, not the resident KV window. `n_predict: -1` means no fixed output cap. Unconfigured sampling fields are omitted. `autoload` has no effect; an unknown `model` returns 404. These metadata endpoints and `/slots` require the API key when one is configured. They do not load, unload or restart models.
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d '{
@@ -239,6 +317,9 @@ print(r.choices[0].message.content)
   15 s, and `GET /status` says what it is doing (`reading the prompt`, `answering`, tokens so far). Closing the
   connection or pressing stop in your app really stops the model, so the next request starts at once.
 - **Chat apps.** Any app with an "OpenAI-compatible" provider works: base URL `http://127.0.0.1:8080/v1`, any API key.
+- **Claude Code** (Strata 0.1.17 or newer): set `ANTHROPIC_BASE_URL=http://127.0.0.1:8080` and
+  `ANTHROPIC_MODEL` to a Claude model name it knows (it refuses names it doesn't; Strata ignores the name), plus any
+  `ANTHROPIC_AUTH_TOKEN` (or your `api_key`, if you set one).
 - **Context.** Chosen in setup (8K-262K). Requests longer than that are refused, never silently cut. A request whose
   `max_tokens` would run past the context is refused too (400); agents that always ask for their full output cap
   can instead get it shortened to the room left: add `"fit_max_tokens": true` to `strata-<model>.json` (or pass
@@ -258,10 +339,16 @@ print(r.choices[0].message.content)
 **Conversation cache.** A request that continues a chat reads only the part after what the engine already holds: the
 live session, or one of the checkpoints it keeps in RAM (up to 6, ~118 MB each, taken at the start of each new
 assistant turn and every 16K prompt tokens). A checkpoint is used only when the prompt starts with exactly its tokens
-and pictures. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`, `--turn-token ID`.
+and pictures. The oldest checkpoint - in practice the end of the system prompt, which every chat of the same client
+shares - is kept for good while the rest rotates by least recent use, so a NEW chat that shares that prefix starts
+reading after it instead of from token 0. A prompt read from the start is also checkpointed at the end of its system
+prompt when that is 2,048 tokens or more (engine 0.1.20; PR #62 + #65), so that root exists for agent clients with long
+system prompts and tool lists. Engine options: `--prompt-cache N` (0 = off), `--prompt-cache-every N`,
+`--prompt-cache-root N` (0 = no system-prompt checkpoint), `--turn-token ID`.
 
-**Current limits (v1):** one request at a time, and one conversation cached at a time (switching between two chats
-re-reads the other one); images only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
+**Current limits (v1):** one request at a time, and one conversation's history in the KV cache at a time (switching
+between two chats re-reads the part where they diverge; the shared prefix, such as the system prompt, is reused); images
+only when set up with them (below); no video. **Temperature / top_p / top_k / min_p /
 seed** are honored per request (OpenAI and Anthropic fields); with the default adaptive expert tier a sampled result
 is not reproducible run to run - for seed-reproducible output add `--adapt-every 100000` (static residency) to the
 engine arguments. The run config's optional `sampling` block sets the defaults for requests that leave the fields out
@@ -269,7 +356,52 @@ engine arguments. The run config's optional `sampling` block sets the defaults f
 block at all a request without sampling keys decodes greedy. The penalties (`presence_penalty`, `frequency_penalty`,
 `repetition_penalty`, with `penalty_last_n` capping how many recent tokens they count over, default 64 when any
 penalty is set) ride the same path; they count the tokens the request has consumed, so a repetition penalty
-suppresses what the model itself just said, not the prompt alone.
+suppresses what the model itself just said, not the prompt alone. Since engine 0.1.19 they apply to every token
+the speculative decoding checks at once, exactly as if it decoded one token at a time (before, only the first of
+each batch got them). That makes requests with penalties 1-11% slower than in 0.1.18: the draft layer guesses
+without penalties, so more of its guesses are now rejected. Requests without penalties are unchanged. `top_k` keeps at most 64 candidates: `0` ("off") or anything above 64 uses all 64.
+
+---
+
+## Tools from MCP servers
+
+The chat page can give the model tools from [MCP](https://modelcontextprotocol.io) servers, as LM Studio and Claude
+Desktop do: reading your files, fetching web pages, searching, anything an MCP server offers. List the servers in
+`strata-<model>.json` under `"mcp_servers"` - the same shape as Claude Desktop's `mcpServers` block, which you can
+also paste as it is (key `"mcpServers"`):
+
+```json
+"mcp_servers": {
+  "files": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:\\Users\\me\\Documents\\notes"]},
+  "search": {"url": "http://127.0.0.1:3000/mcp", "headers": {"Authorization": "Bearer ..."}}
+},
+"mcp": {"timeout_s": 60, "max_result_chars": 20000, "max_rounds": 8}
+```
+
+Or keep them in their own file and start the server with `--mcp-config path\to\claude_desktop_config.json` (a file
+with an `mcpServers` block; add it to the `serve/server.py` line of your run script). Restart Strata after a change.
+
+- **A program** (`command`, `args`, optional `env` and `cwd`) is started by Strata and spoken to over its
+  stdin/stdout; `npx`, `uvx`, `python` and friends are found on `PATH` as usual (Node.js is needed for `npx`
+  servers). **An address** (`url`, optional `headers`) uses MCP's Streamable HTTP transport (the older SSE-only
+  transport is not supported). `"disabled": true` leaves an entry out.
+- The servers start with Strata, in the background; the server window says what each one offers
+  (`MCP server 'files': 14 tools (...)`), or why it did not start - its tools are then left out and the chat works
+  without them. The Monitor tab lists them, and the Sampling drawer has **Use tools from MCP servers** (on by
+  default). A server that stops later is started again at its next call.
+- In the chat each call shows as a small block (tool, arguments, result); the model reads the result and goes on,
+  up to `max_rounds` calls in a row per answer. A tool that fails or takes longer than `timeout_s` (default 60 s)
+  gives the model an `error: ...` result instead of ending the chat. Results longer than `max_result_chars`
+  (default 20,000 characters) are cut, with a note, before the model reads them. Stop stops a running tool too.
+- Only the chat page uses them. API clients (omp, Claude Code, OpenAI and Anthropic SDKs) see the API exactly as
+  before and keep their own tools; a request to `/v1/chat/completions` opts in with `"strata_mcp": true` (it then
+  gets `strata_mcp` tool events in the stream).
+
+**Security.** MCP tools run on your PC with your user's rights, and **the model decides when to call them** - also
+because of what it reads (a web page or a file can contain instructions). Give a filesystem server only the folders
+it needs, prefer read-only tools, and don't add servers you don't trust. The tools can only be used from the chat
+page itself (a request with another site's Origin or without a JSON content type is refused); if Strata is reachable
+from other devices, set an API key.
 
 ---
 
@@ -394,8 +526,9 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | Python or the build tools could not be installed | Install what it names (links are printed), then run it again. Everything already done is kept. |
 | `port 8080 is already in use` | Strata is already running (look for its window), or another program uses the port: `START-HERE.bat --port 8081`. |
 | `cudaHostRegister ... out of memory` in the log | Normal on Windows: the engine pins the experts in per-layer slices instead. Only a problem if the load then fails. |
+| `ExpertCache: cudaMalloc(...) failed: out of memory` although VRAM is free | Windows' page file is off or tiny: every allocation on the graphics card is also charged to Windows' commit (RAM + page file). Set the page file to "System managed" (System > About > Advanced system settings > Performance > Advanced > Virtual memory) and restart. Since 0.1.19 the engine retries with a smaller cache instead of stopping, and setup warns about a page file under 4 GB (issue #60). |
 | The first start takes minutes | It is reading 34-55 GB into RAM; the second start is faster while the files are in the OS cache. |
-| The PC freezes for a few minutes at the first start | Normal the first time: the engine loads the experts into RAM, pins part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
+| The PC freezes for a few minutes at the start | Normal, most of all the first time (the server window says when it happens): the engine loads the experts into RAM, pins part of it for the GPU and sizes the expert cache. Wait; don't close the window. Still frozen after 10 minutes: restart the PC, close other programs, try again, or pick a smaller size. |
 | `the engine stopped unexpectedly (exit code ...)` | The engine process ended mid-answer - usually out of RAM (Linux ends the biggest program: `sudo dmesg \| grep -i -E 'killed process\|out of memory'`). The next request starts it again by itself. If it repeats: close other programs or pick a smaller size. The server also warns at start when the model's experts leave less than ~6 GB of RAM for everything else. |
 | Slow output, disk light busy | Not enough free RAM: close other programs, or choose Q2_0 / IQ2_XS. |
 | `prompt ... exceeds the context` | The request is longer than the context you chose: run setup again with a bigger `--context`. |
@@ -405,6 +538,7 @@ the document, +0.4% on the chat. Details: `bench/results/2026-09-27-esp/`.
 | Pictures are slow (10-30 s) | The encoder runs on the CPU: run setup again with `--vision gpu` (needs ~1.4 GB of VRAM). |
 | A request never finishes: "reading the prompt", GPU "100%" at low power | The GPU ran out of VRAM (engines before 0.1.9 could end with ~30 MiB free at large contexts). Run `START-HERE.bat` once to get engine 0.1.9 or newer; the log then says `... MiB of VRAM free with everything loaded` (a few hundred) and names the `--vram-reserve-mib` to add if it is low. |
 | Generation stops mid-answer, GPU "100%", one CPU core busy | Fixed in engine 0.1.12 (issue #29, a race in the CPU expert pool on big-VRAM cards). Since then a request that stops moving ends with an error instead of hanging (after 2 minutes; 1 minute from 0.1.13): the log says `no progress for ... s ... (issue #29)` with where it stopped, and the next request starts the engine again. If you see that line, please open an issue with it. Engine 0.1.13 adds a stall report under it (what every expert-pool thread and the GPU handshake were doing, memory and page faults) and, on Windows, a `strata-stall-<pid>.dmp` file with every thread's stack: attach both. (`STRATA_WATCHDOG_S` sets the time in seconds; 0 turns it off.) Engine 0.1.14 fixes the stall those reports found (issue #31: with the IQ packs the host could wait forever inside the NVIDIA driver while copying experts in a verify window; the experts are now copied by a GPU kernel, `--pcie-mode dma` restores the old way). |
+| `out of memory: cudaFuncSetAttribute` in the log (IQ3_XXS, long prompt) | Fixed in engine 0.1.15: CUDA loaded a kernel's code when it was first needed, and mid-prompt there was no VRAM left for it. Run `START-HERE.bat` (Windows) or `./setup.sh` (Linux) once to update. |
 | Anything else | The engine log is `strata-<model>.log` in this folder. |
 
 ---
@@ -431,8 +565,12 @@ The full story, with measurements, bottlenecks and what comes next: **[docs/pape
 
 ## Credits and licenses
 
+Strata itself: [MIT](../LICENSE). The model files are not part of it; their licenses apply to them (below).
+
 - Model: [Qwen/Qwen3.8-Flash-Next](https://huggingface.co/Qwen/Qwen3.8-Flash-Next) by the Qwen team; quantizations:
   [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF).
+  The Coder: [ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF)
+  (Apache-2.0 per its card); its support in Strata came from @pjgmobile's PR #54.
   Swift 1.5: [ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF)
   by UkisAI. Their licenses apply to the weights.
 - [llama.cpp / ggml](https://github.com/ggml-org/llama.cpp) (MIT): the i-quant formats, the GPU dot products and
@@ -443,3 +581,5 @@ The full story, with measurements, bottlenecks and what comes next: **[docs/pape
   [HyperQwen](https://github.com/syv-ai/HyperQwen); references in the paper.
 - The web app's font: [Outfit](https://github.com/Outfitio/Outfit-Fonts) (SIL Open Font License 1.1, see
   `serve/web/fonts/OFL.txt`). Its Monitor tab started from @code-martin's dashboard idea (PR #22).
+- The experimental speed projection's vector (`data/experimental-speed-projection/`): Qwen Community License 1.0,
+  made from the model's activations (see its README).

@@ -26,6 +26,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <algorithm>
 
@@ -418,9 +419,14 @@ private:
             meta_.emplace(std::move(key), read_value(c, t));
         }
         tensors_.reserve((size_t)n_tensors);
+        // GGUF has no index to arbitrate between two tensors of one name: find() is first-match, so a
+        // duplicate would silently win by position.  Refuse the file at open instead, naming both.
+        std::set<std::string> names;
         for (uint64_t i = 0; i < n_tensors; ++i) {
             TensorInfo t;
             t.name = c.str();
+            if (!names.insert(t.name).second)
+                throw std::runtime_error("GGUF: duplicate tensor name '" + t.name + "' in " + path_);
             const uint32_t nd = c.read<uint32_t>();
             if (nd == 0 || nd > 4) throw std::runtime_error("GGUF: bad n_dims for " + t.name);
             t.shape.resize(nd);
@@ -457,8 +463,9 @@ private:
 // pruned GSQ-RCO releases carry 256 of the base model's 512 experts, and the engine reads the real
 // count from the file anyway.  Every other field here still defines the architecture and is asserted.
 struct Qwen4ExpGuard {
-    uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 10, head_count = 24,
-             head_count_kv = 2;
+    uint32_t block_count = 48, hidden = 2560, experts = 0, experts_used = 0, head_count = 24,
+             head_count_kv = 2;   // 0 = presence-only: pruned variants (GSQ-RCO Coder) legitimately ship
+                                  // fewer experts than the canonical 512; the graph reads the true value
 };
 
 inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& want = {}) {
@@ -480,8 +487,7 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
     for (const auto& r : reqs) {
         const MetaValue* v = g.get(r.key);
         if (!v) return std::string("missing ") + r.key;
-        if (r.want == 0) continue;   // 0 == "whatever the file says" (see Qwen4ExpGuard)
-        if (v->u != r.want)
+        if (r.want && v->u != r.want)
             return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
     }
     return {}; // empty == ok

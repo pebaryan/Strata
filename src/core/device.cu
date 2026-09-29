@@ -30,7 +30,7 @@ DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
-        throw CudaError("no CUDA device is present; Strata targets sm_120 (RTX 5000 series)", -1);
+        throw CudaError("no CUDA device is present; Strata needs an NVIDIA GPU of compute capability 8.0 or newer", -1);
     }
     if (ordinal < 0 || ordinal >= count) {
         throw CudaError("device ordinal " + std::to_string(ordinal) + " is out of range (have " +
@@ -56,14 +56,15 @@ DeviceInfo device_info(int ordinal) {
     check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
 
-    // Upstream is written against sm_120 and refuses anything else here.
-    // LOCAL VOLTA PORT (peb, 2026-09-28): this build is compiled for sm_70, so accept cc 7.x and warn.
-    // sm_70 lacks tf32 mma, ldmatrix and bf16 tensor-core math, so its speed and numerics differ from
-    // the validated sm_120 path and must be measured, not assumed.
+    // Upstream's floor here is 8.0 (tf32 mma in the attention scorer, bf16 math; RTX 30 / 40 / 50) and its
+    // arch guard enforces the same floor at build time.  LOCAL VOLTA PORT (peb, 2026-09-28): this fork is
+    // configured for sm_70, so its runtime floor is 7.0.  sm_70 has no tf32 mma, no ldmatrix and no bf16
+    // tensor-core math, so this port's speed and numerics differ from the validated sm_80+ path: they are
+    // measured here, never assumed.
     if (d.cc_major < 7) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) +
-                            "; this build needs compute capability 7.0 or newer",
+                            "; this build needs compute capability 7.0 or newer (the Volta port)",
                         -1);
     }
     if (d.cc_major != 12) {

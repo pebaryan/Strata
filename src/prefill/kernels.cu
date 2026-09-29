@@ -1,6 +1,7 @@
 // src/prefill/kernels.cu - see include/strata/prefill/kernels.hpp.
 #include "strata/prefill/kernels.hpp"
 #include "strata/kernels/mrope.hpp"
+#include "strata/kernels/router_top10.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -131,6 +132,38 @@ __global__ void gdn_conv_kernel(float* __restrict__ hist, const float* __restric
     }
     hist[c * 3] = v0; hist[c * 3 + 1] = v1; hist[c * 3 + 2] = v2;
 }
+// C-3: the same 4-tap causal conv, tiled over tokens: thread (c, tile) reads its tile's 3 predecessors from the
+// chunk (or the history before it) instead of carrying them - the conv reads inputs, not its own outputs, so the
+// tiles are independent. The same expression per element (so the same bits); the history is written afterwards.
+constexpr int CONV_TILE = 64;
+__global__ void gdn_conv_tiled_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
+                                      const float* __restrict__ w, float* __restrict__ h, int64_t T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    const int64_t t0 = (int64_t) blockIdx.y * CONV_TILE;
+    if (t0 >= T) return;
+    const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
+    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)]; };
+    float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    for (int64_t t = t0; t < t1; ++t) {
+        const float x = qkv[t * C + c];
+        const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+        h[t * C + c] = s / (1.0f + __expf(-s));
+        v0 = v1; v1 = v2; v2 = x;
+    }
+}
+// the history after the chunk: its last three inputs (the older history where the chunk is shorter than 3)
+__global__ void gdn_conv_hist_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= C) return;
+    float v[3];
+    for (int k = 0; k < 3; ++k) {
+        const int64_t t = T - 3 + k;
+        v[k] = t >= 0 ? qkv[t * C + c] : hist[c * 3 + (int) (t + 3)];
+    }
+    hist[c * 3] = v[0]; hist[c * 3 + 1] = v[1]; hist[c * 3 + 2] = v[2];
+}
 __global__ void gdn_l2_kernel(float* __restrict__ h, float eps) {
     // block (t, head) over the 32 q/k heads, 128 threads
     const int64_t t = blockIdx.y;
@@ -200,38 +233,94 @@ __global__ void __launch_bounds__(S * RG) gdn_rec_kernel(float* __restrict__ sta
     for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
 }
 
+// D-2: the recurrence with the value columns split over 4 blocks per head (4x the blocks of the kernel above, a
+// quarter of its threads per __syncthreads), and the output norm - the only step that couples the head's columns -
+// in its own kernel. Per column the same arithmetic in the same order (the 4 row-group partial sums added as
+// red[0] + red[1] + red[2] + red[3]; the norm's warp sums over the same 32-column warps): the same bits.
+constexpr int CB = 32, NCB = S / CB;
+__global__ void __launch_bounds__(CB * RG) gdn_rec_cols_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                                const float* __restrict__ gate,
+                                                                const float* __restrict__ beta,
+                                                                float* __restrict__ oc_out, int64_t T) {
+    __shared__ float sk[S], sq[S], red[RG][CB];
+    const int head = blockIdx.x / NCB, cb = blockIdx.x % NCB;
+    const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
+    const int qh = head % HK;
+    float s[RPG];
+    float* base = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = base[r * rs];
+    for (int64_t t = 0; t < T; ++t) {
+        const float* ht = h + t * C;
+        __syncthreads();
+        if (tid < S) { sq[tid] = ht[qh * S + tid]; sk[tid] = ht[HK * S + qh * S + tid]; }
+        __syncthreads();
+        const float g = __expf(gate[t * HV + head]);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red[rg][c] = kv;
+        __syncthreads();
+        const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
+        const float delta = (ht[2 * HK * S + head * S + col] - g * kv_col) * beta[t * HV + head];
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[rg * RPG + r], o);
+        }
+        __syncthreads();
+        red[rg][c] = o;
+        __syncthreads();
+        if (rg == 0) oc_out[t * HV * S + head * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) base[r * rs] = s[r];
+}
+__global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict__ z, const float* __restrict__ gamma,
+                                                         float eps, float* __restrict__ y, uint16_t* __restrict__ y16) {
+    __shared__ float wsum[4];
+    const int64_t t = blockIdx.x;
+    const int head = blockIdx.y, col = threadIdx.x;
+    const size_t at = (size_t) t * HV * S + (size_t) head * S + col;
+    const float oc = y[at];
+    float sp = warp_sum(oc * oc);
+    if ((col & 31) == 0) wsum[col >> 5] = sp;
+    __syncthreads();
+    const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+    const float v = oc * rsqrtf(ss / (float) S + eps) * gamma[col] * sigm(z[t * HV * S + head * S + col]);
+    y[at] = v;
+    y16[at] = hf(v);
+}
+
 // ---------------------------------------------------------------- MoE
-// LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): upstream hardwired 512 experts (32 lanes x 16 values) into
-// this kernel.  The warp layout follows the expert count instead: 512 -> VEC 16, 256 -> VEC 8.  Same
-// reduction, same top-10, fewer values per lane.
-template <int NEXP>
+template <int REG>
 __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ wout,
                              int64_t T) {
-    static_assert(NEXP % 32 == 0, "the router's warp layout needs a multiple of 32 experts");
-    constexpr int VEC = NEXP / 32;
     const int64_t t = (int64_t) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (t >= T) return;
     const int lane = threadIdx.x & 31;
-    const float* lg = logits + t * NEXP;
-    float v[VEC];
+    const float* lg = logits + t * (REG * 32);
+    float v[REG];
 #pragma unroll
-    for (int i = 0; i < VEC; ++i) v[i] = lg[lane + i * 32];
+    for (int i = 0; i < REG; ++i) v[i] = lg[lane + i * 32];
     float mx = -INFINITY;
 #pragma unroll
-    for (int i = 0; i < VEC; ++i) mx = fmaxf(mx, v[i]);
+    for (int i = 0; i < REG; ++i) mx = fmaxf(mx, v[i]);
     mx = warp_max(mx);
     float sum = 0.0f;
 #pragma unroll
-    for (int i = 0; i < VEC; ++i) { v[i] = expf(v[i] - mx); sum += v[i]; }
+    for (int i = 0; i < REG; ++i) { v[i] = expf(v[i] - mx); sum += v[i]; }
     const float rcp = 1.0f / warp_sum(sum);
 #pragma unroll
-    for (int i = 0; i < VEC; ++i) { v[i] *= rcp; if (isnan(v[i])) v[i] = -FLT_MAX; }
+    for (int i = 0; i < REG; ++i) { v[i] *= rcp; if (isnan(v[i])) v[i] = -FLT_MAX; }
     float selected = 0.0f, selected_sum = 0.0f;
     for (int rank = 0; rank < 10; ++rank) {
         float best = v[0];
         int ex = lane;
 #pragma unroll
-        for (int i = 1; i < VEC; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
+        for (int i = 1; i < REG; ++i) if (v[i] > best) { best = v[i]; ex = lane + i * 32; }
 #pragma unroll
         for (int m = 16; m; m >>= 1) {
             const float ob = __shfl_xor_sync(0xffffffffu, best, m);
@@ -452,24 +541,35 @@ void gdn_gates(const float* ab, const float* dt, const float* ssm_a, float* gate
     check("gdn_gates");
 }
 void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, void* stream) {
-    gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+    static const bool serial = std::getenv("STRATA_GDN_CONV_SERIAL") != nullptr;   // the old walk (A/B)
+    if (serial || T <= CONV_TILE) {
+        gdn_conv_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+    } else {
+        gdn_conv_tiled_kernel<<<dim3(C / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
+                                (cudaStream_t) stream>>>(history, qkv, conv_w, h, T);
+        gdn_conv_hist_kernel<<<C / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T);
+    }
     gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
     check("gdn_conv");
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream) {
-    gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
+    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
+    if (serial || T <= 0) {
+        gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T);
+    } else {
+        gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
+        gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16);
+    }
     check("gdn_recurrence");
 }
-void route(const float* logits, int32_t* ids, float* weights, int64_t T, int n_expert, void* stream) {
-    // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): the caller knows the artifact's expert count (512
-    // unpruned, 256 pruned); the kernel's warp layout is compiled per count.
-    const unsigned blocks = (unsigned) ((T + 7) / 8);
-    if (n_expert == 256) {
-        route_kernel<256><<<blocks, 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
-    } else {
-        route_kernel<512><<<blocks, 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
-    }
+void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
+    if (n_expert == 512)
+        route_kernel<16><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    else if (n_expert == 256)
+        route_kernel<8><<<(unsigned) ((T + 7) / 8), 256, 0, (cudaStream_t) stream>>>(logits, ids, weights, T);
+    else
+        strata::kernels::router_top10(logits, (int) T, (int) n_expert, 10, ids, weights, stream);
     check("route");
 }
 void blob_dequant(const uint8_t* blob, uint16_t* gu16, uint16_t* down16, void* stream) {

@@ -36,6 +36,7 @@ import os
 import platform
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -57,7 +58,7 @@ PREBUILT_ASSET = "strata-windows-x64.zip" if WIN else "strata-linux-x64.zip"
 # the CUDA libraries the ready-made engine loads (the same CUDA 13.0 it is built with), from NVIDIA's pip packages
 CUDA_WHEELS = ["nvidia-cublas==13.0.2.14", "nvidia-cuda-runtime==13.0.96"]
 MIN_DRIVER = 580                       # CUDA 13.0
-MIN_ENGINE = (0, 1, 14)                # v0.1.14: no host CUDA call inside a verify window (#31); v0.1.13: --prefill auto
+MIN_ENGINE = (0, 1, 24)                # v0.1.24: long prompts faster (QSA select on tensor cores); v0.1.23: image requests honor sampling, 8 GB cards start, batched verify window; v0.1.22: faster prompts (tensor-core attention), multi-GPU across images/steering/KV streaming; v0.1.21: multi-GPU layer split (--gpus); v0.1.20: system-prompt checkpoint, PCIe probe, hit rate; v0.1.19: penalties
 PY_PACKAGES = ["numpy", "jinja2", "regex", "pyyaml", "tqdm", "requests", "cmake", "ninja", "pillow", "psutil"]
 
 MODELS = {
@@ -70,6 +71,9 @@ MODELS = {
     "IQ3_S": {"about": "3.5-bit i-quant, the best quality (matches the full model), the slowest; needs a 64 GB PC "
                        "with little else running", "download_gb": 83.6, "ram_gb": 62, "arena_gb": 50.3,
               "families": ("qwen",)},
+    # the Coder release: 256 of the 512 experts kept (the ones code, tools and vision use), IQ2_S-IQ4_XS like IQ3_S
+    "IQ1_M": {"about": "the Coder's only size: half the experts, stored like IQ3_S (3.5 bits)", "download_gb": 58.4,
+              "ram_gb": 32, "arena_gb": 23.4, "families": ("coder",)},
 }
 CONTEXTS = [8192, 32768, 65536, 131072, 262144]
 # The model families: the same architecture, weights in the same three GSQ-RCO sizes, different files.
@@ -87,6 +91,15 @@ FAMILIES = {
               "mmproj_hf": "https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF/resolve/main/",
               "mmproj": "mmproj-Swift-Qwen3.8-Flash-Next-BF16.gguf", "name": "swift-1.5",
               "license": "Swift Open License 1.0: https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF"},
+    # ISTA-DASLab's expert-pruned release: half of each layer's experts removed, chosen for code, agentic tool use and
+    # vision; its shard 2 (the n-gram table) and vision encoder are the original's files, shared with it
+    "coder": {"title": "Qwen3.8-Flash-Next Coder", "by": "ISTA-DASLab's coding version",
+              "about": "half the experts (code, tools, images kept): needs ~32 GB of RAM, faster; weaker outside coding",
+              "hf": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/main/{q}/",
+              "file": "Qwen3.8-Flash-Next-GSQ-RCO-{q}-0000{i}-of-00002.gguf", "tag": "coder-",
+              "mmproj_hf": "https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/main/",
+              "mmproj": "mmproj-Qwen3.8-Flash-Next-BF16.gguf", "name": "qwen3.8-flash-next-coder",
+              "profile": "expert-profile-coder.bin"},
 }
 MMPROJ = "mmproj-Qwen3.8-Flash-Next-BF16.gguf"
 # EXPERIMENTAL, off by default (setup asks): a control vector shipped with the repository, see its README
@@ -169,22 +182,37 @@ def mark(path: Path, text=""):
 
 
 # ------------------------------------------------------------------------------------------------ the PC
+def _memory_status():
+    """Windows' GlobalMemoryStatusEx: RAM, and the commit limit (ullTotalPageFile = RAM + page file)."""
+    class MS(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+    m = MS()
+    m.dwLength = ctypes.sizeof(MS)
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+    return m
+
+
 def ram_gb():
     if WIN:
-        class MS(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        m = MS()
-        m.dwLength = ctypes.sizeof(MS)
-        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
-        return m.ullTotalPhys / 2**30
+        return _memory_status().ullTotalPhys / 2**30
     for line in open("/proc/meminfo"):
         if line.startswith("MemTotal"):
             return int(line.split()[1]) * 1024 / 2**30
     return 0.0
+
+
+def page_file_gb():
+    """The page file's current size (GB) on Windows, None elsewhere.  The graphics card's memory needs room there
+    too: under Windows' driver model every allocation on the card is also charged to the commit (RAM + page file),
+    so with the page file off or tiny the engine cannot use the free VRAM (issue #60)."""
+    if not WIN:
+        return None
+    m = _memory_status()
+    return max(0.0, (m.ullTotalPageFile - m.ullTotalPhys) / 2**30)
 
 
 def cpu_info():
@@ -231,12 +259,194 @@ def _cpuid_avx512_full() -> bool:
         return False
 
 
-def gpu_info():
-    s = out(["nvidia-smi", "--query-gpu=name,memory.total,compute_cap,driver_version", "--format=csv,noheader,nounits"])
-    if not s.strip():
+def gpus():
+    """Every NVIDIA GPU, numbered as nvidia-smi numbers them (by PCI bus, the order the engine is told to use)."""
+    s = out(["nvidia-smi", "--query-gpu=index,name,memory.total,compute_cap,driver_version",
+             "--format=csv,noheader,nounits"])
+    found = []
+    for line in s.strip().splitlines():
+        try:
+            idx, name, mem, cc, drv = [x.strip() for x in line.split(",")]
+            found.append({"index": int(idx), "name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""),
+                          "driver": drv})
+        except ValueError:
+            continue
+    return found
+
+
+GPU_PICK = None                                         # --gpu N (issue #51); None: the card with the most VRAM
+SPLIT_MIN_VRAM_GB = 8                                   # a card sharing a model holds the dense weights and its own
+                                                        # prompt buffers too (docs/MULTI_GPU.md)
+
+
+def cc(g) -> str:
+    return f"{g['arch'][:-1]}.{g['arch'][-1]}"
+
+
+def gpu_problem(g, together=False):
+    """Why Strata cannot use this card, in plain words (None: it can)."""
+    if int(g["arch"]) < 80:
+        return (f"not supported - older than the RTX 30 series (compute capability {cc(g)}; Strata needs 8.0 or "
+                "newer)")
+    if together and g["vram_gb"] < SPLIT_MIN_VRAM_GB - 0.5:
+        return (f"not supported together with other GPUs - {g['vram_gb']:.0f} GB of VRAM (a card sharing the model "
+                f"needs {SPLIT_MIN_VRAM_GB} GB or more)")
+    return None
+
+
+def gpu_rank(g):
+    """The order cards share a model in: the newest generation first (it gets the first layers and most of the
+    work), then the most VRAM."""
+    return (-int(g["arch"]), -round(g["vram_gb"]), g["index"])
+
+
+def gpu_name(g) -> str:
+    return f"GPU {g['index']} ({g['name']}, {g['vram_gb']:.0f} GB)"
+
+
+def gpu_table(found) -> None:
+    say("  Your NVIDIA GPUs:")
+    for g in found:
+        p = gpu_problem(g)
+        say(f"    GPU {g['index']}: {g['name']}, {g['vram_gb']:.0f} GB VRAM - " + ("can be used" if p is None else p))
+
+
+def together_ok(found) -> list:
+    """The cards that can share one model, in the order they would (empty if fewer than two)."""
+    ok_ = sorted([g for g in found if gpu_problem(g, together=True) is None], key=gpu_rank)
+    return ok_ if len(ok_) >= 2 else []
+
+
+def parse_gpus(text, found) -> list:
+    """--gpus / --gpu with several: "0,2" or "all" (every card that can share the model)."""
+    if str(text).strip().lower() == "all":
+        sel = [g["index"] for g in together_ok(found)]
+        if not sel:
+            gpu_table(found)
+            fail("--gpus all: this PC does not have two GPUs Strata can use together")
+        return sel
+    try:
+        sel = [int(x) for x in str(text).split(",") if x.strip()]
+    except ValueError:
+        fail(f"--gpus takes GPU numbers as nvidia-smi numbers them, e.g. --gpus 0,2 (or --gpus all), not {text!r}")
+    if len(sel) < 2 or len(set(sel)) != len(sel):
+        fail("--gpus takes two or more different GPUs, e.g. --gpus 0,2 (one GPU: --gpu 0)")
+    return sel
+
+
+def check_gpus(sel, found, what="") -> None:
+    """Stops with a plain message when a chosen card is missing or cannot be used, and says what can."""
+    together = len(sel) > 1
+    for i in sel:
+        g = next((x for x in found if x["index"] == i), None)
+        p = "not found on this PC" if g is None else gpu_problem(g, together)
+        if p is None:
+            continue
+        say()
+        gpu_table(found)
+        can = together_ok(found)
+        single = [x for x in found if gpu_problem(x) is None]
+        ones = " or ".join(f"--gpu {x['index']}" for x in single)
+        both = "--gpus " + ",".join(str(x["index"]) for x in can) if can else ""
+        hint = ((f"use these together: {both}" + (f" (or one card: {ones})" if not together else "")) if can else
+                f"use one card: {ones}" if single else "Strata needs an NVIDIA RTX 30 series or newer card")
+        fail(f"GPU {i}{'' if g is None else ' (' + g['name'] + ')'} {what}cannot be used: {p}", hint)
+
+
+def engine_archs():
+    """The GPU generations the installed engine has code for: (archs, ptx), or None when there is none."""
+    info = ROOT / "engine" / "BUILD.json"
+    try:
+        meta = json.loads(info.read_text())
+    except (OSError, ValueError):
         return None
-    name, mem, cc, drv = [x.strip() for x in s.strip().splitlines()[0].split(",")]
-    return {"name": name, "vram_gb": float(mem) / 1024.0, "arch": cc.replace(".", ""), "driver": drv}
+    return [int(x) for x in meta.get("archs", [])], bool(meta.get("ptx"))
+
+
+def engine_runs_on(g) -> bool:
+    ea = engine_archs()
+    if ea is None or not ea[0]:
+        return True
+    archs, ptx = ea
+    return int(g["arch"]) in archs or (ptx and int(g["arch"]) > max(archs))
+
+
+def choose_gpus(a, found) -> list:
+    """Which cards this install uses: --gpus / --gpu, or asked when two or more can share the model (the two best
+    together recommended), else the supported card with the most VRAM.  Returns their numbers, the main one first."""
+    if a.gpus:
+        sel = parse_gpus(a.gpus, found)
+        check_gpus(sel, found)
+        return sel
+    if a.gpu is not None:
+        check_gpus([a.gpu], found)
+        return [a.gpu]
+    single = sorted([g for g in found if gpu_problem(g) is None], key=lambda x: (-round(x["vram_gb"]), x["index"]))
+    if not single:
+        gpu_table(found)
+        fail("none of your GPUs can run Strata", "it needs an NVIDIA RTX 30 series or newer (compute capability 8.0+)")
+    can = together_ok(found)
+    if not can:
+        return [single[0]["index"]]
+    say()
+    say(f"  Strata can run the model on one GPU, or share it across {'these' if len(can) > 2 else 'both'}: then each"
+        " card holds the")
+    say("  experts of its own layers, so together they hold about twice as many, and prompts are read about 20%")
+    say("  faster (details: docs/MULTI_GPU.md). A much slower extra card can also make it slower.")
+    opts = [can[:2]] + ([can] if len(can) > 2 else []) + [[g] for g in single]
+    for i, o in enumerate(opts, 1):
+        label = (" + ".join(gpu_name(g) for g in o) + " together") if len(o) > 1 else gpu_name(o[0]) + " only"
+        say(f"  {i}) {label}" + ("   (recommended)" if i == 1 else ""))
+    for g in found:
+        if gpu_problem(g, together=True) is not None:
+            say(f"     (GPU {g['index']}, {g['name']}: {gpu_problem(g, together=True)})")
+    pick = opts[int(ask("Which GPUs?", [str(i) for i in range(1, len(opts) + 1)], "1", a.yes or a.check)) - 1]
+    return [g["index"] for g in pick]
+
+
+def offer_together(cfg_path: Path, cfg: dict, yes: bool) -> dict:
+    """Starting a model set up for one card on a PC with two or more that can share it: asked once (the answer is
+    saved in its config)."""
+    if isinstance(cfg.get("gpu"), list) or cfg.get("gpus_asked"):
+        return cfg
+    found = gpus()
+    can = together_ok(found)
+    if not can:
+        return cfg
+    pair = can[:2]
+    cfg["gpus_asked"] = True
+    say()
+    say("  This PC has " + " and ".join(gpu_name(g) for g in pair) + ": Strata can share the model across both.")
+    say("  Together they hold about twice the model's experts and read prompts about 20% faster (docs/MULTI_GPU.md).")
+    missing = [g for g in pair if not engine_runs_on(g)]
+    if missing:
+        say("  The installed engine has no code for " + ", ".join(g["name"] for g in missing) + ": to use them "
+            "together, run START-HERE.bat --setup --gpus " + ",".join(str(g["index"]) for g in pair))
+    elif ask("  Use both from now on? (you can change it later: START-HERE.bat --gpu N for one card)",
+             ["y", "n"], "y", yes) == "y":
+        cfg["gpu"] = [g["index"] for g in pair]
+        cfg["layer_split"] = cfg.get("layer_split") or "auto"
+        ok("from now on this model runs on " + " + ".join(gpu_name(g) for g in pair))
+    else:
+        ok("staying on one GPU (START-HERE.bat --gpus " + ",".join(str(g["index"]) for g in pair) + " switches)")
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    return cfg
+
+
+def gpu_info(pick=None):
+    """The GPU Strata runs on: `pick` (nvidia-smi's number) if given, else the one with the most VRAM (ties: the
+    lower number).  None when there is no NVIDIA GPU.  The dict also says how many there are ("count")."""
+    found = gpus()
+    if not found:
+        return None
+    pick = GPU_PICK if pick is None else pick
+    if pick is not None:
+        g = next((x for x in found if x["index"] == pick), None)
+        if g is None:
+            fail(f"there is no GPU {pick}: " + ", ".join(f"{x['index']} = {x['name']}" for x in found))
+    else:
+        g = max(found, key=lambda x: (round(x["vram_gb"]), -x["index"]))
+    return {**g, "count": len(found)}
 
 
 def find_nvcc():
@@ -263,7 +473,9 @@ def find_vcvars():
     vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Microsoft Visual Studio/Installer/vswhere.exe"
     if not vswhere.exists():
         return None
-    p = out([str(vswhere), "-latest", "-products", "*", "-requires",
+    # CUDA 13 accepts Visual Studio 2019 and 2022 only: a newer one (2026 = version 18) installed next to them
+    # must not be picked ("unsupported Microsoft Visual Studio version"); with only a newer one there is none
+    p = out([str(vswhere), "-latest", "-products", "*", "-version", "[16.0,18.0)", "-requires",
              "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"]).strip()
     v = Path(p) / "VC/Auxiliary/Build/vcvars64.bat" if p else None
     return v if v and v.exists() else None
@@ -347,10 +559,32 @@ def download(url, dst: Path, what=None):
             warn(f"download interrupted ({e}); retrying in 10 s ...")
             time.sleep(10)
     if total and part.stat().st_size != total:
-        fail(f"could not finish downloading {dst.name}", "check your internet connection and run it again")
+        fail(f"could not finish downloading {dst.name}: {part.stat().st_size:,} bytes on disk, the server says {total:,}",
+             "check your internet connection and run it again (the download resumes where it stopped)")
     part.replace(dst)
     mark(dst)
     ok(f"{what or dst.name} downloaded")
+
+
+def check_shards(shards):
+    """Every shard present and whole, or setup stops naming the file and the numbers.  Whole means as long as
+    its own tensor directory says (the header is read, the data is not): a truncated copy (--gguf-dir, a .part
+    renamed by hand, a download finished by an older setup) otherwise passes as a model file and the engine
+    fails much later, at the first tensor that runs past the end."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+    for s in shards:
+        if not s.exists():
+            fail(f"missing {s}")
+        try:
+            g = GGUFFile(s)
+        except (ValueError, struct.error) as e:
+            fail(f"{s.name} is not a whole GGUF shard ({e})", "delete it and run setup again")
+        need = g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0)
+        have = s.stat().st_size
+        if have < need:
+            fail(f"{s.name} is short: {have:,} of {need:,} bytes ({need - have:,} missing)",
+                 "delete it and run setup again (or copy the whole file into --gguf-dir)")
 
 
 def get_llama_cpp():
@@ -366,7 +600,18 @@ def get_llama_cpp():
         f.extractall(tmp)
     top = next(tmp.iterdir())
     shutil.rmtree(llama, ignore_errors=True)
-    top.replace(llama)
+    # PR #63: on Windows a rename can fail with PermissionError while an antivirus scanner still holds a file of the
+    # fresh unpack; shutil.move falls back to copy-and-delete, and a few retries let the scanner finish.  The target
+    # is `llama` itself - moving into its parent would keep the zip's `llama.cpp-<sha>` folder name.
+    for attempt in range(5):
+        try:
+            shutil.move(str(top), str(llama))
+            break
+        except PermissionError:
+            if attempt == 4:
+                raise
+            shutil.rmtree(llama, ignore_errors=True)   # a partial copy from the failed attempt
+            time.sleep(2)
     shutil.rmtree(tmp, ignore_errors=True)
     z.unlink(missing_ok=True)
     z.with_name(z.name + ".done").unlink(missing_ok=True)
@@ -406,8 +651,9 @@ def driver_major(gpu):
         return 0
 
 
-def get_prebuilt(url_base, gpu, vision) -> Path | None:
-    """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC."""
+def get_prebuilt(url_base, gpu, vision, updating=False) -> Path | None:
+    """The ready-made engine in engine/ (kept between runs), or None when there is none for this PC.
+    updating: called to replace an installed engine, which starts instead when this fails (no compile)."""
     eng = ROOT / "engine"
     info = eng / "BUILD.json"
     if info.exists() and (eng / EXE).exists():
@@ -427,7 +673,7 @@ def get_prebuilt(url_base, gpu, vision) -> Path | None:
             req = urllib.request.Request(base + PREBUILT_ASSET, method="HEAD", headers={"User-Agent": "strata-setup"})
             urllib.request.urlopen(req, timeout=60).close()
         except OSError as e:
-            warn(f"no ready-made engine at {base} ({e}): compiling instead")
+            warn(f"no ready-made engine at {base} ({e})" + ("" if updating else ": compiling instead"))
             return None
     say("  Downloading the ready-made Strata engine ...")
     download(base + PREBUILT_ASSET, z, "Strata engine")
@@ -437,14 +683,21 @@ def get_prebuilt(url_base, gpu, vision) -> Path | None:
         f.extractall(tmp)
     meta = json.loads((tmp / "BUILD.json").read_text())
     if tuple(int(x) for x in str(meta.get("version", "0")).split(".")[:3] if x.isdigit()) < MIN_ENGINE:
-        warn(f"the ready-made engine at {base} is version {meta.get('version')}; this setup needs "
-             f"{'.'.join(map(str, MIN_ENGINE))}: compiling instead")
+        need = ".".join(map(str, MIN_ENGINE))
+        if updating:                                   # these files are newer than the published release (#58)
+            warn(f"engine {need} is not published yet (the release may still be uploading): run this again "
+                 f"in a few minutes to update it")
+        else:
+            warn(f"the ready-made engine at {base} is version {meta.get('version')}; this setup needs "
+                 f"{need}: compiling instead")
         shutil.rmtree(tmp, ignore_errors=True)
         return None
     archs = [int(a) for a in meta.get("archs", [])]
-    arch = int(gpu["arch"])
-    if arch not in archs and not (meta.get("ptx") and arch > max(archs)):
-        warn(f"the ready-made engine is built for {', '.join(str(a) for a in archs)}; your GPU is {arch}: compiling instead")
+    miss = [int(x) for x in gpu.get("archs", [gpu["arch"]])
+            if int(x) not in archs and not (meta.get("ptx") and int(x) > max(archs))]
+    if miss:
+        warn(f"the ready-made engine is built for {', '.join(str(a) for a in archs)}; your GPU is "
+             f"{', '.join(str(x) for x in miss)}" + ("" if updating else ": compiling instead"))
         shutil.rmtree(tmp, ignore_errors=True)
         return None
     for p in tmp.iterdir():
@@ -498,6 +751,7 @@ def update_installed_engine(url_base) -> None:
         try:                                           # a failed compile must not stop the model from starting
             if gpu is None:
                 raise RuntimeError("no NVIDIA GPU found")
+            gpu = {**gpu, "archs": sorted({int(gpu["arch"]), *(int(x) for x in meta.get("archs", []))})}
             build_engine(gpu, vision, False, get_llama_cpp())
         except (Exception, SystemExit) as e:
             warn(f"could not compile the updated engine{'' if isinstance(e, SystemExit) else f' ({e})'}: starting the installed one")
@@ -505,7 +759,7 @@ def update_installed_engine(url_base) -> None:
     new = None
     if gpu is not None:
         try:
-            new = get_prebuilt(url_base, gpu, "gpu")
+            new = get_prebuilt(url_base, gpu, "gpu", updating=True)
         except Exception as e:                         # a failed download must not stop the model from starting
             warn(f"updating the engine failed ({e})")
     if new is None:
@@ -519,7 +773,7 @@ def update_installed_engine(url_base) -> None:
 def install_build_tools(gpu, yes):
     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
     nvcc, cuda_v = find_nvcc()
-    need_cuda = (12, 8) if int(gpu["arch"]) >= 120 else (12, 0)
+    need_cuda = (12, 8) if max(int(x) for x in gpu.get("archs", [gpu["arch"]])) >= 120 else (12, 0)
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
     missing = []
@@ -631,27 +885,227 @@ def build_engine(gpu, vision, yes, llama) -> Path:
         ok("engine already built for this PC")
         return eng
     nvcc, vcvars = install_build_tools(gpu, yes)
+    archs = sorted({int(x) for x in gpu.get("archs", [gpu["arch"]])})    # every card the model runs on
+    cuda_archs = ";".join(str(x) for x in archs)
     if not engine_ok:
         say("  The engine's source changed: compiling it again (only what changed, a few minutes) ..."
             if local and (eng / EXE).exists() else "  Compiling the Strata engine for your GPU (10-20 minutes, once) ...")
         cmake_build(ROOT, ROOT / "build", "strata",
-                    ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}",
+                    ["-DSTRATA_ENABLE_CUDA=ON", "-DSTRATA_BUILD_TESTS=OFF", f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}",
                      f"-DCMAKE_CUDA_COMPILER={nvcc}", f"-DSTRATA_GGML_DIR={llama}"], vcvars, "build-strata.bat")
         shutil.copy2(ROOT / "build" / EXE, eng / EXE)
     if not vision_ok:
         say("  Compiling the image encoder" + (" with CUDA (10-20 minutes, once) ..." if vision == "gpu" else " ..."))
         defs = [f"-DLLAMA_DIR={llama}", f"-DSTRATA_VISION_CUDA={'ON' if vision == 'gpu' else 'OFF'}"]
         if vision == "gpu":
-            defs += [f"-DCMAKE_CUDA_ARCHITECTURES={gpu['arch']}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
+            defs += [f"-DCMAKE_CUDA_ARCHITECTURES={cuda_archs}", f"-DCMAKE_CUDA_COMPILER={nvcc}"]
         cmake_build(ROOT / "tools" / "vision", ROOT / "build-vision", "strata-vision", defs, vcvars, "build-vision.bat")
         shutil.copy2(ROOT / "build-vision" / "bin" / VEXE, eng / VEXE)
     bindir = Path(nvcc).parent                            # the toolkit's own libraries (bin, bin/x64, lib64)
     dirs = [str(d) for d in (bindir, bindir / "x64", bindir.parent / "lib64") if d.is_dir()]
-    stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": [int(gpu["arch"])],
+    stamp.write_text(json.dumps({"source": "local", "version": source_version(), "archs": archs,
                                  "vision": vision,
                                  "cuda_dirs": dirs, "src": src, "vision_src": vsrc if want_vision else None}, indent=1))
     ok(f"engine compiled: {eng / EXE}")
     return eng
+
+
+# ------------------------------------------------------------------------------------------------ the data folder
+# The model files - the GGUFs, the prepared packs and the MTP layer, 70-120 GB - live in a data folder NEXT TO the
+# Strata folder (`Strata-data`), not inside it: updating Strata by unzipping a new copy used to give a new, empty
+# folder and a full download again.  Where it is, and which Strata folders this user ran, is kept in a small
+# per-user file, so every Strata folder on the PC finds the same files.
+DATA_ITEMS = ("models", "packs", "mtp")
+
+
+def settings_path() -> Path:
+    if WIN:
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Strata" / "settings.json"
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "strata" / "settings.json"
+
+
+def load_settings() -> dict:
+    try:
+        return json.loads(settings_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(s: dict) -> None:
+    try:
+        settings_path().parent.mkdir(parents=True, exist_ok=True)
+        settings_path().write_text(json.dumps(s, indent=1), encoding="utf-8")
+    except OSError as e:
+        warn(f"could not save {settings_path()} ({e})")
+
+
+def has_data(folder: Path) -> bool:
+    for d in DATA_ITEMS:
+        try:
+            if (folder / d).is_dir() and any((folder / d).iterdir()):
+                return True
+        except OSError:
+            pass
+    return False
+
+
+def other_installs(settings: dict) -> list:
+    """Strata folders besides this one that may hold model files: the ones this user ran before, and Strata* folders
+    next to this one (a zip unpacked again lands in e.g. `Strata-main (1)\\Strata-main`)."""
+    cands = [Path(p) for p in settings.get("installs", [])]
+    for base in dict.fromkeys((ROOT.parent, ROOT.parent.parent)):
+        try:
+            for d in base.iterdir():
+                if d.is_dir() and d.name.lower().startswith("strata"):
+                    cands.append(d)
+                    cands += [c for c in d.iterdir() if c.is_dir() and c.name.lower().startswith("strata")]
+        except OSError:
+            pass
+    found = []
+    for d in cands:
+        try:
+            d = d.resolve()
+            if d != ROOT and d not in found and (d / "setup.py").is_file():
+                found.append(d)
+        except OSError:
+            pass
+    return found
+
+
+def same_drive(a: Path, b: Path) -> bool:
+    try:
+        return os.stat(a).st_dev == os.stat(b).st_dev
+    except OSError:
+        return False
+
+
+def move_into(src: Path, dst: Path) -> None:
+    """A rename into the data folder (same drive: instant); a folder merges into one already there, keeping what the
+    destination has.  Whatever cannot be moved (a file in use) stays where it is."""
+    if not dst.exists():
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(src, dst)
+            return
+        except OSError:
+            if not src.is_dir():
+                return
+            dst.mkdir(parents=True, exist_ok=True)
+    if src.is_dir() and dst.is_dir():
+        for c in list(src.iterdir()):
+            move_into(c, dst / c.name)
+        try:
+            src.rmdir()
+        except OSError:
+            pass
+
+
+def repoint_config(cfg_file: Path, old: Path, new: Path) -> None:
+    """A config whose model files moved from `old` to `new` points at them there (each path only if its file is
+    now there and no longer at the old place)."""
+    try:
+        cfg = json.loads(cfg_file.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return
+
+    def fix(v):
+        if isinstance(v, list):
+            return [fix(x) for x in v]
+        if isinstance(v, dict):
+            return {k: fix(x) for k, x in v.items()}
+        if isinstance(v, str):
+            for d in DATA_ITEMS:
+                o = str(old / d)
+                nv, no = os.path.normcase(v), os.path.normcase(o)   # Windows: C:\ and c:\ are the same place
+                if nv == no or nv.startswith(no + os.sep):
+                    n = str(new / d) + v[len(o):]
+                    if Path(n).exists() and not Path(v).exists():
+                        return n
+        return v
+
+    new_cfg = fix(cfg)
+    if new_cfg != cfg:
+        cfg_file.write_text(json.dumps(new_cfg, indent=1), encoding="utf-8")
+
+
+def data_folder(requested: str | None) -> tuple:
+    """(the data folder, folders on other drives that still hold model files).  Moves the model files of this folder
+    and of earlier Strata folders on the same drive into the data folder, and points their configs there."""
+    settings = load_settings()
+    dest = Path(requested).expanduser().resolve() if requested else \
+        Path(settings["data_dir"]) if settings.get("data_dir") else ROOT.parent / "Strata-data"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:                                # e.g. no write access next to the Strata folder
+        warn(f"cannot use {dest} for the model files ({e}): keeping them in {ROOT}")
+        dest = ROOT
+    elsewhere = []
+    for folder in [ROOT, *other_installs(settings)]:
+        if folder == dest or not has_data(folder):
+            continue
+        if not same_drive(folder, dest):
+            elsewhere.append(folder)                    # another drive: used where it is (no 70 GB copy)
+            continue
+        # the downloads merge file by file (the same file wherever it came from); a prepared pack or MTP layer moves
+        # whole or not at all, so two copies are never mixed
+        if (folder / "models").is_dir():
+            move_into(folder / "models", dest / "models")
+        for item in [*((folder / "packs").glob("*") if (folder / "packs").is_dir() else []), folder / "mtp"]:
+            rel = item.relative_to(folder)
+            if item.exists() and not (dest / rel).exists():
+                move_into(item, dest / rel)
+        for d in ("packs",):
+            try:
+                (folder / d).rmdir()                    # empty now
+            except OSError:
+                pass
+        for c in folder.glob("strata-*.json"):
+            repoint_config(c, folder, dest)
+        if has_data(folder):
+            elsewhere.append(folder)                    # in use, or a copy the data folder already has
+            warn(f"some model files are still in {folder} (in use, or already in {dest})")
+        else:
+            ok(f"model files from {folder} moved to {dest} (a new copy of Strata finds them there)")
+    installs = [str(ROOT)] + [p for p in settings.get("installs", []) if p != str(ROOT) and Path(p).is_dir()]
+    save_settings({**settings, "data_dir": str(dest), "installs": installs[:20]})
+    return dest, elsewhere
+
+
+def previous_config(elsewhere_first: list, settings: dict):
+    """The most recently used model config of another Strata folder on this PC, for a folder that has none yet."""
+    cands = []
+    for folder in [*elsewhere_first, *other_installs(settings)]:
+        cands += list(folder.glob("strata-*.json"))
+    cands = [c for c in dict.fromkeys(cands) if c.is_file()]
+    return max(cands, key=lambda p: p.stat().st_mtime) if cands else None
+
+
+def choices_from_config(cfg_path: Path) -> dict:
+    """The setup answers a config was written with (family, size, context, KV, images, projection, network)."""
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    tag = cfg_path.stem[len("strata-"):]
+    family = next((f for f, d in FAMILIES.items() if d["tag"] and tag.startswith(d["tag"])), "qwen")
+    model = tag.split("-")[-1].upper()
+    a = cfg.get("args", [])
+    val = lambda k: a[a.index(k) + 1] if k in a and a.index(k) + 1 < len(a) else None   # noqa: E731
+    vis = cfg.get("vision")
+    esp = val("--control-vector-scaled")
+    esp_path = esp.rsplit(":", 1)[0] if esp else None
+    return {"family": family, "model": model if model in MODELS else None,
+            "context": int(val("--max-context")) if val("--max-context") else None,
+            "kv": val("--kv") if val("--kv") in ("int8", "q4_0") else None,
+            "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
+            "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
+            "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
+            "layer_split": cfg.get("layer_split")}
+
+
+def find_in(roots: list, rel: str):
+    """The first of roots/rel that exists."""
+    for r in roots:
+        if (r / rel).exists():
+            return r / rel
+    return None
 
 
 # ------------------------------------------------------------------------------------------------ start
@@ -687,6 +1141,52 @@ def is_wsl() -> bool:
     return sys.platform.startswith("linux") and "microsoft" in platform.uname().release.lower()
 
 
+def hardware_key(cfg: dict) -> str:
+    """What a calibration is valid for: this GPU, CPU and RAM, and the model with its context and images setting
+    (the context's KV cache and the image encoder take VRAM from the expert cache)."""
+    sel = cfg.get("gpu")
+    gl = [gpu_info(i) or {} for i in sel] if isinstance(sel, list) else [gpu_info(sel) or {}]
+    g = {"name": " + ".join(x.get("name", "?") for x in gl), "vram_gb": sum(x.get("vram_gb", 0) for x in gl)}
+    a = cfg.get("args", [])
+    ctx = a[a.index("--max-context") + 1] if "--max-context" in a else "?"
+    return "|".join([g.get("name", "?"), f"{g.get('vram_gb', 0):.0f}GB", cpu_info()[0], f"{ram_gb():.0f}GB",
+                     cfg.get("model_name", "?"), ctx, "images" if "--vision" in a else "text"])
+
+
+def calibrate_config(cfg_path: Path) -> bool:
+    """Measure the engine's hardware-dependent settings on this PC (tools/calibrate.py), write them into the run
+    config and remember them per PC and model in the settings file, so an update or a reinstall keeps them."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    import calibrate as CAL
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    say()
+    say("  Tuning Strata for this PC: the output speed is measured with a few engine settings (the PCIe share, the")
+    say("  draft depth, the CPU threads). It takes about 5-10 minutes; the PC is busy meanwhile.")
+    try:
+        res = CAL.run(cfg, say=say)
+    except Exception as e:                             # never stops an install: the defaults stay
+        warn(f"the tuning did not finish ({e}): the default settings stay")
+        return False
+    cfg["args"] = CAL.apply(cfg["args"], res["settings"])
+    cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+    st = load_settings()
+    st.setdefault("calibration", {})[hardware_key(cfg)] = {"settings": res["settings"], "tok_s": res["report"].get("tok_s"),
+                                                           "date": time.strftime("%Y-%m-%d")}
+    save_settings(st)
+    if res["settings"]:
+        ok("tuned for this PC: " + ", ".join(f"{k} {v}" for k, v in res["settings"].items())
+           + (f" ({res['report']['tok_s']} tok/s)" if res["report"].get("tok_s") else ""))
+    else:
+        ok("tuned for this PC: the default settings are already the fastest here"
+           + (f" ({res['report']['tok_s']} tok/s)" if res["report"].get("tok_s") else ""))
+    return True
+
+
+def saved_calibration(cfg: dict) -> dict | None:
+    """The settings an earlier calibration found for this PC and model, if any."""
+    return (load_settings().get("calibration") or {}).get(hardware_key(cfg))
+
+
 def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     """Configs written before v0.1.13 read prompts in fixed 2048-token chunks; the engine now picks the chunk
     itself (`--prefill auto`: up to 8192, as the free VRAM allows - about 2x faster on long prompts).  Under WSL,
@@ -712,7 +1212,8 @@ def upgrade_config(cfg_path: Path, cfg: dict) -> dict:
     return cfg
 
 
-def start(cfg_path: Path, port: int | None, open_browser=True) -> int:
+def start(cfg_path: Path, port: int | None, gpu: int | list | None = None, open_browser=True, yes=False,
+          layer_split=None) -> int:
     cfg = upgrade_config(cfg_path, json.loads(cfg_path.read_text(encoding="utf-8-sig")))
     missing = [p for p in [cfg["exe"], *[a for a in cfg["args"] if a.endswith(".gguf")]] if not Path(p).exists()]
     if missing:
@@ -720,10 +1221,44 @@ def start(cfg_path: Path, port: int | None, open_browser=True) -> int:
     cfg_path.touch()                                     # the most recently used model
     cmd = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
            "--port", str(port or cfg.get("port", 8080))]
+    found = gpus()
+    if isinstance(gpu, list):                          # --gpus: saved, this model runs on these cards from now on
+        check_gpus(gpu, found)
+        cfg["gpu"], cfg["gpus_asked"] = gpu, True
+        cfg["layer_split"] = layer_split or cfg.get("layer_split") or "auto"
+        cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
+        gpu = None
+    elif gpu is not None:                              # --gpu N: this start only, on that card
+        check_gpus([gpu], found)
+        cmd += ["--gpu", str(gpu)]
+    else:
+        cfg = offer_together(cfg_path, cfg, yes)
+    use = gpu if gpu is not None else cfg.get("gpu")
+    if isinstance(use, list):
+        check_gpus(use, found, "(chosen for this model) ")
+        byid = {g["index"]: g for g in found}
+        ok("GPUs: " + " + ".join(gpu_name(byid[i]) for i in use) + f" together (layers split {cfg.get('layer_split') or 'auto'})")
+    elif found:
+        g = next((x for x in found if x["index"] == use), None) if use is not None else max(
+            found, key=lambda x: (round(x["vram_gb"]), -x["index"]))
+        if g is not None:
+            ok("GPU: " + gpu_name(g))
     if open_browser:
         cmd.append("--open")
+    gb = 0.0
+    if "--native" in cfg["args"]:
+        try:
+            gb = Path(cfg["args"][cfg["args"].index("--native") + 1]).stat().st_size / 1e9
+        except (OSError, IndexError):
+            pass
     say()
-    say(f"Starting {cfg.get('model_name', 'the model')} (loads 34-43 GB into RAM: 30-90 s). Close this window to stop it.")
+    say("  " + "-" * 100)
+    say(f"  Starting {cfg.get('model_name', 'the model')}: it loads {f'about {gb:.0f} GB' if gb >= 1 else '34-55 GB'} "
+        "into RAM and locks part of it for the GPU.")
+    say("  While it does, YOUR PC CAN BE SLOW OR STOP RESPONDING FOR 1-3 MINUTES (longer the first time after a")
+    say("  restart). That is normal: please wait and don't close this window - the browser opens when it is ready.")
+    say("  Later, closing this window stops the model.")
+    say("  " + "-" * 100)
     return subprocess.call(cmd)
 
 
@@ -757,10 +1292,19 @@ def main() -> int:
                     help="EXPERIMENTAL, off by default: the control vector in data/experimental-speed-projection "
                          "(or another GGUF) as a projection on layers 4-44; see docs/DETAILS.md")
     ap.add_argument("--port", type=int, help="the server's port (default: the one the install was set up with, 8080 for a new one)")
+    ap.add_argument("--gpu", help="one GPU, numbered as nvidia-smi numbers them (default: asked when several can be "
+                                  "used; with --setup it is saved, when starting it is for that start only)")
+    ap.add_argument("--gpus", help="several GPUs sharing one model, as nvidia-smi numbers them: \"0,2\", or \"all\" "
+                                   "(every card that can); the first is the main one. Saved, also when starting "
+                                   "(see docs/MULTI_GPU.md)")
+    ap.add_argument("--layer-split", help="with --gpus: where each later GPU's layers start (\"18\", \"16,32\"); "
+                                          "default auto, placed from each GPU's free VRAM")
     ap.add_argument("--host", help="where the server listens: 127.0.0.1 = this PC only (default), 0.0.0.0 = also other "
                                    "devices on your network (issue #26; set --api-key too)")
     ap.add_argument("--api-key", help="require this key from clients (recommended with --host 0.0.0.0)")
-    ap.add_argument("--models-dir", default=str(ROOT / "models"), help="where the GGUF files go (~70 GB)")
+    ap.add_argument("--data-dir", help="where the model files go (~70-120 GB): default Strata-data next to this folder, "
+                                       "remembered for every Strata folder on this PC")
+    ap.add_argument("--models-dir", help="where the GGUF files go (default: <data folder>/models)")
     ap.add_argument("--gguf-dir", help="use GGUF files you already have (a folder with the two shards)")
     ap.add_argument("--yes", action="store_true", help="accept the recommended answers")
     ap.add_argument("--setup", action="store_true", help="install another model or change settings")
@@ -769,37 +1313,93 @@ def main() -> int:
     ap.add_argument("--prebuilt", default=os.environ.get("STRATA_PREBUILT_URL", PREBUILT_URL),
                     help="where the ready-made engine is (a URL folder or a local folder)")
     ap.add_argument("--check", action="store_true", help="only check this PC and exit")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="tune the engine's settings for this PC (about 5-10 minutes), then start the model")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
-    port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
-
+    if a.gpu is not None:                              # --gpu 0,2 means --gpus 0,2 (a user tried it: issue report)
+        if "," in a.gpu:
+            a.gpus, a.gpu = a.gpus or a.gpu, None
+        elif a.gpu.strip().isdigit():
+            a.gpu = int(a.gpu)
+        else:
+            ap.error(f"--gpu takes a GPU number as nvidia-smi numbers them, e.g. --gpu 1 (or --gpus 0,2), not {a.gpu!r}")
     say("Strata - Qwen3.8-Flash-Next on a normal PC (NVIDIA GPU + system RAM + CPU)")
+    data, elsewhere = data_folder(a.data_dir)          # the model files: in the data folder, found from any copy
+    roots = [data, *elsewhere]
+    if a.models_dir is None:
+        a.models_dir = str(data / "models")
 
     # ---- 0. already installed: just start it
     have = installed_configs()
+    explicit = a.setup or a.model or a.family or a.check or a.no_start
+    if not have and not explicit:                      # a new copy of Strata (an update unzipped elsewhere): set it
+        prev = previous_config(elsewhere, load_settings())   # up like the last one, from the files already here
+        if prev is not None:
+            ch = choices_from_config(prev)
+            if ch["model"]:
+                say(f"  Found your earlier install in {prev.parent} ({prev.stem[len('strata-'):]}): setting up this "
+                    "copy the same way - the model files are reused, nothing big is downloaded.")
+                a.family, a.model, a.context = ch["family"], ch["model"], a.context or ch["context"]
+                a.kv = a.kv or ch["kv"]
+                a.vision = a.vision or ch["vision"]
+                a.experimental_speed_projection = a.experimental_speed_projection or ch["esp"]
+                a.host, a.api_key = a.host or ch["host"], a.api_key or ch["api_key"]
+                a.port = a.port or ch["port"]
+                if isinstance(ch.get("gpu"), list):     # a layer split: set up across the same cards again
+                    a.gpus = a.gpus or ",".join(str(g) for g in ch["gpu"])
+                    a.layer_split = a.layer_split or ch.get("layer_split")
+                else:
+                    a.gpu = a.gpu if a.gpu is not None else ch.get("gpu")
+                a.yes = True
+    global GPU_PICK
+    # starting an installed model: --gpus 0,2 (or all) saves those cards for it and starts on them (it used to start
+    # on the first one alone unless given with --setup), --gpu N runs this start on one card; neither: the saved
+    # choice, and asked once when the PC has cards that could share the model
+    run_gpu = (parse_gpus(a.gpus, gpus()) if a.gpus else None) or a.gpu
+    port = a.port or 8080                              # a new install's port (issue #32: --port for an existing one)
+    if have and a.calibrate and not (a.setup or a.model or a.family or a.check):
+        if not a.build:
+            update_installed_engine(a.prebuilt)
+        pick_cfg = have[0]
+        if len(have) > 1:
+            say()
+            for i, c in enumerate(have, 1):
+                say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
+            pick_cfg = have[int(ask("Tune which one?", [str(i) for i in range(1, len(have) + 1)], "1", a.yes)) - 1]
+        calibrate_config(pick_cfg)
+        return 0 if a.no_start else start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split)
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         if not a.build:
             update_installed_engine(a.prebuilt)
         if len(have) == 1:
-            return start(have[0], a.port)
+            return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split)
         say()
         for i, c in enumerate(have, 1):
             say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
         say(f"  {len(have) + 1}) install another model / change settings")
         pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
         if pick <= len(have):
-            return start(have[pick - 1], a.port)
+            return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split)
 
     # ---- 1. the PC
     step(1, "checking your PC")
-    gpu = gpu_info()
-    if gpu is None:
+    found = gpus()
+    if not found:
         fail("no NVIDIA GPU found (nvidia-smi did not answer)",
              "install the NVIDIA driver from https://www.nvidia.com/drivers and restart the PC")
-    ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {gpu['arch'][:-1]}.{gpu['arch'][-1]}, "
-       f"driver {gpu['driver']}")
-    if int(gpu["arch"]) < 80:
-        fail("this GPU is older than the RTX 30 series (compute capability 8.0 is required)")
+    if len(found) > 1 or gpu_problem(found[0]) is not None:
+        gpu_table(found)
+    sel = choose_gpus(a, found)                        # asked when two or more cards can share the model
+    multi = sel if len(sel) > 1 else []
+    a.gpu = sel[0]                                     # the main GPU: the checks and the sizing below are its
+    GPU_PICK = a.gpu
+    gpu = gpu_info(a.gpu)
+    chosen = [gpu_info(i) for i in sel]
+    gpu["archs"] = sorted({x["arch"] for x in chosen})  # the engine needs code for every one of them
+    if multi:
+        ok("GPUs: " + " + ".join(gpu_name(x) for x in chosen) + " together (the model's layers are split across them)")
+    ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {cc(gpu)}, driver {gpu['driver']}")
     if driver_major(gpu) < MIN_DRIVER:
         fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
              "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
@@ -809,12 +1409,17 @@ def main() -> int:
     cpu, avx2, avx512 = cpu_info()
     need = min(d["ram_gb"] for d in MODELS.values())
     if ram < need - 4 and not a.check:
-        # every model keeps ALL its experts in RAM (34+ GB); VRAM only holds a copy of the most-used ones, so a
+        # every model keeps ALL its experts in RAM (23+ GB); VRAM only holds a copy of the most-used ones, so a
         # bigger GPU does not lower this
-        fail(f"RAM: {ram:.0f} GB - the smallest model (Q2_0 / IQ2_XS) needs about {need} GB",
-             "Strata keeps all of the model's experts in RAM (34-50 GB, whatever the GPU) and the GPU holds a copy "
-             "of the most-used ones: it needs 48 GB of RAM or more")
+        fail(f"RAM: {ram:.0f} GB - the smallest model (the Coder) needs about {need} GB",
+             "Strata keeps all of the model's experts in RAM (23-50 GB, whatever the GPU) and the GPU holds a copy "
+             "of the most-used ones: it needs 32 GB of RAM or more (48 GB for the full model)")
     ok(f"RAM: {ram:.0f} GB" if ram >= need - 4 else f"RAM: {ram:.0f} GB (less than the {need} GB the smallest model needs)")
+    pf = page_file_gb()
+    if pf is not None and pf < 4:
+        warn(f"Windows' page file is {pf:.1f} GB: the graphics card's memory needs room there too (issue #60), so "
+             "the model may not start or may use less VRAM. Set it to \"System managed\": System > About > "
+             "Advanced system settings > Performance > Advanced > Virtual memory")
     ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     if not avx2:
         fail("this CPU has no AVX2; Strata needs at least AVX2")
@@ -841,21 +1446,31 @@ def main() -> int:
     if fam.get("license"):
         say(f"  Its license: {fam['license']}")
     say()
-    names = [m for m in MODELS if family in MODELS[m].get("families", FAMILIES)]
+    names = [m for m in MODELS if family in MODELS[m].get("families", ("qwen", "swift"))]
     if a.model and a.model not in names:
         fail(f"{fam['title']} has no {a.model} model file", "choose one of: " + ", ".join(names))
     for i, m in enumerate(names, 1):
         d = MODELS[m]
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
-    rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 else "1"
+    rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     if ram < MODELS[model]["ram_gb"] - 4:
-        fail(f"{model} needs about {MODELS[model]['ram_gb']} GB of RAM; this PC has {ram:.0f} GB",
-             "choose Q2_0 or IQ2_XS, or add RAM")
+        # #125: a warning and a question, not a stop: the user may accept paging (asked, "no" by default, so an
+        # unattended --yes install still stops here)
+        need_gb, arena = MODELS[model]["ram_gb"], MODELS[model]["arena_gb"]
+        warn(f"{model} needs about {need_gb} GB of RAM and this PC has {ram:.0f} GB: its experts alone are "
+             f"{arena:.0f} GB and must stay in RAM, so Windows/Linux will page part of them from disk. Expect it "
+             "to be much slower, and it may not start at all.")
+        say("       A smaller size (Q2_0 or IQ2_XS) fits; more RAM fixes it.")
+        if ask("  Install it anyway?", ["y", "n"], "n", a.yes) != "y":
+            fail(f"{model} needs about {need_gb} GB of RAM; this PC has {ram:.0f} GB",
+                 "choose Q2_0 or IQ2_XS, or add RAM")
+        warn(f"installing {model} with {ram:.0f} GB of RAM, as you chose")
     ok(f"size: {model}")
     tag = fam["tag"] + model                           # names of the pack, config and start script
-    rec_ctx = 32768 if gpu["vram_gb"] < 14 else 65536 if gpu["vram_gb"] < 20 else 131072
+    small = min(x["vram_gb"] for x in chosen)         # each card keeps its layers' KV of the whole context
+    rec_ctx = 32768 if small < 14 else 65536 if small < 20 else 131072
     if a.context:
         ctx = a.context
     else:
@@ -893,7 +1508,7 @@ def main() -> int:
     # chosen here; with it loaded, the web app and the API switch it off per request
     esp = None
     esp_choice = (a.experimental_speed_projection or "").strip()
-    if family == "qwen":
+    if family in ("qwen", "coder"):                   # the Coder: the same model's residual stream
         if not esp_choice:
             say()
             say("  EXPERIMENTAL - speed projection: a small control vector applied while the model runs (layers 4-44).")
@@ -910,6 +1525,13 @@ def main() -> int:
         warn("the experimental speed projection is made for the original Qwen3.8-Flash-Next, not Swift 1.5: left off")
     models_dir = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     shards = [models_dir / fam["file"].format(q=model, i=i) for i in (1, 2)]
+    if not a.gguf_dir and not all(sh.exists() and done(sh) for sh in shards):
+        for r in elsewhere:                            # already downloaded in a Strata folder on another drive
+            cand = [r / "models" / tag / sh.name for sh in shards]
+            if all(c.exists() and done(c) for c in cand):
+                models_dir, shards = cand[0].parent, cand
+                ok(f"model files found in {models_dir}")
+                break
     have_model = all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
     need = (0 if a.gguf_dir or have_model else MODELS[model]["download_gb"]) + 8 + \
         (40 if model == "Q2_0" and avx512 and family == "qwen" else 0) + (1 if vision != "none" else 0)
@@ -943,9 +1565,9 @@ def main() -> int:
             if s.exists() and done(s):
                 ok(f"{s.name} already downloaded")
                 continue
-            # the original's shard 2 is the same file for all three sizes: reuse one that is already here
+            # the original's shard 2 is the same file for all its sizes and the Coder: reuse one that is already here
             other = [p for p in Path(a.models_dir).glob("*/Qwen3.8-Flash-Next-GSQ-RCO-*-00002-of-00002.gguf") if done(p)]
-            if family == "qwen" and s.name.endswith("00002-of-00002.gguf") and other and not s.exists():
+            if family in ("qwen", "coder") and s.name.endswith("00002-of-00002.gguf") and other and not s.exists():
                 try:
                     os.link(other[0], s)
                     mark(s)
@@ -954,11 +1576,11 @@ def main() -> int:
                 except OSError:
                     pass
             download(fam["hf"].format(q=model) + s.name, s)
-    for s in shards:
-        if not s.exists():
-            fail(f"missing {s}")
+    check_shards(shards)
     ok("model files present")
     mmproj = Path(a.models_dir) / fam["mmproj"]
+    if not mmproj.exists():
+        mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
     if vision != "none":
         if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
             mmproj = Path(a.gguf_dir) / fam["mmproj"]
@@ -968,7 +1590,7 @@ def main() -> int:
 
     # ---- 6. the pack and the MTP draft layer
     step(6, "preparing the model for Strata")
-    pack = ROOT / "packs" / tag.lower()
+    pack = find_in(roots, f"packs/{tag.lower()}") or data / "packs" / tag.lower()
     env = dict(os.environ, STRATA_GGUF_PY=str(llama / "gguf-py"))
     if model == "Q2_0" and avx512 and family == "qwen":
         # the Q2_0 experts repacked for the AVX-512 kernel (the measured speed): a one-time ~40 GB conversion
@@ -984,7 +1606,7 @@ def main() -> int:
         # every tensor as the GGUF stores it; the experts are read from the GGUF at start (seconds to build)
         run([sys.executable, str(ROOT / "tools" / "iq_pack.py"), "--gguf", str(shards[0]), "--out", str(pack)], env=env)
     ok(f"model prepared: {pack}")
-    mtp = ROOT / "mtp"
+    mtp = (find_in(roots, "mtp/rt/experts.bin") or data / "mtp/rt/experts.bin").parent.parent
     rt = mtp / "rt"
     if not (rt / "experts.bin").exists():
         say("  The MTP draft layer (speculative decoding, ~2x faster output) comes from the original Qwen checkpoint:")
@@ -1006,7 +1628,7 @@ def main() -> int:
     if ple is None:
         fail("the model has no per_layer_token_embd tensor (is this a Qwen3.8-Flash-Next GGUF?)")
     args = ["--pack", str(pack), "--native", str(shards[0]), "--ple-gguf", str(ple),
-            "--expert-profile", str(ROOT / "data" / "expert-profile.bin"), "--expert-cache", "auto",
+            "--expert-profile", str(ROOT / "data" / fam.get("profile", "expert-profile.bin")), "--expert-cache", "auto",
             "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5", "--mtp", str(rt),
             "--max-context", str(ctx)]
     if ctx > 8192:
@@ -1030,6 +1652,13 @@ def main() -> int:
     cfg = {"exe": str(eng / EXE), "args": args, "cwd": str(ROOT), "tokenizer": str(pack / "tokenizer"),
            "model_name": f"{fam['name']}-{model.lower()}", "log": str(ROOT / f"strata-{tag.lower()}.log"),
            "lib_dirs": lib_dirs, "port": port}
+    if gpu["count"] > 1 or a.gpu is not None:
+        cfg["gpu"] = gpu["index"]                      # the engine is told this card (issue #51)
+        cfg["gpus_asked"] = True                       # chosen at setup: not asked again at start
+    if multi:                                          # a layer split across these cards (the server adds the flag)
+        cfg["gpu"] = multi
+        cfg["layer_split"] = a.layer_split or "auto"
+        ok(f"layer split across GPUs {multi} ({cfg['layer_split']})")
     if a.host:
         cfg["host"] = a.host
     if a.api_key:
@@ -1040,8 +1669,19 @@ def main() -> int:
         if vision == "cpu":
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
+    cal = saved_calibration(cfg)
+    if cal is not None:
+        sys.path.insert(0, str(ROOT / "tools"))
+        import calibrate as CAL
+        cfg["args"] = CAL.apply(cfg["args"], cal.get("settings") or {})
+        ok("the settings tuned for this PC earlier are used" + (f" ({cal['date']})" if cal.get("date") else ""))
     cfg_path.write_text(json.dumps(cfg, indent=1), encoding="utf-8")
     script = write_run_script(tag, cfg_path, port)
+    # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
+    if cal is None and not a.no_start and not a.yes and ask(
+            "Tune Strata for this PC now? It measures a few engine settings (about 5-10 minutes; the PC is busy "
+            "meanwhile; later: START-HERE --calibrate)", ["y", "n"], "y", a.yes) == "y":
+        calibrate_config(cfg_path)
     ok(f"start script: {script.name}")
 
     say()

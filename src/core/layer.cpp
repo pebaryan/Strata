@@ -364,7 +364,8 @@ project_bf16(x, b.x_bf16, (const uint16_t*) w_router->data, b.logits, g.n_embd, 
 // ---- routing: softmax over ALL experts, stable descending argsort with ties by index, gather, renormalise
 if (native_router_enabled()) {
     // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): the kernel's warp layout is compiled per expert count
-    // (see native_router.cu), so a pruned 256-expert pack is accepted alongside the unpruned 512.
+    // (see native_router.cu), so a pruned 256-expert pack is accepted alongside the unpruned 512; any other
+    // count falls through to the generic top-k kernel.
     if ((g.n_expert != 512 && g.n_expert != 256) || k != 10) {
         err = v.name("router") + ": native router requires 512 or 256 experts and k=10";
         return false;

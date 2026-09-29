@@ -93,20 +93,20 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.max_blob = 0;
     std::string line;
     while (std::getline(in, line)) {
-        if (line.empty()) continue;
-        if (line[0] == '#') {
-            // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-28): the pack states its own expert count in this
-            // header, but the caller passes a default-constructed geometry (512) because this check runs
-            // before the model is opened.  Trust the file, or every pruned (256-expert) pack fails the
-            // contiguity check below.
-            const std::string key = "n_expert ";
-            const size_t at_key = line.find(key);
-            if (at_key != std::string::npos) {
-                int64_t n = 0;
-                for (size_t i = at_key + key.size(); i < line.size() && line[i] >= '0' && line[i] <= '9'; ++i) {
-                    n = n * 10 + (line[i] - '0');
+        if (line.empty() || line[0] == '#') {
+            if (!line.empty() && line[0] == '#') {
+                // v3 packs record their expert count in the header; a pruned model (GSQ-RCO Coder) ships
+                // fewer experts than the canonical geometry the caller passes, which is a compile-time
+                // default, so the header wins.  LOCAL (peb): this fork's older packs write the same field
+                // without parentheses, so accept both spellings.
+
+                const size_t at = line.find("(n_expert ");
+                if (at != std::string::npos) {
+                    L.n_expert = std::atoll(line.c_str() + at + 10);
+                } else if (const size_t bare = line.find("n_expert "); bare != std::string::npos) {
+                    const int64_t n = std::atoll(line.c_str() + bare + 10);
+                    if (n > 0) L.n_expert = n;
                 }
-                if (n > 0) L.n_expert = n;
             }
             continue;
         }

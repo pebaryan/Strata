@@ -13,5 +13,10 @@ bool native_router_enabled();
 // computed probabilities select the lower expert index. All spans must be
 // four-byte aligned and outputs disjoint from each other and the input.
 // Requires a nonnull ordered CUDA stream. No allocation or synchronization.
+/// The expert count is the caller's: upstream's kernel hardwires 512, this fork's warp layout follows the
+/// artifact (512 -> 16 values per lane, 256 -> 8), which is what lets a pruned pack use the fused router.
 void native_router_top10(const float* logits, int32_t* ids, float* weights, int n_expert, void* stream);
+/// n_tok rows at once (logits [n, n_expert], ids/weights [n,10]); each row exactly as the single call.
+void native_router_top10_multi(const float* logits, int32_t* ids, float* weights, int n_tok, int n_expert,
+                               void* stream);
 }
