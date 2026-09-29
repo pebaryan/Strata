@@ -52,7 +52,11 @@ __global__ void route(const float* __restrict__ logits, int32_t* __restrict__ id
     constexpr int VEC = NEXP / 32;
     // Preserve the pinned 32x8 block geometry; only row zero is active here.
     // blockIdx.x = the token (a multi-token launch; 0 for the single one)
-    logits += (size_t) blockIdx.x * 512; ids += (size_t) blockIdx.x * 10; weights += (size_t) blockIdx.x * 10;
+    // LOCAL PRUNED-MODEL SUPPORT (peb, 2026-09-29): the row stride was pinned at the unpruned 512, so in a
+    // multi-row (batched verify) launch every row past the first read logits 2x too far on a 256-expert pack
+    // and the router returned the wrong experts - the model then rambled or ended its turn mid-thinking.
+    // Single-row calls (blockIdx.x == 0) never showed it.  The stride follows the artifact like VEC does.
+    logits += (size_t) blockIdx.x * NEXP; ids += (size_t) blockIdx.x * 10; weights += (size_t) blockIdx.x * 10;
     if (threadIdx.y != 0) return;
     const int lane = threadIdx.x;
     float values[VEC];
