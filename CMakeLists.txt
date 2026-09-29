@@ -39,6 +39,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/CMakeLists.txt AND EXISTS ${CMAKE_CU
   set(_strata_tests_default ON)
 endif()
 option(STRATA_BUILD_TESTS "Build the test suite" ${_strata_tests_default})
+# `add_test` on its own does nothing: CTest must be switched on for the suite to be runnable at all.  The parity
+# `add_test` calls below live under `if(STRATA_ENABLE_CUDA)` (not under STRATA_BUILD_TESTS), so this is
+# unconditional - otherwise `ctest` reports "No tests were found" while the binaries sit right there, which is how
+# a router stride bug survived a fully green build (2026-09-29).
+enable_testing()
 option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
 if(STRATA_ENABLE_CUDA)
