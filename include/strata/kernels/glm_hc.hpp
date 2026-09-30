@@ -26,6 +26,12 @@ inline constexpr int SINKHORN_ITERS = 20;         ///< hyper_connection.sinkhorn
 /// hyper_connection.epsilon: added to every Sinkhorn divisor and to `pre` after its sigmoid.
 inline constexpr float HC_EPS = 1e-6f;
 
+/// attention.layer_norm_rms_epsilon, i.e. the model's f_norm_rms_eps, which the reference passes to the
+/// graph context as norm_rms_eps and feeds to the stream rms_norm.  It is NOT hyper_connection.epsilon:
+/// the two differ by 10x and using either one for both is invisible to a parity gate, because the
+/// oracle and the kernel then agree with each other while differing from the reference.
+inline constexpr float HC_RMS_EPS = 1e-5f;
+
 /// The per-token mix a site needs: `pre` selects the layer input out of the streams, `post` scales what
 /// the site returns, `comb` is the Sinkhorn-normalized stream-to-stream matrix.
 struct HcMix {

@@ -44,6 +44,7 @@ import iq_pack as P          # noqa: E402
 HC = 4          # hyper_connection.count
 SINKHORN_ITERS = 20
 EPS = 1e-6      # hyper_connection.epsilon (metadata: 9.999999974752427e-07)
+RMS_EPS = 1e-5  # attention.layer_norm_rms_epsilon (metadata: 9.999999747378752e-06)
 
 
 class Model:
@@ -64,8 +65,13 @@ class Model:
         return np.asarray(vals, dtype=np.float32).reshape(tuple(int(d) for d in reversed(t.shape)))
 
 
-def rms_norm(x: np.ndarray, eps: float = 1e-6) -> np.ndarray:
-    """ggml_rms_norm over ne0, unscaled (the reference calls it without a weight)."""
+def rms_norm(x: np.ndarray, eps: float = RMS_EPS) -> np.ndarray:
+    """ggml_rms_norm over ne0, unscaled (the reference calls it without a weight).
+
+    eps here is the MODEL's rms eps (attention.layer_norm_rms_epsilon = 1e-5, passed to the graph
+    context as norm_rms_eps), NOT hyper_connection.epsilon - the two differ and using the wrong one
+    is invisible to a parity gate, because the oracle and the kernel then share the error.
+    """
     return x / np.sqrt(np.mean(x * x, axis=0, keepdims=True) + eps)
 
 

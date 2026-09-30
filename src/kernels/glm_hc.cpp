@@ -63,7 +63,7 @@ void hc_pre(const float* x, const float* fn, const float* base, const float* sca
     // rms_norm over the flattened streams (the reference normalizes the whole hc*n_embd block at once)
     double ss = 0.0;
     for (int i = 0; i < dim; ++i) ss += (double) x[i] * (double) x[i];
-    const float rms = 1.0f / std::sqrt((float) (ss / dim) + HC_EPS);
+    const float rms = 1.0f / std::sqrt((float) (ss / dim) + HC_RMS_EPS);
 
     // mixes[m] = sum_i fn[m][i] * flat_norm[i]  (ggml_mul_mat reduces over the weight's ne0)
     std::vector<float> mixes((size_t) HC_MIX_DIM, 0.0f);
