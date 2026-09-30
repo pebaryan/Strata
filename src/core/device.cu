@@ -30,7 +30,11 @@ DeviceInfo device_info(int ordinal) {
     int count = 0;
     check(cudaGetDeviceCount(&count), "cudaGetDeviceCount");
     if (count == 0) {
-        throw CudaError("no CUDA device is present; Strata needs an NVIDIA GPU of compute capability 8.0 or newer", -1);
+#if defined(STRATA_USE_HIP)
+        throw CudaError("no HIP device is present; this backend targets gfx1100 wave32", -1);
+#else
+        throw CudaError("no CUDA device is present; Strata needs an NVIDIA GPU (RTX 20 series or newer)", -1);
+#endif
     }
     if (ordinal < 0 || ordinal >= count) {
         throw CudaError("device ordinal " + std::to_string(ordinal) + " is out of range (have " +
@@ -56,23 +60,29 @@ DeviceInfo device_info(int ordinal) {
     check(cudaDriverGetVersion(&d.driver_version), "cudaDriverGetVersion");
     check(cudaRuntimeGetVersion(&d.runtime_version), "cudaRuntimeGetVersion");
 
-    // Upstream's floor here is 8.0 (tf32 mma in the attention scorer, bf16 math; RTX 30 / 40 / 50) and its
-    // arch guard enforces the same floor at build time.  LOCAL VOLTA PORT (peb, 2026-09-28): this fork is
-    // configured for sm_70, so its runtime floor is 7.0.  sm_70 has no tf32 mma, no ldmatrix and no bf16
-    // tensor-core math, so this port's speed and numerics differ from the validated sm_80+ path: they are
-    // measured here, never assumed.
-    if (d.cc_major < 7) {
+#if defined(STRATA_USE_HIP)
+    if (std::strncmp(p.gcnArchName, "gfx1100", 7) != 0 || p.warpSize != 32) {
+        throw CudaError("HIP backend requires validated gfx1100 wave32 hardware", -1);
+    }
+#else
+    // Upstream's floor is 7.5 (Turing: below sm_80 the QSA scorer takes its portable fp32-FMA fallback and the
+    // tensor-core prompt kernels refuse and fall back), and its CMake guard enforces that at build time.
+    // LOCAL VOLTA PORT (peb, 2026-09-28): this fork is also configured for sm_70, so its runtime floor is 7.0.
+    // sm_70 has no tf32 mma, no ldmatrix and no bf16 tensor-core math, so this port's speed and numerics differ
+    // from the validated sm_80+ path: they are measured here, never assumed.
+    if (d.cc_major * 10 + d.cc_minor < 70) {
         throw CudaError("device " + d.name + " reports compute capability " + std::to_string(d.cc_major) +
                             "." + std::to_string(d.cc_minor) +
-                            "; this build needs compute capability 7.0 or newer (the Volta port)",
+                            "; this build needs compute capability 7.0 or newer (the Volta port; upstream needs 7.5)",
                         -1);
     }
-    if (d.cc_major != 12) {
+    if (d.cc_major == 7) {
         std::fprintf(stderr,
-                     "strata: WARNING local Volta build: %s is sm_%d%d, not sm_120; speed and numerics "
-                     "are unvalidated on this architecture\n",
+                     "strata: WARNING local Volta port: %s is sm_%d%d; upstream validates 7.5 and newer, so this "
+                     "port's speed and numerics are the port's own\n",
                      d.name.c_str(), d.cc_major, d.cc_minor);
     }
+#endif
     return d;
 }
 
