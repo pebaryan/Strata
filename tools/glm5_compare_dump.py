@@ -49,12 +49,17 @@ def main() -> int:
         print(f"no manifest at {man}; run tools/glm5_ref_dump.cpp first")
         return 2
 
-    rows, first_bad, checked, missing = [], None, 0, 0
+    rows, first_bad, checked, missing, skipped = [], None, 0, 0, 0
     for line in man.read_text().splitlines():
         f = line.split("\t")
         if len(f) < 7:
             continue
         name, tfile = f[0], f[6]
+        if tfile.startswith("SKIPPED") or tfile.startswith("DUPLICATE"):
+            # not comparable data: a non-contiguous view's buffer is not what the graph sees, and a
+            # duplicate name means one tensor's file was overwritten by another's
+            skipped += 1
+            continue
         if a.only and a.only not in name:
             continue
         rp, pp = ref_dir / tfile, port_dir / tfile
@@ -75,7 +80,8 @@ def main() -> int:
         if first_bad is None and rel > a.tol:
             first_bad = (name, ma, rel)
 
-    print(f"compared {checked} tensors ({missing} missing from one side), tol {a.tol:g} of each array's scale")
+    print(f"compared {checked} tensors ({missing} missing from one side, {skipped} not comparable: views "
+          f"or duplicate names), tol {a.tol:g} of each array's scale")
     if first_bad:
         print(f"\nFIRST DIVERGENCE in evaluation order: {first_bad[0]}  "
               f"max abs {first_bad[1]:.4e}  (= {first_bad[2]:.4e} of scale)")

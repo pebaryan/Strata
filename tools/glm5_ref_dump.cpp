@@ -24,6 +24,7 @@
 #include <cstring>
 #include <cmath>
 #include <list>
+#include <set>
 #include <string>
 #include <vector>
 #include <fstream>
@@ -37,12 +38,15 @@ struct Dumper {
     bool dumping = false;
     std::ofstream manifest;
     int dumped = 0;
+    std::set<std::string> seen;              // names already written
+    std::vector<std::string> dupes;          // names that appeared more than once
 
     bool wanted(const std::string & n) const {
         if (all) return true;
         static const char * keys[] = {"l_out", "hc_head", "h_nextn", "result_norm", "result_output",
-                                      "attn_out", "kda_gate", "ffn_out", "inp_embd", "hc_attn", "hc_ffn",
-                                      "Qcur", "kv_cmpr", "ffn_moe_out", "kda_beta", "mtp_"};
+                                      "attn_out", "kda_gate", "kda_beta", "ffn_out", "inp_embd", "hc_init",
+                                      "hc_attn", "hc_ffn", "attn_norm", "ffn_norm", "ffn_inp",
+                                      "Qcur", "kv_cmpr", "ffn_moe_out", "mtp_"};
         for (const char * k : keys)
             if (n.find(k) != std::string::npos) return true;
         return false;
@@ -57,6 +61,24 @@ void dump_tensor(ggml_tensor * t) {
     std::string safe = name;
     std::replace(safe.begin(), safe.end(), '/', '_');
     const std::string path = g_d.dir + "/" + safe + ".bin";
+
+    // A non-contiguous tensor is a VIEW (a broadcast, a permute, a reshape of something else).  Reading
+    // its buffer yields the underlying bytes, not the values the graph sees through it - which silently
+    // produced a "hc_init" whose four broadcast streams differed from each other.  Skip, and say so.
+    if (!ggml_is_contiguous(t)) {
+        g_d.manifest << name << "\t" << t->ne[0] << "\t" << t->ne[1] << "\t" << t->ne[2] << "\t" << t->ne[3]
+                     << "\t" << ggml_type_name(t->type) << "\tSKIPPED-NON-CONTIGUOUS-VIEW\n";
+        return;
+    }
+    // Two tensors can share a name in this graph (the graph's inputs-embeds placeholder and the real
+    // embedding lookup are both "inp_embd"), in which case one file overwrites the other.  Record which.
+    if (g_d.seen.count(name)) {
+        g_d.manifest << name << "\t" << t->ne[0] << "\t" << t->ne[1] << "\t" << t->ne[2] << "\t" << t->ne[3]
+                     << "\t" << ggml_type_name(t->type) << "\tDUPLICATE-NAME (already written)\n";
+        g_d.dupes.push_back(name);
+        return;
+    }
+    g_d.seen.insert(name);
 
     const int64_t n = ggml_nelements(t);
     std::vector<float> f((size_t) n, 0.0f);
@@ -182,6 +204,11 @@ int main(int argc, char ** argv) {
     tokfile << "\ndone " << generated.size() << " tokens\n";
     std::printf("\nwrote %s/dump.tsv (%d tensors) and %s/tokens.txt\n", g_d.dir.c_str(), g_d.dumped,
                 g_d.dir.c_str());
+    if (!g_d.dupes.empty()) {
+        std::printf("note: %zu tensor name(s) appeared more than once; the first was kept:\n",
+                    g_d.dupes.size());
+        for (size_t i = 0; i < g_d.dupes.size() && i < 12; ++i) std::printf("  %s\n", g_d.dupes[i].c_str());
+    }
 
     llama_sampler_free(smpl);
     llama_free(ctx);
