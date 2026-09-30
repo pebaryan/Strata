@@ -52,6 +52,9 @@ def main() -> int:
                     help="how many trunk blocks (default: block_count - nextn_predict_layers, i.e. the "
                          "artifact's own trunk length)")
     ap.add_argument("--vocab", type=int, default=154880)
+    ap.add_argument("--save-hidden", help="write the post-trunk hidden state (last token, post "
+                                          "output_norm) to this .npy so a head fix need not re-run the "
+                                          "whole trunk")
     a = ap.parse_args()
 
     toks = [int(t) for t in a.tokens.split()]
@@ -138,11 +141,21 @@ def main() -> int:
     cur = HC.hc_mean(np.transpose(inpL, (1, 0, 2)))                     # [n_embd, T]
     cur = DRV.rms_norm_ne0(cur, w.tensor("output_norm.weight"))
     x = cur[:, -1].astype(np.float64)                                    # the last prompt token
+    if a.save_hidden:
+        # keep the post-trunk state so a HEAD fix can be tested in seconds instead of re-running 45
+        # blocks: the expensive part is the trunk, and it does not change when the head does.
+        np.save(a.save_hidden, np.asarray(x, dtype=np.float32))
+        print(f"saved the post-trunk hidden state to {a.save_hidden}")
 
     best_v, best_s = -1, -np.inf
+    # the reference prefers the artifact's own output.weight and falls back to the TIED token_embd only
+    # when it is absent (llama-model.cpp: TENSOR_NOT_REQUIRED, then TENSOR_DUPLICATED).  Using the
+    # embedding here when output.weight exists silently computes the wrong projection.
+    out_name = "output.weight" if "output.weight" in w.m.m.where else "token_embd.weight"
+    print(f"output projection: {out_name}")
     for lo in range(0, a.vocab, 4096):                                   # in chunks: 154880 x 4096
         hi = min(lo + 4096, a.vocab)
-        rows = np.stack([w.embedding(v, a.vocab) for v in range(lo, hi)]).astype(np.float64)
+        rows = np.stack([w.embedding(v, a.vocab, out_name) for v in range(lo, hi)]).astype(np.float64)
         s = rows @ x
         i = int(np.argmax(s))
         if s[i] > best_s:

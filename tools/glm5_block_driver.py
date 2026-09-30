@@ -64,10 +64,15 @@ class Weights:
     def tensor(self, name: str) -> np.ndarray:
         return self.m.tensor(name)
 
-    def embedding(self, token: int, vocab: int) -> np.ndarray:
+    def embedding(self, token: int, vocab: int, name: str = "token_embd.weight") -> np.ndarray:
         """One row of the (quantized) token embedding table, dequantized.  ne0 = n_embd, so a row is a
-        whole number of quant blocks and can be sliced directly."""
-        g, t, mm, _ = self.m.m.where["token_embd.weight"]
+        whole number of quant blocks and can be sliced directly.
+
+        `name` picks the table: the reference's output projection prefers the artifact's own
+        output.weight and only falls back to the tied token_embd (llama-model.cpp's TENSOR_NOT_REQUIRED
+        then TENSOR_DUPLICATED), so a head that always uses token_embd is wrong whenever output.weight
+        exists - which it does in this artifact."""
+        g, t, mm, _ = self.m.m.where[name]
         row_bytes = t.expected_bytes() // vocab
         raw = np.asarray(P.tensor_bytes(mm, g, t))[token * row_bytes:(token + 1) * row_bytes]
         vals = self.m.quants.dequantize(raw, self.m.Q[t.type_name])
