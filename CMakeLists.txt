@@ -164,6 +164,12 @@ add_executable(glm_indexer_parity src/kernels/glm_indexer_parity.cpp src/kernels
 target_include_directories(glm_indexer_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_indexer_parity PRIVATE -O2)
 
+# KDA parity (branch glm5next-port): the linear-attention block, the recurrence shared with the engine's
+# GDN but with a per-channel decay, against tools/glm5_kda_reference.py.
+add_executable(glm_kda_parity src/kernels/glm_kda_parity.cpp src/kernels/glm_kda.cpp)
+target_include_directories(glm_kda_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm_kda_parity PRIVATE -O2)
+
 add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
