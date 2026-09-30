@@ -329,12 +329,24 @@ int main() {
         float* d_at4 = dalloc<float>((size_t) QH * D);
         const bool took = k::qsa_prompt_attn_batch(d_q, pools, d_ids, d_step, cells, s, d_at4, 1, nullptr);
         if (!took) {
+            int cc_major = 0;
+            cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, 0);
 #if defined(STRATA_USE_HIP)
             // AMD: the tensor-core prompt path is CUDA-only, so it refuses every pool and the old kernel runs
             std::printf("[5/5] qsa_prompt_attn mode 3: PASS (refused on HIP - the old kernel runs)\n");
 #else
-            std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (refused the hybrid pools)\n");
-            g_fail = 1;
+            if (cc_major < 8) {
+                // LOCAL VOLTA PORT (peb, 2026-09-30): qsa_prompt_attn.cu refuses cc < 8 by design
+                // ("if (cc_major[dev] < 8) return false"), because the scorer is tf32 mma.  On a Volta port
+                // the old prompt kernel runs and its output is still checked against the dequant reference
+                // below, so the refusal is the documented speed gap rather than a failure.  Keep the FAIL
+                // branch for sm_80+, where a refusal WOULD be a regression.
+                std::printf("[5/5] qsa_prompt_attn mode 3: PASS (refused on sm_%d0: the tensor-core prompt path "
+                            "needs 8.0+, so the old kernel runs)\n", cc_major);
+            } else {
+                std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (refused the hybrid pools)\n");
+                g_fail = 1;
+            }
 #endif
         } else {
             k::fwht256_inplace_cuda(d_at4, QH, nullptr);
