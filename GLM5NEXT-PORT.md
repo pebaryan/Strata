@@ -290,7 +290,42 @@ from a paper. That is what makes this an open-ended task rather than an unbounde
 | 5 | the linear-attention block (`ssm_*`, KDA) | *done* - 12 stage checks pass on layers 4 and 20 at 1, 5 and 8 tokens (worst 1.8e-05 relative), covering the single-token decode step as well as prefill; the gate stays in [gate_lower_bound, 0] and &#124;q&#124; comes out 1.0 per head |
 | 6 | router top-8, `ffn_exp_probs_b`, `expert_weights_norm/scale`; dense stem FFN; shared expert | *done* - the router on a fixture chosen BECAUSE the selection bias changes the answer (ids exact, weights 1.9e-07, sum(weights) exactly 2.5), the MoE sum / shared expert / site output to 1.5e-05, and the leading blocks' dense FFN (ff 12288, not an expert's 2048) to 1.6e-05 |
 | 7 | MTP arm (blk.45, which has no hyper-connections) | *done* - the head's own wiring verified (e/h norms, the concat with e_norm FIRST exactly, eh_proj, the head norm, worst 7.1e-06); the block's MLA/MoE are the trunk's operators, asserted by comparing tensor shapes rather than assumed, and blk.45 confirmed to have 0 hc_* tensors |
-| 8 | end-to-end | greedy tokens identical to the oracle on a fixed prompt set |
+| 8 | end-to-end | **ground truth established, graph still to write** - the reference's own GLM5-Next graph now dumps 947 named tensors plus the golden greedy tokens (`tools/glm5_ref_dump.cpp`, manifest in `tools/glm5-ref/`, comparison harness in `tools/glm5_compare_dump.py`), so a mismatch localizes to a layer and a site |
+
+## Phase 8: the ground truth, and what it gives the port
+
+Before writing the trunk graph, the thing that had to exist is a way to compare against the reference
+OTHER than its final tokens.  "The logits differ" localizes nothing, and with 46 blocks and four cache
+kinds to wire, a single opaque mismatch would mean bisecting by hand.
+
+`tools/glm5_ref_dump.cpp` runs the fork's own GLM5-Next graph with `cb_eval` set and writes every tensor
+the graph NAMES - the graph's `cb(...)` calls are the hooks.  A fixed prompt yields 947 named tensors and
+the golden greedy generation:
+
+    prompt    "The capital of France is"  ->  785 6722 315 9621 374
+    greedy    12089 13 1084 374
+
+and the granularity is what matters:
+
+  * `l_out-N` [4096, 4, 5, 1] for every trunk block - the four hyper-connection streams after block N,
+    which is exactly the array shape the verified mHC kernel consumes;
+  * `hc_head`, `result_norm`, `result_output` [154880] for the last prompt token;
+  * per-SITE tensors inside each block, so a mismatch localizes further than a layer: for a KDA block
+    `hc_attn_pre-N`, `kda_gate-N`, `kda_beta-N`, `attn_output-N`, `hc_attn_post-N`, `hc_ffn_pre-N`,
+    `ffn_out-N`; for an MLA block `Qcur-N` [512,64,5,1], `kv_cmpr-N` [512,1,5,1], `hc_attn_post-N`,
+    `ffn_moe_out-N`.
+
+The dump is ~116 MB and lives in `/home/peb/moredata/glm5-ref-dump/`; what is committed is the manifest
+and the golden tokens (`tools/glm5-ref/`) plus the regeneration recipe.
+`tools/glm5_compare_dump.py` compares a port dump against it and reports the FIRST tensor in the
+reference's own evaluation order that exceeds tolerance - so the port's failures come back as "block 3
+diverges while block 2 matched".
+
+Running the reference needs the same attention to memory as the earlier llama.cpp work: the experts stay
+on the CPU (one tensor-buft override per layer, the CLI's `-ncmoe`), because 86 GB of experts cannot live
+in 32 GB of VRAM.  Note that `token_embd.weight` and 126 other tensors land on the CPU anyway
+(`cannot be used with preferred buffer type CUDA_Host`), so the reference run is not fully offloaded
+either - worth knowing when comparing timings.
 
 Phases 3-5 are independent of each other and can be validated in isolation with a synthetic two-layer
 pack, which is how the engine's existing parity tests are already structured.

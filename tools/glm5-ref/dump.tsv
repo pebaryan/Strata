@@ -1,0 +1,947 @@
+inp_embd	4096	5	1	1	f32	inp_embd.bin
+inp_embd (reshaped)	4096	1	5	1	f32	inp_embd (reshaped).bin
+blk.0.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.0.hc_attn_scale.weight (view).bin
+blk.0.hc_attn_base.weight (view)	4	1	1	1	f32	blk.0.hc_attn_base.weight (view).bin
+hc_attn_pre-0	4096	5	1	1	f32	hc_attn_pre-0.bin
+kda_gate-0	128	64	5	1	f32	kda_gate-0.bin
+kda_beta-0	1	64	5	1	f32	kda_beta-0.bin
+attn_output-0	128	64	5	1	f32	attn_output-0.bin
+attn_output-0 (cont)	128	64	5	1	f32	attn_output-0 (cont).bin
+attn_output-0 (cont) (reshaped)	128	64	5	1	f32	attn_output-0 (cont) (reshaped).bin
+blk.0.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.0.hc_attn_scale.weight (view).bin
+blk.0.hc_attn_base.weight (view)	4	1	1	1	f32	blk.0.hc_attn_base.weight (view).bin
+hc_attn_post-0	4096	4	5	1	f32	hc_attn_post-0.bin
+hc_attn_post-0 (reshaped)	16384	5	1	1	f32	hc_attn_post-0 (reshaped).bin
+blk.0.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.0.hc_ffn_scale.weight (view).bin
+blk.0.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.0.hc_ffn_base.weight (view).bin
+blk.0.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.0.hc_ffn_scale.weight (view).bin
+blk.0.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.0.hc_ffn_base.weight (view).bin
+hc_ffn_pre-0	4096	5	1	1	f32	hc_ffn_pre-0.bin
+ffn_out-0	4096	5	1	1	f32	ffn_out-0.bin
+l_out-0	4096	4	5	1	f32	l_out-0.bin
+l_out-0 (reshaped)	16384	5	1	1	f32	l_out-0 (reshaped).bin
+blk.1.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.1.hc_attn_scale.weight (view).bin
+blk.1.hc_attn_base.weight (view)	4	1	1	1	f32	blk.1.hc_attn_base.weight (view).bin
+hc_attn_pre-1	4096	5	1	1	f32	hc_attn_pre-1.bin
+kda_gate-1	128	64	5	1	f32	kda_gate-1.bin
+kda_beta-1	1	64	5	1	f32	kda_beta-1.bin
+attn_output-1	128	64	5	1	f32	attn_output-1.bin
+attn_output-1 (cont)	128	64	5	1	f32	attn_output-1 (cont).bin
+attn_output-1 (cont) (reshaped)	128	64	5	1	f32	attn_output-1 (cont) (reshaped).bin
+blk.1.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.1.hc_attn_scale.weight (view).bin
+blk.1.hc_attn_base.weight (view)	4	1	1	1	f32	blk.1.hc_attn_base.weight (view).bin
+hc_attn_post-1	4096	4	5	1	f32	hc_attn_post-1.bin
+hc_attn_post-1 (reshaped)	16384	5	1	1	f32	hc_attn_post-1 (reshaped).bin
+blk.1.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.1.hc_ffn_scale.weight (view).bin
+blk.1.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.1.hc_ffn_base.weight (view).bin
+blk.1.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.1.hc_ffn_scale.weight (view).bin
+blk.1.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.1.hc_ffn_base.weight (view).bin
+hc_ffn_pre-1	4096	5	1	1	f32	hc_ffn_pre-1.bin
+ffn_out-1	4096	5	1	1	f32	ffn_out-1.bin
+l_out-1	4096	4	5	1	f32	l_out-1.bin
+l_out-1 (reshaped)	16384	5	1	1	f32	l_out-1 (reshaped).bin
+blk.2.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.2.hc_attn_scale.weight (view).bin
+blk.2.hc_attn_base.weight (view)	4	1	1	1	f32	blk.2.hc_attn_base.weight (view).bin
+hc_attn_pre-2	4096	5	1	1	f32	hc_attn_pre-2.bin
+kda_gate-2	128	64	5	1	f32	kda_gate-2.bin
+kda_beta-2	1	64	5	1	f32	kda_beta-2.bin
+attn_output-2	128	64	5	1	f32	attn_output-2.bin
+attn_output-2 (cont)	128	64	5	1	f32	attn_output-2 (cont).bin
+attn_output-2 (cont) (reshaped)	128	64	5	1	f32	attn_output-2 (cont) (reshaped).bin
+blk.2.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.2.hc_attn_scale.weight (view).bin
+blk.2.hc_attn_base.weight (view)	4	1	1	1	f32	blk.2.hc_attn_base.weight (view).bin
+hc_attn_post-2	4096	4	5	1	f32	hc_attn_post-2.bin
+hc_attn_post-2 (reshaped)	16384	5	1	1	f32	hc_attn_post-2 (reshaped).bin
+blk.2.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.2.hc_ffn_scale.weight (view).bin
+blk.2.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.2.hc_ffn_base.weight (view).bin
+blk.2.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.2.hc_ffn_scale.weight (view).bin
+blk.2.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.2.hc_ffn_base.weight (view).bin
+hc_ffn_pre-2	4096	5	1	1	f32	hc_ffn_pre-2.bin
+ffn_out-2	4096	5	1	1	f32	ffn_out-2.bin
+l_out-2	4096	4	5	1	f32	l_out-2.bin
+l_out-2 (reshaped)	16384	5	1	1	f32	l_out-2 (reshaped).bin
+blk.3.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.3.hc_attn_scale.weight (view).bin
+blk.3.hc_attn_base.weight (view)	4	1	1	1	f32	blk.3.hc_attn_base.weight (view).bin
+hc_attn_pre-3	4096	5	1	1	f32	hc_attn_pre-3.bin
+Qcur-3	512	64	5	1	f32	Qcur-3.bin
+kv_cmpr-3	512	1	5	1	f32	kv_cmpr-3.bin
+kv_cmpr-3 (view)	512	5	1	1	f32	kv_cmpr-3 (view).bin
+Qcur-3 (view)	512	64	5	1	f32	Qcur-3 (view).bin
+Qcur-3 (view) (permuted)	512	5	64	1	f32	Qcur-3 (view) (permuted).bin
+blk.3.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.3.hc_attn_scale.weight (view).bin
+blk.3.hc_attn_base.weight (view)	4	1	1	1	f32	blk.3.hc_attn_base.weight (view).bin
+hc_attn_post-3	4096	4	5	1	f32	hc_attn_post-3.bin
+hc_attn_post-3 (reshaped)	16384	5	1	1	f32	hc_attn_post-3 (reshaped).bin
+blk.3.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.3.hc_ffn_scale.weight (view).bin
+blk.3.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.3.hc_ffn_base.weight (view).bin
+blk.3.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.3.hc_ffn_scale.weight (view).bin
+blk.3.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.3.hc_ffn_base.weight (view).bin
+hc_ffn_pre-3	4096	5	1	1	f32	hc_ffn_pre-3.bin
+ffn_moe_out-3	4096	5	1	1	f32	ffn_moe_out-3.bin
+ffn_out-3	4096	5	1	1	f32	ffn_out-3.bin
+l_out-3	4096	4	5	1	f32	l_out-3.bin
+l_out-3 (reshaped)	16384	5	1	1	f32	l_out-3 (reshaped).bin
+blk.4.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.4.hc_attn_scale.weight (view).bin
+blk.4.hc_attn_base.weight (view)	4	1	1	1	f32	blk.4.hc_attn_base.weight (view).bin
+hc_attn_pre-4	4096	5	1	1	f32	hc_attn_pre-4.bin
+kda_gate-4	128	64	5	1	f32	kda_gate-4.bin
+kda_beta-4	1	64	5	1	f32	kda_beta-4.bin
+attn_output-4	128	64	5	1	f32	attn_output-4.bin
+attn_output-4 (cont)	128	64	5	1	f32	attn_output-4 (cont).bin
+attn_output-4 (cont) (reshaped)	128	64	5	1	f32	attn_output-4 (cont) (reshaped).bin
+blk.4.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.4.hc_attn_scale.weight (view).bin
+blk.4.hc_attn_base.weight (view)	4	1	1	1	f32	blk.4.hc_attn_base.weight (view).bin
+hc_attn_post-4	4096	4	5	1	f32	hc_attn_post-4.bin
+hc_attn_post-4 (reshaped)	16384	5	1	1	f32	hc_attn_post-4 (reshaped).bin
+blk.4.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.4.hc_ffn_scale.weight (view).bin
+blk.4.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.4.hc_ffn_base.weight (view).bin
+blk.4.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.4.hc_ffn_scale.weight (view).bin
+blk.4.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.4.hc_ffn_base.weight (view).bin
+hc_ffn_pre-4	4096	5	1	1	f32	hc_ffn_pre-4.bin
+ffn_moe_out-4	4096	5	1	1	f32	ffn_moe_out-4.bin
+ffn_out-4	4096	5	1	1	f32	ffn_out-4.bin
+l_out-4	4096	4	5	1	f32	l_out-4.bin
+l_out-4 (reshaped)	16384	5	1	1	f32	l_out-4 (reshaped).bin
+blk.5.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.5.hc_attn_scale.weight (view).bin
+blk.5.hc_attn_base.weight (view)	4	1	1	1	f32	blk.5.hc_attn_base.weight (view).bin
+hc_attn_pre-5	4096	5	1	1	f32	hc_attn_pre-5.bin
+kda_gate-5	128	64	5	1	f32	kda_gate-5.bin
+kda_beta-5	1	64	5	1	f32	kda_beta-5.bin
+attn_output-5	128	64	5	1	f32	attn_output-5.bin
+attn_output-5 (cont)	128	64	5	1	f32	attn_output-5 (cont).bin
+attn_output-5 (cont) (reshaped)	128	64	5	1	f32	attn_output-5 (cont) (reshaped).bin
+blk.5.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.5.hc_attn_scale.weight (view).bin
+blk.5.hc_attn_base.weight (view)	4	1	1	1	f32	blk.5.hc_attn_base.weight (view).bin
+hc_attn_post-5	4096	4	5	1	f32	hc_attn_post-5.bin
+hc_attn_post-5 (reshaped)	16384	5	1	1	f32	hc_attn_post-5 (reshaped).bin
+blk.5.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.5.hc_ffn_scale.weight (view).bin
+blk.5.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.5.hc_ffn_base.weight (view).bin
+blk.5.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.5.hc_ffn_scale.weight (view).bin
+blk.5.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.5.hc_ffn_base.weight (view).bin
+hc_ffn_pre-5	4096	5	1	1	f32	hc_ffn_pre-5.bin
+ffn_moe_out-5	4096	5	1	1	f32	ffn_moe_out-5.bin
+ffn_out-5	4096	5	1	1	f32	ffn_out-5.bin
+l_out-5	4096	4	5	1	f32	l_out-5.bin
+l_out-5 (reshaped)	16384	5	1	1	f32	l_out-5 (reshaped).bin
+blk.6.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.6.hc_attn_scale.weight (view).bin
+blk.6.hc_attn_base.weight (view)	4	1	1	1	f32	blk.6.hc_attn_base.weight (view).bin
+hc_attn_pre-6	4096	5	1	1	f32	hc_attn_pre-6.bin
+kda_gate-6	128	64	5	1	f32	kda_gate-6.bin
+kda_beta-6	1	64	5	1	f32	kda_beta-6.bin
+attn_output-6	128	64	5	1	f32	attn_output-6.bin
+attn_output-6 (cont)	128	64	5	1	f32	attn_output-6 (cont).bin
+attn_output-6 (cont) (reshaped)	128	64	5	1	f32	attn_output-6 (cont) (reshaped).bin
+blk.6.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.6.hc_attn_scale.weight (view).bin
+blk.6.hc_attn_base.weight (view)	4	1	1	1	f32	blk.6.hc_attn_base.weight (view).bin
+hc_attn_post-6	4096	4	5	1	f32	hc_attn_post-6.bin
+hc_attn_post-6 (reshaped)	16384	5	1	1	f32	hc_attn_post-6 (reshaped).bin
+blk.6.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.6.hc_ffn_scale.weight (view).bin
+blk.6.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.6.hc_ffn_base.weight (view).bin
+blk.6.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.6.hc_ffn_scale.weight (view).bin
+blk.6.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.6.hc_ffn_base.weight (view).bin
+hc_ffn_pre-6	4096	5	1	1	f32	hc_ffn_pre-6.bin
+ffn_moe_out-6	4096	5	1	1	f32	ffn_moe_out-6.bin
+ffn_out-6	4096	5	1	1	f32	ffn_out-6.bin
+l_out-6	4096	4	5	1	f32	l_out-6.bin
+l_out-6 (reshaped)	16384	5	1	1	f32	l_out-6 (reshaped).bin
+blk.7.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.7.hc_attn_scale.weight (view).bin
+blk.7.hc_attn_base.weight (view)	4	1	1	1	f32	blk.7.hc_attn_base.weight (view).bin
+hc_attn_pre-7	4096	5	1	1	f32	hc_attn_pre-7.bin
+Qcur-7	512	64	5	1	f32	Qcur-7.bin
+kv_cmpr-7	512	1	5	1	f32	kv_cmpr-7.bin
+kv_cmpr-7 (view)	512	5	1	1	f32	kv_cmpr-7 (view).bin
+Qcur-7 (view)	512	64	5	1	f32	Qcur-7 (view).bin
+Qcur-7 (view) (permuted)	512	5	64	1	f32	Qcur-7 (view) (permuted).bin
+blk.7.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.7.hc_attn_scale.weight (view).bin
+blk.7.hc_attn_base.weight (view)	4	1	1	1	f32	blk.7.hc_attn_base.weight (view).bin
+hc_attn_post-7	4096	4	5	1	f32	hc_attn_post-7.bin
+hc_attn_post-7 (reshaped)	16384	5	1	1	f32	hc_attn_post-7 (reshaped).bin
+blk.7.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.7.hc_ffn_scale.weight (view).bin
+blk.7.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.7.hc_ffn_base.weight (view).bin
+blk.7.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.7.hc_ffn_scale.weight (view).bin
+blk.7.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.7.hc_ffn_base.weight (view).bin
+hc_ffn_pre-7	4096	5	1	1	f32	hc_ffn_pre-7.bin
+ffn_moe_out-7	4096	5	1	1	f32	ffn_moe_out-7.bin
+ffn_out-7	4096	5	1	1	f32	ffn_out-7.bin
+l_out-7	4096	4	5	1	f32	l_out-7.bin
+l_out-7 (reshaped)	16384	5	1	1	f32	l_out-7 (reshaped).bin
+blk.8.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.8.hc_attn_scale.weight (view).bin
+blk.8.hc_attn_base.weight (view)	4	1	1	1	f32	blk.8.hc_attn_base.weight (view).bin
+hc_attn_pre-8	4096	5	1	1	f32	hc_attn_pre-8.bin
+kda_gate-8	128	64	5	1	f32	kda_gate-8.bin
+kda_beta-8	1	64	5	1	f32	kda_beta-8.bin
+attn_output-8	128	64	5	1	f32	attn_output-8.bin
+attn_output-8 (cont)	128	64	5	1	f32	attn_output-8 (cont).bin
+attn_output-8 (cont) (reshaped)	128	64	5	1	f32	attn_output-8 (cont) (reshaped).bin
+blk.8.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.8.hc_attn_scale.weight (view).bin
+blk.8.hc_attn_base.weight (view)	4	1	1	1	f32	blk.8.hc_attn_base.weight (view).bin
+hc_attn_post-8	4096	4	5	1	f32	hc_attn_post-8.bin
+hc_attn_post-8 (reshaped)	16384	5	1	1	f32	hc_attn_post-8 (reshaped).bin
+blk.8.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.8.hc_ffn_scale.weight (view).bin
+blk.8.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.8.hc_ffn_base.weight (view).bin
+blk.8.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.8.hc_ffn_scale.weight (view).bin
+blk.8.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.8.hc_ffn_base.weight (view).bin
+hc_ffn_pre-8	4096	5	1	1	f32	hc_ffn_pre-8.bin
+ffn_moe_out-8	4096	5	1	1	f32	ffn_moe_out-8.bin
+ffn_out-8	4096	5	1	1	f32	ffn_out-8.bin
+l_out-8	4096	4	5	1	f32	l_out-8.bin
+l_out-8 (reshaped)	16384	5	1	1	f32	l_out-8 (reshaped).bin
+blk.9.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.9.hc_attn_scale.weight (view).bin
+blk.9.hc_attn_base.weight (view)	4	1	1	1	f32	blk.9.hc_attn_base.weight (view).bin
+hc_attn_pre-9	4096	5	1	1	f32	hc_attn_pre-9.bin
+kda_gate-9	128	64	5	1	f32	kda_gate-9.bin
+kda_beta-9	1	64	5	1	f32	kda_beta-9.bin
+attn_output-9	128	64	5	1	f32	attn_output-9.bin
+attn_output-9 (cont)	128	64	5	1	f32	attn_output-9 (cont).bin
+attn_output-9 (cont) (reshaped)	128	64	5	1	f32	attn_output-9 (cont) (reshaped).bin
+blk.9.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.9.hc_attn_scale.weight (view).bin
+blk.9.hc_attn_base.weight (view)	4	1	1	1	f32	blk.9.hc_attn_base.weight (view).bin
+hc_attn_post-9	4096	4	5	1	f32	hc_attn_post-9.bin
+hc_attn_post-9 (reshaped)	16384	5	1	1	f32	hc_attn_post-9 (reshaped).bin
+blk.9.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.9.hc_ffn_scale.weight (view).bin
+blk.9.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.9.hc_ffn_base.weight (view).bin
+blk.9.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.9.hc_ffn_scale.weight (view).bin
+blk.9.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.9.hc_ffn_base.weight (view).bin
+hc_ffn_pre-9	4096	5	1	1	f32	hc_ffn_pre-9.bin
+ffn_moe_out-9	4096	5	1	1	f32	ffn_moe_out-9.bin
+ffn_out-9	4096	5	1	1	f32	ffn_out-9.bin
+l_out-9	4096	4	5	1	f32	l_out-9.bin
+l_out-9 (reshaped)	16384	5	1	1	f32	l_out-9 (reshaped).bin
+blk.10.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.10.hc_attn_scale.weight (view).bin
+blk.10.hc_attn_base.weight (view)	4	1	1	1	f32	blk.10.hc_attn_base.weight (view).bin
+hc_attn_pre-10	4096	5	1	1	f32	hc_attn_pre-10.bin
+kda_gate-10	128	64	5	1	f32	kda_gate-10.bin
+kda_beta-10	1	64	5	1	f32	kda_beta-10.bin
+attn_output-10	128	64	5	1	f32	attn_output-10.bin
+attn_output-10 (cont)	128	64	5	1	f32	attn_output-10 (cont).bin
+attn_output-10 (cont) (reshaped)	128	64	5	1	f32	attn_output-10 (cont) (reshaped).bin
+blk.10.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.10.hc_attn_scale.weight (view).bin
+blk.10.hc_attn_base.weight (view)	4	1	1	1	f32	blk.10.hc_attn_base.weight (view).bin
+hc_attn_post-10	4096	4	5	1	f32	hc_attn_post-10.bin
+hc_attn_post-10 (reshaped)	16384	5	1	1	f32	hc_attn_post-10 (reshaped).bin
+blk.10.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.10.hc_ffn_scale.weight (view).bin
+blk.10.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.10.hc_ffn_base.weight (view).bin
+blk.10.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.10.hc_ffn_scale.weight (view).bin
+blk.10.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.10.hc_ffn_base.weight (view).bin
+hc_ffn_pre-10	4096	5	1	1	f32	hc_ffn_pre-10.bin
+ffn_moe_out-10	4096	5	1	1	f32	ffn_moe_out-10.bin
+ffn_out-10	4096	5	1	1	f32	ffn_out-10.bin
+l_out-10	4096	4	5	1	f32	l_out-10.bin
+l_out-10 (reshaped)	16384	5	1	1	f32	l_out-10 (reshaped).bin
+blk.11.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.11.hc_attn_scale.weight (view).bin
+blk.11.hc_attn_base.weight (view)	4	1	1	1	f32	blk.11.hc_attn_base.weight (view).bin
+hc_attn_pre-11	4096	5	1	1	f32	hc_attn_pre-11.bin
+Qcur-11	512	64	5	1	f32	Qcur-11.bin
+kv_cmpr-11	512	1	5	1	f32	kv_cmpr-11.bin
+kv_cmpr-11 (view)	512	5	1	1	f32	kv_cmpr-11 (view).bin
+Qcur-11 (view)	512	64	5	1	f32	Qcur-11 (view).bin
+Qcur-11 (view) (permuted)	512	5	64	1	f32	Qcur-11 (view) (permuted).bin
+blk.11.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.11.hc_attn_scale.weight (view).bin
+blk.11.hc_attn_base.weight (view)	4	1	1	1	f32	blk.11.hc_attn_base.weight (view).bin
+hc_attn_post-11	4096	4	5	1	f32	hc_attn_post-11.bin
+hc_attn_post-11 (reshaped)	16384	5	1	1	f32	hc_attn_post-11 (reshaped).bin
+blk.11.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.11.hc_ffn_scale.weight (view).bin
+blk.11.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.11.hc_ffn_base.weight (view).bin
+blk.11.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.11.hc_ffn_scale.weight (view).bin
+blk.11.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.11.hc_ffn_base.weight (view).bin
+hc_ffn_pre-11	4096	5	1	1	f32	hc_ffn_pre-11.bin
+ffn_moe_out-11	4096	5	1	1	f32	ffn_moe_out-11.bin
+ffn_out-11	4096	5	1	1	f32	ffn_out-11.bin
+l_out-11	4096	4	5	1	f32	l_out-11.bin
+l_out-11 (reshaped)	16384	5	1	1	f32	l_out-11 (reshaped).bin
+blk.12.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.12.hc_attn_scale.weight (view).bin
+blk.12.hc_attn_base.weight (view)	4	1	1	1	f32	blk.12.hc_attn_base.weight (view).bin
+hc_attn_pre-12	4096	5	1	1	f32	hc_attn_pre-12.bin
+kda_gate-12	128	64	5	1	f32	kda_gate-12.bin
+kda_beta-12	1	64	5	1	f32	kda_beta-12.bin
+attn_output-12	128	64	5	1	f32	attn_output-12.bin
+attn_output-12 (cont)	128	64	5	1	f32	attn_output-12 (cont).bin
+attn_output-12 (cont) (reshaped)	128	64	5	1	f32	attn_output-12 (cont) (reshaped).bin
+blk.12.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.12.hc_attn_scale.weight (view).bin
+blk.12.hc_attn_base.weight (view)	4	1	1	1	f32	blk.12.hc_attn_base.weight (view).bin
+hc_attn_post-12	4096	4	5	1	f32	hc_attn_post-12.bin
+hc_attn_post-12 (reshaped)	16384	5	1	1	f32	hc_attn_post-12 (reshaped).bin
+blk.12.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.12.hc_ffn_scale.weight (view).bin
+blk.12.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.12.hc_ffn_base.weight (view).bin
+blk.12.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.12.hc_ffn_scale.weight (view).bin
+blk.12.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.12.hc_ffn_base.weight (view).bin
+hc_ffn_pre-12	4096	5	1	1	f32	hc_ffn_pre-12.bin
+ffn_moe_out-12	4096	5	1	1	f32	ffn_moe_out-12.bin
+ffn_out-12	4096	5	1	1	f32	ffn_out-12.bin
+l_out-12	4096	4	5	1	f32	l_out-12.bin
+l_out-12 (reshaped)	16384	5	1	1	f32	l_out-12 (reshaped).bin
+blk.13.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.13.hc_attn_scale.weight (view).bin
+blk.13.hc_attn_base.weight (view)	4	1	1	1	f32	blk.13.hc_attn_base.weight (view).bin
+hc_attn_pre-13	4096	5	1	1	f32	hc_attn_pre-13.bin
+kda_gate-13	128	64	5	1	f32	kda_gate-13.bin
+kda_beta-13	1	64	5	1	f32	kda_beta-13.bin
+attn_output-13	128	64	5	1	f32	attn_output-13.bin
+attn_output-13 (cont)	128	64	5	1	f32	attn_output-13 (cont).bin
+attn_output-13 (cont) (reshaped)	128	64	5	1	f32	attn_output-13 (cont) (reshaped).bin
+blk.13.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.13.hc_attn_scale.weight (view).bin
+blk.13.hc_attn_base.weight (view)	4	1	1	1	f32	blk.13.hc_attn_base.weight (view).bin
+hc_attn_post-13	4096	4	5	1	f32	hc_attn_post-13.bin
+hc_attn_post-13 (reshaped)	16384	5	1	1	f32	hc_attn_post-13 (reshaped).bin
+blk.13.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.13.hc_ffn_scale.weight (view).bin
+blk.13.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.13.hc_ffn_base.weight (view).bin
+blk.13.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.13.hc_ffn_scale.weight (view).bin
+blk.13.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.13.hc_ffn_base.weight (view).bin
+hc_ffn_pre-13	4096	5	1	1	f32	hc_ffn_pre-13.bin
+ffn_moe_out-13	4096	5	1	1	f32	ffn_moe_out-13.bin
+ffn_out-13	4096	5	1	1	f32	ffn_out-13.bin
+l_out-13	4096	4	5	1	f32	l_out-13.bin
+l_out-13 (reshaped)	16384	5	1	1	f32	l_out-13 (reshaped).bin
+blk.14.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.14.hc_attn_scale.weight (view).bin
+blk.14.hc_attn_base.weight (view)	4	1	1	1	f32	blk.14.hc_attn_base.weight (view).bin
+hc_attn_pre-14	4096	5	1	1	f32	hc_attn_pre-14.bin
+kda_gate-14	128	64	5	1	f32	kda_gate-14.bin
+kda_beta-14	1	64	5	1	f32	kda_beta-14.bin
+attn_output-14	128	64	5	1	f32	attn_output-14.bin
+attn_output-14 (cont)	128	64	5	1	f32	attn_output-14 (cont).bin
+attn_output-14 (cont) (reshaped)	128	64	5	1	f32	attn_output-14 (cont) (reshaped).bin
+blk.14.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.14.hc_attn_scale.weight (view).bin
+blk.14.hc_attn_base.weight (view)	4	1	1	1	f32	blk.14.hc_attn_base.weight (view).bin
+hc_attn_post-14	4096	4	5	1	f32	hc_attn_post-14.bin
+hc_attn_post-14 (reshaped)	16384	5	1	1	f32	hc_attn_post-14 (reshaped).bin
+blk.14.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.14.hc_ffn_scale.weight (view).bin
+blk.14.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.14.hc_ffn_base.weight (view).bin
+blk.14.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.14.hc_ffn_scale.weight (view).bin
+blk.14.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.14.hc_ffn_base.weight (view).bin
+hc_ffn_pre-14	4096	5	1	1	f32	hc_ffn_pre-14.bin
+ffn_moe_out-14	4096	5	1	1	f32	ffn_moe_out-14.bin
+ffn_out-14	4096	5	1	1	f32	ffn_out-14.bin
+l_out-14	4096	4	5	1	f32	l_out-14.bin
+l_out-14 (reshaped)	16384	5	1	1	f32	l_out-14 (reshaped).bin
+blk.15.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.15.hc_attn_scale.weight (view).bin
+blk.15.hc_attn_base.weight (view)	4	1	1	1	f32	blk.15.hc_attn_base.weight (view).bin
+hc_attn_pre-15	4096	5	1	1	f32	hc_attn_pre-15.bin
+Qcur-15	512	64	5	1	f32	Qcur-15.bin
+kv_cmpr-15	512	1	5	1	f32	kv_cmpr-15.bin
+kv_cmpr-15 (view)	512	5	1	1	f32	kv_cmpr-15 (view).bin
+Qcur-15 (view)	512	64	5	1	f32	Qcur-15 (view).bin
+Qcur-15 (view) (permuted)	512	5	64	1	f32	Qcur-15 (view) (permuted).bin
+blk.15.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.15.hc_attn_scale.weight (view).bin
+blk.15.hc_attn_base.weight (view)	4	1	1	1	f32	blk.15.hc_attn_base.weight (view).bin
+hc_attn_post-15	4096	4	5	1	f32	hc_attn_post-15.bin
+hc_attn_post-15 (reshaped)	16384	5	1	1	f32	hc_attn_post-15 (reshaped).bin
+blk.15.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.15.hc_ffn_scale.weight (view).bin
+blk.15.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.15.hc_ffn_base.weight (view).bin
+blk.15.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.15.hc_ffn_scale.weight (view).bin
+blk.15.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.15.hc_ffn_base.weight (view).bin
+hc_ffn_pre-15	4096	5	1	1	f32	hc_ffn_pre-15.bin
+ffn_moe_out-15	4096	5	1	1	f32	ffn_moe_out-15.bin
+ffn_out-15	4096	5	1	1	f32	ffn_out-15.bin
+l_out-15	4096	4	5	1	f32	l_out-15.bin
+l_out-15 (reshaped)	16384	5	1	1	f32	l_out-15 (reshaped).bin
+blk.16.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.16.hc_attn_scale.weight (view).bin
+blk.16.hc_attn_base.weight (view)	4	1	1	1	f32	blk.16.hc_attn_base.weight (view).bin
+hc_attn_pre-16	4096	5	1	1	f32	hc_attn_pre-16.bin
+kda_gate-16	128	64	5	1	f32	kda_gate-16.bin
+kda_beta-16	1	64	5	1	f32	kda_beta-16.bin
+attn_output-16	128	64	5	1	f32	attn_output-16.bin
+attn_output-16 (cont)	128	64	5	1	f32	attn_output-16 (cont).bin
+attn_output-16 (cont) (reshaped)	128	64	5	1	f32	attn_output-16 (cont) (reshaped).bin
+blk.16.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.16.hc_attn_scale.weight (view).bin
+blk.16.hc_attn_base.weight (view)	4	1	1	1	f32	blk.16.hc_attn_base.weight (view).bin
+hc_attn_post-16	4096	4	5	1	f32	hc_attn_post-16.bin
+hc_attn_post-16 (reshaped)	16384	5	1	1	f32	hc_attn_post-16 (reshaped).bin
+blk.16.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.16.hc_ffn_scale.weight (view).bin
+blk.16.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.16.hc_ffn_base.weight (view).bin
+blk.16.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.16.hc_ffn_scale.weight (view).bin
+blk.16.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.16.hc_ffn_base.weight (view).bin
+hc_ffn_pre-16	4096	5	1	1	f32	hc_ffn_pre-16.bin
+ffn_moe_out-16	4096	5	1	1	f32	ffn_moe_out-16.bin
+ffn_out-16	4096	5	1	1	f32	ffn_out-16.bin
+l_out-16	4096	4	5	1	f32	l_out-16.bin
+l_out-16 (reshaped)	16384	5	1	1	f32	l_out-16 (reshaped).bin
+blk.17.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.17.hc_attn_scale.weight (view).bin
+blk.17.hc_attn_base.weight (view)	4	1	1	1	f32	blk.17.hc_attn_base.weight (view).bin
+hc_attn_pre-17	4096	5	1	1	f32	hc_attn_pre-17.bin
+kda_gate-17	128	64	5	1	f32	kda_gate-17.bin
+kda_beta-17	1	64	5	1	f32	kda_beta-17.bin
+attn_output-17	128	64	5	1	f32	attn_output-17.bin
+attn_output-17 (cont)	128	64	5	1	f32	attn_output-17 (cont).bin
+attn_output-17 (cont) (reshaped)	128	64	5	1	f32	attn_output-17 (cont) (reshaped).bin
+blk.17.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.17.hc_attn_scale.weight (view).bin
+blk.17.hc_attn_base.weight (view)	4	1	1	1	f32	blk.17.hc_attn_base.weight (view).bin
+hc_attn_post-17	4096	4	5	1	f32	hc_attn_post-17.bin
+hc_attn_post-17 (reshaped)	16384	5	1	1	f32	hc_attn_post-17 (reshaped).bin
+blk.17.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.17.hc_ffn_scale.weight (view).bin
+blk.17.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.17.hc_ffn_base.weight (view).bin
+blk.17.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.17.hc_ffn_scale.weight (view).bin
+blk.17.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.17.hc_ffn_base.weight (view).bin
+hc_ffn_pre-17	4096	5	1	1	f32	hc_ffn_pre-17.bin
+ffn_moe_out-17	4096	5	1	1	f32	ffn_moe_out-17.bin
+ffn_out-17	4096	5	1	1	f32	ffn_out-17.bin
+l_out-17	4096	4	5	1	f32	l_out-17.bin
+l_out-17 (reshaped)	16384	5	1	1	f32	l_out-17 (reshaped).bin
+blk.18.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.18.hc_attn_scale.weight (view).bin
+blk.18.hc_attn_base.weight (view)	4	1	1	1	f32	blk.18.hc_attn_base.weight (view).bin
+hc_attn_pre-18	4096	5	1	1	f32	hc_attn_pre-18.bin
+kda_gate-18	128	64	5	1	f32	kda_gate-18.bin
+kda_beta-18	1	64	5	1	f32	kda_beta-18.bin
+attn_output-18	128	64	5	1	f32	attn_output-18.bin
+attn_output-18 (cont)	128	64	5	1	f32	attn_output-18 (cont).bin
+attn_output-18 (cont) (reshaped)	128	64	5	1	f32	attn_output-18 (cont) (reshaped).bin
+blk.18.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.18.hc_attn_scale.weight (view).bin
+blk.18.hc_attn_base.weight (view)	4	1	1	1	f32	blk.18.hc_attn_base.weight (view).bin
+hc_attn_post-18	4096	4	5	1	f32	hc_attn_post-18.bin
+hc_attn_post-18 (reshaped)	16384	5	1	1	f32	hc_attn_post-18 (reshaped).bin
+blk.18.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.18.hc_ffn_scale.weight (view).bin
+blk.18.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.18.hc_ffn_base.weight (view).bin
+blk.18.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.18.hc_ffn_scale.weight (view).bin
+blk.18.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.18.hc_ffn_base.weight (view).bin
+hc_ffn_pre-18	4096	5	1	1	f32	hc_ffn_pre-18.bin
+ffn_moe_out-18	4096	5	1	1	f32	ffn_moe_out-18.bin
+ffn_out-18	4096	5	1	1	f32	ffn_out-18.bin
+l_out-18	4096	4	5	1	f32	l_out-18.bin
+l_out-18 (reshaped)	16384	5	1	1	f32	l_out-18 (reshaped).bin
+blk.19.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.19.hc_attn_scale.weight (view).bin
+blk.19.hc_attn_base.weight (view)	4	1	1	1	f32	blk.19.hc_attn_base.weight (view).bin
+hc_attn_pre-19	4096	5	1	1	f32	hc_attn_pre-19.bin
+Qcur-19	512	64	5	1	f32	Qcur-19.bin
+kv_cmpr-19	512	1	5	1	f32	kv_cmpr-19.bin
+kv_cmpr-19 (view)	512	5	1	1	f32	kv_cmpr-19 (view).bin
+Qcur-19 (view)	512	64	5	1	f32	Qcur-19 (view).bin
+Qcur-19 (view) (permuted)	512	5	64	1	f32	Qcur-19 (view) (permuted).bin
+blk.19.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.19.hc_attn_scale.weight (view).bin
+blk.19.hc_attn_base.weight (view)	4	1	1	1	f32	blk.19.hc_attn_base.weight (view).bin
+hc_attn_post-19	4096	4	5	1	f32	hc_attn_post-19.bin
+hc_attn_post-19 (reshaped)	16384	5	1	1	f32	hc_attn_post-19 (reshaped).bin
+blk.19.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.19.hc_ffn_scale.weight (view).bin
+blk.19.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.19.hc_ffn_base.weight (view).bin
+blk.19.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.19.hc_ffn_scale.weight (view).bin
+blk.19.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.19.hc_ffn_base.weight (view).bin
+hc_ffn_pre-19	4096	5	1	1	f32	hc_ffn_pre-19.bin
+ffn_moe_out-19	4096	5	1	1	f32	ffn_moe_out-19.bin
+ffn_out-19	4096	5	1	1	f32	ffn_out-19.bin
+l_out-19	4096	4	5	1	f32	l_out-19.bin
+l_out-19 (reshaped)	16384	5	1	1	f32	l_out-19 (reshaped).bin
+blk.20.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.20.hc_attn_scale.weight (view).bin
+blk.20.hc_attn_base.weight (view)	4	1	1	1	f32	blk.20.hc_attn_base.weight (view).bin
+hc_attn_pre-20	4096	5	1	1	f32	hc_attn_pre-20.bin
+kda_gate-20	128	64	5	1	f32	kda_gate-20.bin
+kda_beta-20	1	64	5	1	f32	kda_beta-20.bin
+attn_output-20	128	64	5	1	f32	attn_output-20.bin
+attn_output-20 (cont)	128	64	5	1	f32	attn_output-20 (cont).bin
+attn_output-20 (cont) (reshaped)	128	64	5	1	f32	attn_output-20 (cont) (reshaped).bin
+blk.20.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.20.hc_attn_scale.weight (view).bin
+blk.20.hc_attn_base.weight (view)	4	1	1	1	f32	blk.20.hc_attn_base.weight (view).bin
+hc_attn_post-20	4096	4	5	1	f32	hc_attn_post-20.bin
+hc_attn_post-20 (reshaped)	16384	5	1	1	f32	hc_attn_post-20 (reshaped).bin
+blk.20.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.20.hc_ffn_scale.weight (view).bin
+blk.20.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.20.hc_ffn_base.weight (view).bin
+blk.20.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.20.hc_ffn_scale.weight (view).bin
+blk.20.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.20.hc_ffn_base.weight (view).bin
+hc_ffn_pre-20	4096	5	1	1	f32	hc_ffn_pre-20.bin
+ffn_moe_out-20	4096	5	1	1	f32	ffn_moe_out-20.bin
+ffn_out-20	4096	5	1	1	f32	ffn_out-20.bin
+l_out-20	4096	4	5	1	f32	l_out-20.bin
+l_out-20 (reshaped)	16384	5	1	1	f32	l_out-20 (reshaped).bin
+blk.21.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.21.hc_attn_scale.weight (view).bin
+blk.21.hc_attn_base.weight (view)	4	1	1	1	f32	blk.21.hc_attn_base.weight (view).bin
+hc_attn_pre-21	4096	5	1	1	f32	hc_attn_pre-21.bin
+kda_gate-21	128	64	5	1	f32	kda_gate-21.bin
+kda_beta-21	1	64	5	1	f32	kda_beta-21.bin
+attn_output-21	128	64	5	1	f32	attn_output-21.bin
+attn_output-21 (cont)	128	64	5	1	f32	attn_output-21 (cont).bin
+attn_output-21 (cont) (reshaped)	128	64	5	1	f32	attn_output-21 (cont) (reshaped).bin
+blk.21.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.21.hc_attn_scale.weight (view).bin
+blk.21.hc_attn_base.weight (view)	4	1	1	1	f32	blk.21.hc_attn_base.weight (view).bin
+hc_attn_post-21	4096	4	5	1	f32	hc_attn_post-21.bin
+hc_attn_post-21 (reshaped)	16384	5	1	1	f32	hc_attn_post-21 (reshaped).bin
+blk.21.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.21.hc_ffn_scale.weight (view).bin
+blk.21.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.21.hc_ffn_base.weight (view).bin
+blk.21.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.21.hc_ffn_scale.weight (view).bin
+blk.21.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.21.hc_ffn_base.weight (view).bin
+hc_ffn_pre-21	4096	5	1	1	f32	hc_ffn_pre-21.bin
+ffn_moe_out-21	4096	5	1	1	f32	ffn_moe_out-21.bin
+ffn_out-21	4096	5	1	1	f32	ffn_out-21.bin
+l_out-21	4096	4	5	1	f32	l_out-21.bin
+l_out-21 (reshaped)	16384	5	1	1	f32	l_out-21 (reshaped).bin
+blk.22.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.22.hc_attn_scale.weight (view).bin
+blk.22.hc_attn_base.weight (view)	4	1	1	1	f32	blk.22.hc_attn_base.weight (view).bin
+hc_attn_pre-22	4096	5	1	1	f32	hc_attn_pre-22.bin
+kda_gate-22	128	64	5	1	f32	kda_gate-22.bin
+kda_beta-22	1	64	5	1	f32	kda_beta-22.bin
+attn_output-22	128	64	5	1	f32	attn_output-22.bin
+attn_output-22 (cont)	128	64	5	1	f32	attn_output-22 (cont).bin
+attn_output-22 (cont) (reshaped)	128	64	5	1	f32	attn_output-22 (cont) (reshaped).bin
+blk.22.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.22.hc_attn_scale.weight (view).bin
+blk.22.hc_attn_base.weight (view)	4	1	1	1	f32	blk.22.hc_attn_base.weight (view).bin
+hc_attn_post-22	4096	4	5	1	f32	hc_attn_post-22.bin
+hc_attn_post-22 (reshaped)	16384	5	1	1	f32	hc_attn_post-22 (reshaped).bin
+blk.22.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.22.hc_ffn_scale.weight (view).bin
+blk.22.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.22.hc_ffn_base.weight (view).bin
+blk.22.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.22.hc_ffn_scale.weight (view).bin
+blk.22.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.22.hc_ffn_base.weight (view).bin
+hc_ffn_pre-22	4096	5	1	1	f32	hc_ffn_pre-22.bin
+ffn_moe_out-22	4096	5	1	1	f32	ffn_moe_out-22.bin
+ffn_out-22	4096	5	1	1	f32	ffn_out-22.bin
+l_out-22	4096	4	5	1	f32	l_out-22.bin
+l_out-22 (reshaped)	16384	5	1	1	f32	l_out-22 (reshaped).bin
+blk.23.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.23.hc_attn_scale.weight (view).bin
+blk.23.hc_attn_base.weight (view)	4	1	1	1	f32	blk.23.hc_attn_base.weight (view).bin
+hc_attn_pre-23	4096	5	1	1	f32	hc_attn_pre-23.bin
+Qcur-23	512	64	5	1	f32	Qcur-23.bin
+kv_cmpr-23	512	1	5	1	f32	kv_cmpr-23.bin
+kv_cmpr-23 (view)	512	5	1	1	f32	kv_cmpr-23 (view).bin
+Qcur-23 (view)	512	64	5	1	f32	Qcur-23 (view).bin
+Qcur-23 (view) (permuted)	512	5	64	1	f32	Qcur-23 (view) (permuted).bin
+blk.23.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.23.hc_attn_scale.weight (view).bin
+blk.23.hc_attn_base.weight (view)	4	1	1	1	f32	blk.23.hc_attn_base.weight (view).bin
+hc_attn_post-23	4096	4	5	1	f32	hc_attn_post-23.bin
+hc_attn_post-23 (reshaped)	16384	5	1	1	f32	hc_attn_post-23 (reshaped).bin
+blk.23.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.23.hc_ffn_scale.weight (view).bin
+blk.23.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.23.hc_ffn_base.weight (view).bin
+blk.23.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.23.hc_ffn_scale.weight (view).bin
+blk.23.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.23.hc_ffn_base.weight (view).bin
+hc_ffn_pre-23	4096	5	1	1	f32	hc_ffn_pre-23.bin
+ffn_moe_out-23	4096	5	1	1	f32	ffn_moe_out-23.bin
+ffn_out-23	4096	5	1	1	f32	ffn_out-23.bin
+l_out-23	4096	4	5	1	f32	l_out-23.bin
+l_out-23 (reshaped)	16384	5	1	1	f32	l_out-23 (reshaped).bin
+blk.24.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.24.hc_attn_scale.weight (view).bin
+blk.24.hc_attn_base.weight (view)	4	1	1	1	f32	blk.24.hc_attn_base.weight (view).bin
+hc_attn_pre-24	4096	5	1	1	f32	hc_attn_pre-24.bin
+kda_gate-24	128	64	5	1	f32	kda_gate-24.bin
+kda_beta-24	1	64	5	1	f32	kda_beta-24.bin
+attn_output-24	128	64	5	1	f32	attn_output-24.bin
+attn_output-24 (cont)	128	64	5	1	f32	attn_output-24 (cont).bin
+attn_output-24 (cont) (reshaped)	128	64	5	1	f32	attn_output-24 (cont) (reshaped).bin
+blk.24.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.24.hc_attn_scale.weight (view).bin
+blk.24.hc_attn_base.weight (view)	4	1	1	1	f32	blk.24.hc_attn_base.weight (view).bin
+hc_attn_post-24	4096	4	5	1	f32	hc_attn_post-24.bin
+hc_attn_post-24 (reshaped)	16384	5	1	1	f32	hc_attn_post-24 (reshaped).bin
+blk.24.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.24.hc_ffn_scale.weight (view).bin
+blk.24.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.24.hc_ffn_base.weight (view).bin
+blk.24.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.24.hc_ffn_scale.weight (view).bin
+blk.24.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.24.hc_ffn_base.weight (view).bin
+hc_ffn_pre-24	4096	5	1	1	f32	hc_ffn_pre-24.bin
+ffn_moe_out-24	4096	5	1	1	f32	ffn_moe_out-24.bin
+ffn_out-24	4096	5	1	1	f32	ffn_out-24.bin
+l_out-24	4096	4	5	1	f32	l_out-24.bin
+l_out-24 (reshaped)	16384	5	1	1	f32	l_out-24 (reshaped).bin
+blk.25.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.25.hc_attn_scale.weight (view).bin
+blk.25.hc_attn_base.weight (view)	4	1	1	1	f32	blk.25.hc_attn_base.weight (view).bin
+hc_attn_pre-25	4096	5	1	1	f32	hc_attn_pre-25.bin
+kda_gate-25	128	64	5	1	f32	kda_gate-25.bin
+kda_beta-25	1	64	5	1	f32	kda_beta-25.bin
+attn_output-25	128	64	5	1	f32	attn_output-25.bin
+attn_output-25 (cont)	128	64	5	1	f32	attn_output-25 (cont).bin
+attn_output-25 (cont) (reshaped)	128	64	5	1	f32	attn_output-25 (cont) (reshaped).bin
+blk.25.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.25.hc_attn_scale.weight (view).bin
+blk.25.hc_attn_base.weight (view)	4	1	1	1	f32	blk.25.hc_attn_base.weight (view).bin
+hc_attn_post-25	4096	4	5	1	f32	hc_attn_post-25.bin
+hc_attn_post-25 (reshaped)	16384	5	1	1	f32	hc_attn_post-25 (reshaped).bin
+blk.25.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.25.hc_ffn_scale.weight (view).bin
+blk.25.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.25.hc_ffn_base.weight (view).bin
+blk.25.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.25.hc_ffn_scale.weight (view).bin
+blk.25.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.25.hc_ffn_base.weight (view).bin
+hc_ffn_pre-25	4096	5	1	1	f32	hc_ffn_pre-25.bin
+ffn_moe_out-25	4096	5	1	1	f32	ffn_moe_out-25.bin
+ffn_out-25	4096	5	1	1	f32	ffn_out-25.bin
+l_out-25	4096	4	5	1	f32	l_out-25.bin
+l_out-25 (reshaped)	16384	5	1	1	f32	l_out-25 (reshaped).bin
+blk.26.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.26.hc_attn_scale.weight (view).bin
+blk.26.hc_attn_base.weight (view)	4	1	1	1	f32	blk.26.hc_attn_base.weight (view).bin
+hc_attn_pre-26	4096	5	1	1	f32	hc_attn_pre-26.bin
+kda_gate-26	128	64	5	1	f32	kda_gate-26.bin
+kda_beta-26	1	64	5	1	f32	kda_beta-26.bin
+attn_output-26	128	64	5	1	f32	attn_output-26.bin
+attn_output-26 (cont)	128	64	5	1	f32	attn_output-26 (cont).bin
+attn_output-26 (cont) (reshaped)	128	64	5	1	f32	attn_output-26 (cont) (reshaped).bin
+blk.26.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.26.hc_attn_scale.weight (view).bin
+blk.26.hc_attn_base.weight (view)	4	1	1	1	f32	blk.26.hc_attn_base.weight (view).bin
+hc_attn_post-26	4096	4	5	1	f32	hc_attn_post-26.bin
+hc_attn_post-26 (reshaped)	16384	5	1	1	f32	hc_attn_post-26 (reshaped).bin
+blk.26.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.26.hc_ffn_scale.weight (view).bin
+blk.26.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.26.hc_ffn_base.weight (view).bin
+blk.26.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.26.hc_ffn_scale.weight (view).bin
+blk.26.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.26.hc_ffn_base.weight (view).bin
+hc_ffn_pre-26	4096	5	1	1	f32	hc_ffn_pre-26.bin
+ffn_moe_out-26	4096	5	1	1	f32	ffn_moe_out-26.bin
+ffn_out-26	4096	5	1	1	f32	ffn_out-26.bin
+l_out-26	4096	4	5	1	f32	l_out-26.bin
+l_out-26 (reshaped)	16384	5	1	1	f32	l_out-26 (reshaped).bin
+blk.27.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.27.hc_attn_scale.weight (view).bin
+blk.27.hc_attn_base.weight (view)	4	1	1	1	f32	blk.27.hc_attn_base.weight (view).bin
+hc_attn_pre-27	4096	5	1	1	f32	hc_attn_pre-27.bin
+Qcur-27	512	64	5	1	f32	Qcur-27.bin
+kv_cmpr-27	512	1	5	1	f32	kv_cmpr-27.bin
+kv_cmpr-27 (view)	512	5	1	1	f32	kv_cmpr-27 (view).bin
+Qcur-27 (view)	512	64	5	1	f32	Qcur-27 (view).bin
+Qcur-27 (view) (permuted)	512	5	64	1	f32	Qcur-27 (view) (permuted).bin
+blk.27.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.27.hc_attn_scale.weight (view).bin
+blk.27.hc_attn_base.weight (view)	4	1	1	1	f32	blk.27.hc_attn_base.weight (view).bin
+hc_attn_post-27	4096	4	5	1	f32	hc_attn_post-27.bin
+hc_attn_post-27 (reshaped)	16384	5	1	1	f32	hc_attn_post-27 (reshaped).bin
+blk.27.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.27.hc_ffn_scale.weight (view).bin
+blk.27.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.27.hc_ffn_base.weight (view).bin
+blk.27.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.27.hc_ffn_scale.weight (view).bin
+blk.27.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.27.hc_ffn_base.weight (view).bin
+hc_ffn_pre-27	4096	5	1	1	f32	hc_ffn_pre-27.bin
+ffn_moe_out-27	4096	5	1	1	f32	ffn_moe_out-27.bin
+ffn_out-27	4096	5	1	1	f32	ffn_out-27.bin
+l_out-27	4096	4	5	1	f32	l_out-27.bin
+l_out-27 (reshaped)	16384	5	1	1	f32	l_out-27 (reshaped).bin
+blk.28.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.28.hc_attn_scale.weight (view).bin
+blk.28.hc_attn_base.weight (view)	4	1	1	1	f32	blk.28.hc_attn_base.weight (view).bin
+hc_attn_pre-28	4096	5	1	1	f32	hc_attn_pre-28.bin
+kda_gate-28	128	64	5	1	f32	kda_gate-28.bin
+kda_beta-28	1	64	5	1	f32	kda_beta-28.bin
+attn_output-28	128	64	5	1	f32	attn_output-28.bin
+attn_output-28 (cont)	128	64	5	1	f32	attn_output-28 (cont).bin
+attn_output-28 (cont) (reshaped)	128	64	5	1	f32	attn_output-28 (cont) (reshaped).bin
+blk.28.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.28.hc_attn_scale.weight (view).bin
+blk.28.hc_attn_base.weight (view)	4	1	1	1	f32	blk.28.hc_attn_base.weight (view).bin
+hc_attn_post-28	4096	4	5	1	f32	hc_attn_post-28.bin
+hc_attn_post-28 (reshaped)	16384	5	1	1	f32	hc_attn_post-28 (reshaped).bin
+blk.28.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.28.hc_ffn_scale.weight (view).bin
+blk.28.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.28.hc_ffn_base.weight (view).bin
+blk.28.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.28.hc_ffn_scale.weight (view).bin
+blk.28.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.28.hc_ffn_base.weight (view).bin
+hc_ffn_pre-28	4096	5	1	1	f32	hc_ffn_pre-28.bin
+ffn_moe_out-28	4096	5	1	1	f32	ffn_moe_out-28.bin
+ffn_out-28	4096	5	1	1	f32	ffn_out-28.bin
+l_out-28	4096	4	5	1	f32	l_out-28.bin
+l_out-28 (reshaped)	16384	5	1	1	f32	l_out-28 (reshaped).bin
+blk.29.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.29.hc_attn_scale.weight (view).bin
+blk.29.hc_attn_base.weight (view)	4	1	1	1	f32	blk.29.hc_attn_base.weight (view).bin
+hc_attn_pre-29	4096	5	1	1	f32	hc_attn_pre-29.bin
+kda_gate-29	128	64	5	1	f32	kda_gate-29.bin
+kda_beta-29	1	64	5	1	f32	kda_beta-29.bin
+attn_output-29	128	64	5	1	f32	attn_output-29.bin
+attn_output-29 (cont)	128	64	5	1	f32	attn_output-29 (cont).bin
+attn_output-29 (cont) (reshaped)	128	64	5	1	f32	attn_output-29 (cont) (reshaped).bin
+blk.29.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.29.hc_attn_scale.weight (view).bin
+blk.29.hc_attn_base.weight (view)	4	1	1	1	f32	blk.29.hc_attn_base.weight (view).bin
+hc_attn_post-29	4096	4	5	1	f32	hc_attn_post-29.bin
+hc_attn_post-29 (reshaped)	16384	5	1	1	f32	hc_attn_post-29 (reshaped).bin
+blk.29.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.29.hc_ffn_scale.weight (view).bin
+blk.29.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.29.hc_ffn_base.weight (view).bin
+blk.29.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.29.hc_ffn_scale.weight (view).bin
+blk.29.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.29.hc_ffn_base.weight (view).bin
+hc_ffn_pre-29	4096	5	1	1	f32	hc_ffn_pre-29.bin
+ffn_moe_out-29	4096	5	1	1	f32	ffn_moe_out-29.bin
+ffn_out-29	4096	5	1	1	f32	ffn_out-29.bin
+l_out-29	4096	4	5	1	f32	l_out-29.bin
+l_out-29 (reshaped)	16384	5	1	1	f32	l_out-29 (reshaped).bin
+blk.30.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.30.hc_attn_scale.weight (view).bin
+blk.30.hc_attn_base.weight (view)	4	1	1	1	f32	blk.30.hc_attn_base.weight (view).bin
+hc_attn_pre-30	4096	5	1	1	f32	hc_attn_pre-30.bin
+kda_gate-30	128	64	5	1	f32	kda_gate-30.bin
+kda_beta-30	1	64	5	1	f32	kda_beta-30.bin
+attn_output-30	128	64	5	1	f32	attn_output-30.bin
+attn_output-30 (cont)	128	64	5	1	f32	attn_output-30 (cont).bin
+attn_output-30 (cont) (reshaped)	128	64	5	1	f32	attn_output-30 (cont) (reshaped).bin
+blk.30.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.30.hc_attn_scale.weight (view).bin
+blk.30.hc_attn_base.weight (view)	4	1	1	1	f32	blk.30.hc_attn_base.weight (view).bin
+hc_attn_post-30	4096	4	5	1	f32	hc_attn_post-30.bin
+hc_attn_post-30 (reshaped)	16384	5	1	1	f32	hc_attn_post-30 (reshaped).bin
+blk.30.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.30.hc_ffn_scale.weight (view).bin
+blk.30.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.30.hc_ffn_base.weight (view).bin
+blk.30.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.30.hc_ffn_scale.weight (view).bin
+blk.30.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.30.hc_ffn_base.weight (view).bin
+hc_ffn_pre-30	4096	5	1	1	f32	hc_ffn_pre-30.bin
+ffn_moe_out-30	4096	5	1	1	f32	ffn_moe_out-30.bin
+ffn_out-30	4096	5	1	1	f32	ffn_out-30.bin
+l_out-30	4096	4	5	1	f32	l_out-30.bin
+l_out-30 (reshaped)	16384	5	1	1	f32	l_out-30 (reshaped).bin
+blk.31.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.31.hc_attn_scale.weight (view).bin
+blk.31.hc_attn_base.weight (view)	4	1	1	1	f32	blk.31.hc_attn_base.weight (view).bin
+hc_attn_pre-31	4096	5	1	1	f32	hc_attn_pre-31.bin
+Qcur-31	512	64	5	1	f32	Qcur-31.bin
+kv_cmpr-31	512	1	5	1	f32	kv_cmpr-31.bin
+kv_cmpr-31 (view)	512	5	1	1	f32	kv_cmpr-31 (view).bin
+Qcur-31 (view)	512	64	5	1	f32	Qcur-31 (view).bin
+Qcur-31 (view) (permuted)	512	5	64	1	f32	Qcur-31 (view) (permuted).bin
+blk.31.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.31.hc_attn_scale.weight (view).bin
+blk.31.hc_attn_base.weight (view)	4	1	1	1	f32	blk.31.hc_attn_base.weight (view).bin
+hc_attn_post-31	4096	4	5	1	f32	hc_attn_post-31.bin
+hc_attn_post-31 (reshaped)	16384	5	1	1	f32	hc_attn_post-31 (reshaped).bin
+blk.31.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.31.hc_ffn_scale.weight (view).bin
+blk.31.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.31.hc_ffn_base.weight (view).bin
+blk.31.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.31.hc_ffn_scale.weight (view).bin
+blk.31.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.31.hc_ffn_base.weight (view).bin
+hc_ffn_pre-31	4096	5	1	1	f32	hc_ffn_pre-31.bin
+ffn_moe_out-31	4096	5	1	1	f32	ffn_moe_out-31.bin
+ffn_out-31	4096	5	1	1	f32	ffn_out-31.bin
+l_out-31	4096	4	5	1	f32	l_out-31.bin
+l_out-31 (reshaped)	16384	5	1	1	f32	l_out-31 (reshaped).bin
+blk.32.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.32.hc_attn_scale.weight (view).bin
+blk.32.hc_attn_base.weight (view)	4	1	1	1	f32	blk.32.hc_attn_base.weight (view).bin
+hc_attn_pre-32	4096	5	1	1	f32	hc_attn_pre-32.bin
+kda_gate-32	128	64	5	1	f32	kda_gate-32.bin
+kda_beta-32	1	64	5	1	f32	kda_beta-32.bin
+attn_output-32	128	64	5	1	f32	attn_output-32.bin
+attn_output-32 (cont)	128	64	5	1	f32	attn_output-32 (cont).bin
+attn_output-32 (cont) (reshaped)	128	64	5	1	f32	attn_output-32 (cont) (reshaped).bin
+blk.32.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.32.hc_attn_scale.weight (view).bin
+blk.32.hc_attn_base.weight (view)	4	1	1	1	f32	blk.32.hc_attn_base.weight (view).bin
+hc_attn_post-32	4096	4	5	1	f32	hc_attn_post-32.bin
+hc_attn_post-32 (reshaped)	16384	5	1	1	f32	hc_attn_post-32 (reshaped).bin
+blk.32.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.32.hc_ffn_scale.weight (view).bin
+blk.32.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.32.hc_ffn_base.weight (view).bin
+blk.32.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.32.hc_ffn_scale.weight (view).bin
+blk.32.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.32.hc_ffn_base.weight (view).bin
+hc_ffn_pre-32	4096	5	1	1	f32	hc_ffn_pre-32.bin
+ffn_moe_out-32	4096	5	1	1	f32	ffn_moe_out-32.bin
+ffn_out-32	4096	5	1	1	f32	ffn_out-32.bin
+l_out-32	4096	4	5	1	f32	l_out-32.bin
+l_out-32 (reshaped)	16384	5	1	1	f32	l_out-32 (reshaped).bin
+blk.33.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.33.hc_attn_scale.weight (view).bin
+blk.33.hc_attn_base.weight (view)	4	1	1	1	f32	blk.33.hc_attn_base.weight (view).bin
+hc_attn_pre-33	4096	5	1	1	f32	hc_attn_pre-33.bin
+kda_gate-33	128	64	5	1	f32	kda_gate-33.bin
+kda_beta-33	1	64	5	1	f32	kda_beta-33.bin
+attn_output-33	128	64	5	1	f32	attn_output-33.bin
+attn_output-33 (cont)	128	64	5	1	f32	attn_output-33 (cont).bin
+attn_output-33 (cont) (reshaped)	128	64	5	1	f32	attn_output-33 (cont) (reshaped).bin
+blk.33.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.33.hc_attn_scale.weight (view).bin
+blk.33.hc_attn_base.weight (view)	4	1	1	1	f32	blk.33.hc_attn_base.weight (view).bin
+hc_attn_post-33	4096	4	5	1	f32	hc_attn_post-33.bin
+hc_attn_post-33 (reshaped)	16384	5	1	1	f32	hc_attn_post-33 (reshaped).bin
+blk.33.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.33.hc_ffn_scale.weight (view).bin
+blk.33.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.33.hc_ffn_base.weight (view).bin
+blk.33.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.33.hc_ffn_scale.weight (view).bin
+blk.33.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.33.hc_ffn_base.weight (view).bin
+hc_ffn_pre-33	4096	5	1	1	f32	hc_ffn_pre-33.bin
+ffn_moe_out-33	4096	5	1	1	f32	ffn_moe_out-33.bin
+ffn_out-33	4096	5	1	1	f32	ffn_out-33.bin
+l_out-33	4096	4	5	1	f32	l_out-33.bin
+l_out-33 (reshaped)	16384	5	1	1	f32	l_out-33 (reshaped).bin
+blk.34.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.34.hc_attn_scale.weight (view).bin
+blk.34.hc_attn_base.weight (view)	4	1	1	1	f32	blk.34.hc_attn_base.weight (view).bin
+hc_attn_pre-34	4096	5	1	1	f32	hc_attn_pre-34.bin
+kda_gate-34	128	64	5	1	f32	kda_gate-34.bin
+kda_beta-34	1	64	5	1	f32	kda_beta-34.bin
+attn_output-34	128	64	5	1	f32	attn_output-34.bin
+attn_output-34 (cont)	128	64	5	1	f32	attn_output-34 (cont).bin
+attn_output-34 (cont) (reshaped)	128	64	5	1	f32	attn_output-34 (cont) (reshaped).bin
+blk.34.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.34.hc_attn_scale.weight (view).bin
+blk.34.hc_attn_base.weight (view)	4	1	1	1	f32	blk.34.hc_attn_base.weight (view).bin
+hc_attn_post-34	4096	4	5	1	f32	hc_attn_post-34.bin
+hc_attn_post-34 (reshaped)	16384	5	1	1	f32	hc_attn_post-34 (reshaped).bin
+blk.34.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.34.hc_ffn_scale.weight (view).bin
+blk.34.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.34.hc_ffn_base.weight (view).bin
+blk.34.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.34.hc_ffn_scale.weight (view).bin
+blk.34.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.34.hc_ffn_base.weight (view).bin
+hc_ffn_pre-34	4096	5	1	1	f32	hc_ffn_pre-34.bin
+ffn_moe_out-34	4096	5	1	1	f32	ffn_moe_out-34.bin
+ffn_out-34	4096	5	1	1	f32	ffn_out-34.bin
+l_out-34	4096	4	5	1	f32	l_out-34.bin
+l_out-34 (reshaped)	16384	5	1	1	f32	l_out-34 (reshaped).bin
+blk.35.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.35.hc_attn_scale.weight (view).bin
+blk.35.hc_attn_base.weight (view)	4	1	1	1	f32	blk.35.hc_attn_base.weight (view).bin
+hc_attn_pre-35	4096	5	1	1	f32	hc_attn_pre-35.bin
+Qcur-35	512	64	5	1	f32	Qcur-35.bin
+kv_cmpr-35	512	1	5	1	f32	kv_cmpr-35.bin
+kv_cmpr-35 (view)	512	5	1	1	f32	kv_cmpr-35 (view).bin
+Qcur-35 (view)	512	64	5	1	f32	Qcur-35 (view).bin
+Qcur-35 (view) (permuted)	512	5	64	1	f32	Qcur-35 (view) (permuted).bin
+blk.35.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.35.hc_attn_scale.weight (view).bin
+blk.35.hc_attn_base.weight (view)	4	1	1	1	f32	blk.35.hc_attn_base.weight (view).bin
+hc_attn_post-35	4096	4	5	1	f32	hc_attn_post-35.bin
+hc_attn_post-35 (reshaped)	16384	5	1	1	f32	hc_attn_post-35 (reshaped).bin
+blk.35.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.35.hc_ffn_scale.weight (view).bin
+blk.35.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.35.hc_ffn_base.weight (view).bin
+blk.35.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.35.hc_ffn_scale.weight (view).bin
+blk.35.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.35.hc_ffn_base.weight (view).bin
+hc_ffn_pre-35	4096	5	1	1	f32	hc_ffn_pre-35.bin
+ffn_moe_out-35	4096	5	1	1	f32	ffn_moe_out-35.bin
+ffn_out-35	4096	5	1	1	f32	ffn_out-35.bin
+l_out-35	4096	4	5	1	f32	l_out-35.bin
+l_out-35 (reshaped)	16384	5	1	1	f32	l_out-35 (reshaped).bin
+blk.36.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.36.hc_attn_scale.weight (view).bin
+blk.36.hc_attn_base.weight (view)	4	1	1	1	f32	blk.36.hc_attn_base.weight (view).bin
+hc_attn_pre-36	4096	5	1	1	f32	hc_attn_pre-36.bin
+kda_gate-36	128	64	5	1	f32	kda_gate-36.bin
+kda_beta-36	1	64	5	1	f32	kda_beta-36.bin
+attn_output-36	128	64	5	1	f32	attn_output-36.bin
+attn_output-36 (cont)	128	64	5	1	f32	attn_output-36 (cont).bin
+attn_output-36 (cont) (reshaped)	128	64	5	1	f32	attn_output-36 (cont) (reshaped).bin
+blk.36.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.36.hc_attn_scale.weight (view).bin
+blk.36.hc_attn_base.weight (view)	4	1	1	1	f32	blk.36.hc_attn_base.weight (view).bin
+hc_attn_post-36	4096	4	5	1	f32	hc_attn_post-36.bin
+hc_attn_post-36 (reshaped)	16384	5	1	1	f32	hc_attn_post-36 (reshaped).bin
+blk.36.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.36.hc_ffn_scale.weight (view).bin
+blk.36.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.36.hc_ffn_base.weight (view).bin
+blk.36.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.36.hc_ffn_scale.weight (view).bin
+blk.36.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.36.hc_ffn_base.weight (view).bin
+hc_ffn_pre-36	4096	5	1	1	f32	hc_ffn_pre-36.bin
+ffn_moe_out-36	4096	5	1	1	f32	ffn_moe_out-36.bin
+ffn_out-36	4096	5	1	1	f32	ffn_out-36.bin
+l_out-36	4096	4	5	1	f32	l_out-36.bin
+l_out-36 (reshaped)	16384	5	1	1	f32	l_out-36 (reshaped).bin
+blk.37.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.37.hc_attn_scale.weight (view).bin
+blk.37.hc_attn_base.weight (view)	4	1	1	1	f32	blk.37.hc_attn_base.weight (view).bin
+hc_attn_pre-37	4096	5	1	1	f32	hc_attn_pre-37.bin
+kda_gate-37	128	64	5	1	f32	kda_gate-37.bin
+kda_beta-37	1	64	5	1	f32	kda_beta-37.bin
+attn_output-37	128	64	5	1	f32	attn_output-37.bin
+attn_output-37 (cont)	128	64	5	1	f32	attn_output-37 (cont).bin
+attn_output-37 (cont) (reshaped)	128	64	5	1	f32	attn_output-37 (cont) (reshaped).bin
+blk.37.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.37.hc_attn_scale.weight (view).bin
+blk.37.hc_attn_base.weight (view)	4	1	1	1	f32	blk.37.hc_attn_base.weight (view).bin
+hc_attn_post-37	4096	4	5	1	f32	hc_attn_post-37.bin
+hc_attn_post-37 (reshaped)	16384	5	1	1	f32	hc_attn_post-37 (reshaped).bin
+blk.37.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.37.hc_ffn_scale.weight (view).bin
+blk.37.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.37.hc_ffn_base.weight (view).bin
+blk.37.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.37.hc_ffn_scale.weight (view).bin
+blk.37.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.37.hc_ffn_base.weight (view).bin
+hc_ffn_pre-37	4096	5	1	1	f32	hc_ffn_pre-37.bin
+ffn_moe_out-37	4096	5	1	1	f32	ffn_moe_out-37.bin
+ffn_out-37	4096	5	1	1	f32	ffn_out-37.bin
+l_out-37	4096	4	5	1	f32	l_out-37.bin
+l_out-37 (reshaped)	16384	5	1	1	f32	l_out-37 (reshaped).bin
+blk.38.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.38.hc_attn_scale.weight (view).bin
+blk.38.hc_attn_base.weight (view)	4	1	1	1	f32	blk.38.hc_attn_base.weight (view).bin
+hc_attn_pre-38	4096	5	1	1	f32	hc_attn_pre-38.bin
+kda_gate-38	128	64	5	1	f32	kda_gate-38.bin
+kda_beta-38	1	64	5	1	f32	kda_beta-38.bin
+attn_output-38	128	64	5	1	f32	attn_output-38.bin
+attn_output-38 (cont)	128	64	5	1	f32	attn_output-38 (cont).bin
+attn_output-38 (cont) (reshaped)	128	64	5	1	f32	attn_output-38 (cont) (reshaped).bin
+blk.38.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.38.hc_attn_scale.weight (view).bin
+blk.38.hc_attn_base.weight (view)	4	1	1	1	f32	blk.38.hc_attn_base.weight (view).bin
+hc_attn_post-38	4096	4	5	1	f32	hc_attn_post-38.bin
+hc_attn_post-38 (reshaped)	16384	5	1	1	f32	hc_attn_post-38 (reshaped).bin
+blk.38.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.38.hc_ffn_scale.weight (view).bin
+blk.38.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.38.hc_ffn_base.weight (view).bin
+blk.38.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.38.hc_ffn_scale.weight (view).bin
+blk.38.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.38.hc_ffn_base.weight (view).bin
+hc_ffn_pre-38	4096	5	1	1	f32	hc_ffn_pre-38.bin
+ffn_moe_out-38	4096	5	1	1	f32	ffn_moe_out-38.bin
+ffn_out-38	4096	5	1	1	f32	ffn_out-38.bin
+l_out-38	4096	4	5	1	f32	l_out-38.bin
+l_out-38 (reshaped)	16384	5	1	1	f32	l_out-38 (reshaped).bin
+blk.39.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.39.hc_attn_scale.weight (view).bin
+blk.39.hc_attn_base.weight (view)	4	1	1	1	f32	blk.39.hc_attn_base.weight (view).bin
+hc_attn_pre-39	4096	5	1	1	f32	hc_attn_pre-39.bin
+Qcur-39	512	64	5	1	f32	Qcur-39.bin
+kv_cmpr-39	512	1	5	1	f32	kv_cmpr-39.bin
+kv_cmpr-39 (view)	512	5	1	1	f32	kv_cmpr-39 (view).bin
+Qcur-39 (view)	512	64	5	1	f32	Qcur-39 (view).bin
+Qcur-39 (view) (permuted)	512	5	64	1	f32	Qcur-39 (view) (permuted).bin
+blk.39.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.39.hc_attn_scale.weight (view).bin
+blk.39.hc_attn_base.weight (view)	4	1	1	1	f32	blk.39.hc_attn_base.weight (view).bin
+hc_attn_post-39	4096	4	5	1	f32	hc_attn_post-39.bin
+hc_attn_post-39 (reshaped)	16384	5	1	1	f32	hc_attn_post-39 (reshaped).bin
+blk.39.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.39.hc_ffn_scale.weight (view).bin
+blk.39.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.39.hc_ffn_base.weight (view).bin
+blk.39.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.39.hc_ffn_scale.weight (view).bin
+blk.39.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.39.hc_ffn_base.weight (view).bin
+hc_ffn_pre-39	4096	5	1	1	f32	hc_ffn_pre-39.bin
+ffn_moe_out-39	4096	5	1	1	f32	ffn_moe_out-39.bin
+ffn_out-39	4096	5	1	1	f32	ffn_out-39.bin
+l_out-39	4096	4	5	1	f32	l_out-39.bin
+l_out-39 (reshaped)	16384	5	1	1	f32	l_out-39 (reshaped).bin
+blk.40.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.40.hc_attn_scale.weight (view).bin
+blk.40.hc_attn_base.weight (view)	4	1	1	1	f32	blk.40.hc_attn_base.weight (view).bin
+hc_attn_pre-40	4096	5	1	1	f32	hc_attn_pre-40.bin
+kda_gate-40	128	64	5	1	f32	kda_gate-40.bin
+kda_beta-40	1	64	5	1	f32	kda_beta-40.bin
+attn_output-40	128	64	5	1	f32	attn_output-40.bin
+attn_output-40 (cont)	128	64	5	1	f32	attn_output-40 (cont).bin
+attn_output-40 (cont) (reshaped)	128	64	5	1	f32	attn_output-40 (cont) (reshaped).bin
+blk.40.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.40.hc_attn_scale.weight (view).bin
+blk.40.hc_attn_base.weight (view)	4	1	1	1	f32	blk.40.hc_attn_base.weight (view).bin
+hc_attn_post-40	4096	4	5	1	f32	hc_attn_post-40.bin
+hc_attn_post-40 (reshaped)	16384	5	1	1	f32	hc_attn_post-40 (reshaped).bin
+blk.40.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.40.hc_ffn_scale.weight (view).bin
+blk.40.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.40.hc_ffn_base.weight (view).bin
+blk.40.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.40.hc_ffn_scale.weight (view).bin
+blk.40.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.40.hc_ffn_base.weight (view).bin
+hc_ffn_pre-40	4096	5	1	1	f32	hc_ffn_pre-40.bin
+ffn_moe_out-40	4096	5	1	1	f32	ffn_moe_out-40.bin
+ffn_out-40	4096	5	1	1	f32	ffn_out-40.bin
+l_out-40	4096	4	5	1	f32	l_out-40.bin
+l_out-40 (reshaped)	16384	5	1	1	f32	l_out-40 (reshaped).bin
+blk.41.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.41.hc_attn_scale.weight (view).bin
+blk.41.hc_attn_base.weight (view)	4	1	1	1	f32	blk.41.hc_attn_base.weight (view).bin
+hc_attn_pre-41	4096	5	1	1	f32	hc_attn_pre-41.bin
+kda_gate-41	128	64	5	1	f32	kda_gate-41.bin
+kda_beta-41	1	64	5	1	f32	kda_beta-41.bin
+attn_output-41	128	64	5	1	f32	attn_output-41.bin
+attn_output-41 (cont)	128	64	5	1	f32	attn_output-41 (cont).bin
+attn_output-41 (cont) (reshaped)	128	64	5	1	f32	attn_output-41 (cont) (reshaped).bin
+blk.41.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.41.hc_attn_scale.weight (view).bin
+blk.41.hc_attn_base.weight (view)	4	1	1	1	f32	blk.41.hc_attn_base.weight (view).bin
+hc_attn_post-41	4096	4	5	1	f32	hc_attn_post-41.bin
+hc_attn_post-41 (reshaped)	16384	5	1	1	f32	hc_attn_post-41 (reshaped).bin
+blk.41.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.41.hc_ffn_scale.weight (view).bin
+blk.41.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.41.hc_ffn_base.weight (view).bin
+blk.41.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.41.hc_ffn_scale.weight (view).bin
+blk.41.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.41.hc_ffn_base.weight (view).bin
+hc_ffn_pre-41	4096	5	1	1	f32	hc_ffn_pre-41.bin
+ffn_moe_out-41	4096	5	1	1	f32	ffn_moe_out-41.bin
+ffn_out-41	4096	5	1	1	f32	ffn_out-41.bin
+l_out-41	4096	4	5	1	f32	l_out-41.bin
+l_out-41 (reshaped)	16384	5	1	1	f32	l_out-41 (reshaped).bin
+blk.42.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.42.hc_attn_scale.weight (view).bin
+blk.42.hc_attn_base.weight (view)	4	1	1	1	f32	blk.42.hc_attn_base.weight (view).bin
+hc_attn_pre-42	4096	5	1	1	f32	hc_attn_pre-42.bin
+kda_gate-42	128	64	5	1	f32	kda_gate-42.bin
+kda_beta-42	1	64	5	1	f32	kda_beta-42.bin
+attn_output-42	128	64	5	1	f32	attn_output-42.bin
+attn_output-42 (cont)	128	64	5	1	f32	attn_output-42 (cont).bin
+attn_output-42 (cont) (reshaped)	128	64	5	1	f32	attn_output-42 (cont) (reshaped).bin
+blk.42.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.42.hc_attn_scale.weight (view).bin
+blk.42.hc_attn_base.weight (view)	4	1	1	1	f32	blk.42.hc_attn_base.weight (view).bin
+hc_attn_post-42	4096	4	5	1	f32	hc_attn_post-42.bin
+hc_attn_post-42 (reshaped)	16384	5	1	1	f32	hc_attn_post-42 (reshaped).bin
+blk.42.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.42.hc_ffn_scale.weight (view).bin
+blk.42.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.42.hc_ffn_base.weight (view).bin
+blk.42.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.42.hc_ffn_scale.weight (view).bin
+blk.42.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.42.hc_ffn_base.weight (view).bin
+hc_ffn_pre-42	4096	5	1	1	f32	hc_ffn_pre-42.bin
+ffn_moe_out-42	4096	5	1	1	f32	ffn_moe_out-42.bin
+ffn_out-42	4096	5	1	1	f32	ffn_out-42.bin
+l_out-42	4096	4	5	1	f32	l_out-42.bin
+l_out-42 (reshaped)	16384	5	1	1	f32	l_out-42 (reshaped).bin
+blk.43.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.43.hc_attn_scale.weight (view).bin
+blk.43.hc_attn_base.weight (view)	4	1	1	1	f32	blk.43.hc_attn_base.weight (view).bin
+hc_attn_pre-43	4096	5	1	1	f32	hc_attn_pre-43.bin
+Qcur-43	512	64	5	1	f32	Qcur-43.bin
+kv_cmpr-43	512	1	5	1	f32	kv_cmpr-43.bin
+kv_cmpr-43 (view)	512	5	1	1	f32	kv_cmpr-43 (view).bin
+Qcur-43 (view)	512	64	5	1	f32	Qcur-43 (view).bin
+Qcur-43 (view) (permuted)	512	5	64	1	f32	Qcur-43 (view) (permuted).bin
+blk.43.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.43.hc_attn_scale.weight (view).bin
+blk.43.hc_attn_base.weight (view)	4	1	1	1	f32	blk.43.hc_attn_base.weight (view).bin
+hc_attn_post-43	4096	4	5	1	f32	hc_attn_post-43.bin
+hc_attn_post-43 (reshaped)	16384	5	1	1	f32	hc_attn_post-43 (reshaped).bin
+blk.43.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.43.hc_ffn_scale.weight (view).bin
+blk.43.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.43.hc_ffn_base.weight (view).bin
+blk.43.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.43.hc_ffn_scale.weight (view).bin
+blk.43.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.43.hc_ffn_base.weight (view).bin
+hc_ffn_pre-43	4096	5	1	1	f32	hc_ffn_pre-43.bin
+ffn_moe_out-43	4096	5	1	1	f32	ffn_moe_out-43.bin
+ffn_out-43	4096	5	1	1	f32	ffn_out-43.bin
+l_out-43	4096	4	5	1	f32	l_out-43.bin
+l_out-43 (reshaped)	16384	5	1	1	f32	l_out-43 (reshaped).bin
+blk.44.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.44.hc_attn_scale.weight (view).bin
+blk.44.hc_attn_base.weight (view)	4	1	1	1	f32	blk.44.hc_attn_base.weight (view).bin
+hc_attn_pre-44	4096	5	1	1	f32	hc_attn_pre-44.bin
+kda_gate-44	128	64	5	1	f32	kda_gate-44.bin
+kda_beta-44	1	64	5	1	f32	kda_beta-44.bin
+attn_output-44	128	64	5	1	f32	attn_output-44.bin
+attn_output-44 (cont)	128	64	5	1	f32	attn_output-44 (cont).bin
+attn_output-44 (cont) (reshaped)	128	64	5	1	f32	attn_output-44 (cont) (reshaped).bin
+blk.44.hc_attn_scale.weight (view)	1	1	1	1	f32	blk.44.hc_attn_scale.weight (view).bin
+blk.44.hc_attn_base.weight (view)	4	1	1	1	f32	blk.44.hc_attn_base.weight (view).bin
+hc_attn_post-44	4096	4	5	1	f32	hc_attn_post-44.bin
+hc_attn_post-44 (reshaped)	16384	5	1	1	f32	hc_attn_post-44 (reshaped).bin
+blk.44.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.44.hc_ffn_scale.weight (view).bin
+blk.44.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.44.hc_ffn_base.weight (view).bin
+blk.44.hc_ffn_scale.weight (view)	1	1	1	1	f32	blk.44.hc_ffn_scale.weight (view).bin
+blk.44.hc_ffn_base.weight (view)	4	1	1	1	f32	blk.44.hc_ffn_base.weight (view).bin
+hc_ffn_pre-44	4096	5	1	1	f32	hc_ffn_pre-44.bin
+ffn_moe_out-44	4096	5	1	1	f32	ffn_moe_out-44.bin
+ffn_out-44	4096	5	1	1	f32	ffn_out-44.bin
+l_out-44	4096	4	5	1	f32	l_out-44.bin
+l_out-44 (reshaped)	16384	5	1	1	f32	l_out-44 (reshaped).bin
+hc_head	4096	1	1	1	f32	hc_head.bin
+result_norm	4096	1	1	1	f32	result_norm.bin
+result_output	154880	1	1	1	f32	result_output.bin
