@@ -247,8 +247,12 @@ scalar scale.** That is 8 lines of math in the reference, not a new recurrence.
 
 What IS new is GLM's front end, and it differs from qwen4exp's in ways that matter:
 
-* **three separate causal convolutions** (q, k, v each with their own `ssm_conv1d_*`, kernel 4) and
-  **no SiLU** on the conv output, where qwen4exp convolves q|k|v together and applies SiLU;
+* **three separate causal convolutions** (q, k, v each with their own `ssm_conv1d_*`, kernel 4), each
+  followed by **SiLU** — the activation is there, but applied per-conv. qwen4exp instead convolves
+  q|k|v concatenated in ONE conv and applies SiLU once to the result. Either way the conv is depthwise
+  over the sequence (`ggml_ssm_conv`: `out[t][ch] = sum_k w[k][ch] * x[t+k][ch]` over the concatenated
+  `[state(d_conv-1) | tokens]`, so the kernel is applied in forward order — a correlation, not a
+  flipped convolution — and the state holds the previous `d_conv-1` inputs per channel);
 * the gate: `g = gate_lower_bound * sigmoid(-(ssm_a * (ssm_f_b(ssm_f_a(x)) + dt_bias)))` with
   `ssm_a` holding `-exp(A_log)`, so the effective factor is `exp(A_log)`; `gate_lower_bound` is -5.0,
   so the decay exponent lives in [-5, 0]. It is per (head_dim, head), which is what makes it KDA;
