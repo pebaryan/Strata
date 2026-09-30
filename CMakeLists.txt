@@ -152,6 +152,12 @@ add_executable(glm_hc_parity src/kernels/glm_hc_parity.cpp src/kernels/glm_hc.cp
 target_include_directories(glm_hc_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_hc_parity PRIVATE -O2)
 
+# MLA parity (branch glm5next-port): the sparse-attention block with the absorption folding, against
+# tools/glm5_mla_reference.py.  Same host-only, hand-run reasoning as the mHC test above.
+add_executable(glm_mla_parity src/kernels/glm_mla_parity.cpp src/kernels/glm_mla.cpp)
+target_include_directories(glm_mla_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm_mla_parity PRIVATE -O2)
+
 add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
