@@ -91,9 +91,17 @@ def rms_norm_ne0(x: np.ndarray, w: np.ndarray | None = None, eps: float = 1e-5) 
     return y * w[:, None] if w is not None else y
 
 
-def dense_ffn(wg: np.ndarray, wu: np.ndarray, wd: np.ndarray, x: np.ndarray) -> np.ndarray:
-    """x: (T, n_embd).  The leading blocks' FFN - the same arithmetic as an expert, ff 12288."""
-    return (MOE.silu(x @ wg.T) * (x @ wu.T)) @ wd.T
+def dense_ffn(wg: np.ndarray, wu: np.ndarray, wd: np.ndarray, x: np.ndarray, limit: float) -> np.ndarray:
+    """x: (T, n_embd).  The leading blocks' FFN - the same arithmetic as an expert, ff 12288 - and the
+    SAME clamp: the reference reaches this site through build_ffn, which reads swiglu_clamp_shexp[il]
+    (llama-graph.cpp:1816) for every il >= 0.  The limit is passed in, never defaulted, so this cannot
+    silently become an unclamped second implementation of the oracle."""
+    gate = x @ wg.T
+    up = x @ wu.T
+    if limit > 1e-6:
+        gate = np.minimum(gate, limit)
+        up = np.clip(up, -limit, limit)
+    return (MOE.silu(gate) * up) @ wd.T
 
 
 def main() -> int:
@@ -109,7 +117,11 @@ def main() -> int:
     dump.mkdir(parents=True, exist_ok=True)
     toks = [int(t) for t in a.tokens.split()]
     w = Weights(pathlib.Path(a.gguf))
-    print(f"prompt tokens {toks} ({len(toks)} tokens), running {a.blocks} block(s)")
+    meta = MOE._read_meta(pathlib.Path(a.gguf))
+    shexp_clamp = meta["glm5next.swiglu_clamp_shexp"]
+    exp_clamp = meta["glm5next.swiglu_clamp_exp"]
+    print(f"prompt tokens {toks} ({len(toks)} tokens), running {a.blocks} block(s); "
+          f"swiglu clamps exp {exp_clamp[0]:g} shexp {shexp_clamp[0]:g}")
 
     # ---- the embedding and the four-stream init
     emb = np.stack([w.embedding(t, a.vocab) for t in toks])          # (T, n_embd)
@@ -160,7 +172,7 @@ def main() -> int:
 
         if il < DENSE_LEAD:
             ffn = dense_ffn(w.tensor(p + "ffn_gate.weight"), w.tensor(p + "ffn_up.weight"),
-                            w.tensor(p + "ffn_down.weight"), cur.T)
+                            w.tensor(p + "ffn_down.weight"), cur.T, shexp_clamp[il])
         else:
             print(f"  block {il} is a MoE block; this driver only does the dense leading blocks so far")
             return 3

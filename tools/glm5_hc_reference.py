@@ -114,6 +114,16 @@ def hc_pre(x, fn, scale, base):
     return layer_in, pre, post, comb
 
 
+def hc_mean(x: np.ndarray) -> np.ndarray:
+    """The head's collapse: the mean over the streams.
+
+    x is [hc, n_embd, nt] in this module's orientation.  The reference (glm5next.cpp:336,
+    glm5next_hc_mean) sums ne1 - the hc axis - and scales by 1/hc, so the collapse is the arithmetic
+    mean, not a weighted one.  It was on the path to the output without being covered by any gate.
+    """
+    return x.mean(axis=0)
+
+
 def hc_post(cur, residual, post, comb):
     """cur: [n_embd, nt] the site's output.  residual: [hc, n_embd, nt].  Returns [hc, n_embd, nt]."""
     hc = residual.shape[0]

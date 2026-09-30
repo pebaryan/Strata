@@ -159,6 +159,30 @@ int main(int argc, char** argv) {
         if (rowmax > 1e-4 || rowdiff > 1e-5 || coldiff > 1e-5) { std::printf("  invariants FAIL\n"); ok = false; }
     }
 
+    // hc_mean: the head's collapse.  It takes no weights, so there is nothing to put in the oracle
+    // fixture - instead the semantics is pinned here directly, against the reference's own formula
+    // (glm5next.cpp:336: sum over the hc axis, then scale by 1/hc) on an input built to make a wrong
+    // axis, a wrong divisor or a sum-instead-of-mean all visible.
+    {
+        using namespace strata::kernels::glm;   // HC and hc_mean live in the kernel namespace
+        const int N = 8;
+        std::vector<float> x((size_t) HC * N), out((size_t) N, 0.0f);
+        for (int h = 0; h < HC; ++h) {
+            for (int e = 0; e < N; ++e) x[(size_t) h * N + e] = (float) (h * 100 + e) * 1.0f;
+        }
+        hc_mean(x.data(), N, out.data());
+        float d = 0.0f;
+        for (int e = 0; e < N; ++e) {
+            double want = 0.0;
+            for (int h = 0; h < HC; ++h) want += x[(size_t) h * N + e];
+            want /= (double) HC;
+            d = std::max(d, (float) std::fabs((double) out[e] - want));
+        }
+        std::printf("hc_mean: worst abs %.3e over [hc=%d][%d]   %s\n", d, HC, N,
+                    d < 1e-6f ? "ok" : "FAIL");
+        if (!(d < 1e-6f)) ok = false;
+    }
+
     std::printf("glm_hc_parity: worst abs %.3e, worst rel %.3e -> %s\n", worst_abs, worst_rel,
                 ok ? "0 failures" : "FAILURES");
     return ok ? 0 : 1;

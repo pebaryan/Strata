@@ -46,6 +46,22 @@ F16_MIN = 6.103515625e-05
 TOP_K_ORDER = "index"   # ties broken by ascending index, as ggml's argsort is stable by index
 
 
+def _read_meta(first: pathlib.Path) -> dict:
+    """The artifact's own metadata, read with the gguf library directly (not through iq_pack, so this
+    stays an independent read of the same file the clamps come from)."""
+    import numpy as np
+    from _paths import add_gguf_py
+    add_gguf_py()
+    from gguf import GGUFReader
+    out = {}
+    for f in GGUFReader(str(first)).fields.values():
+        try:
+            out[f.name] = np.asarray(f.contents()).tolist()
+        except Exception:
+            pass
+    return out
+
+
 class Model:
     def __init__(self, first: pathlib.Path):
         self.m = P.Model(first)
@@ -53,6 +69,21 @@ class Model:
         add_gguf_py()
         from gguf import GGMLQuantizationType as Q, quants
         self.Q, self.quants = Q, quants
+        self.meta = _read_meta(first)          # the artifact's own metadata, for the swiglu clamps
+
+    def clamp_limits(self, layer: int) -> tuple[float, float]:
+        """(swiglu_clamp_exp, swiglu_clamp_shexp) for this layer.
+
+        llama.cpp reads BOTH keys without the optional flag, so GLM5 REQUIRES them, and ggml's
+        ggml_swiglu_clamp is what the reference applies to the experts (llama-graph.cpp:2211) and to
+        the shared expert / dense leading FFN (:1816, whose swiglu_clamp_shexp array is 10.0 for every
+        layer, so the leading dense blocks are clamped too).  Deriving them from the artifact rather
+        than defaulting them off is the point: a default that silently disables a term is how the
+        mHC eps disagreement survived a parity gate.
+        """
+        e = self.meta["glm5next.swiglu_clamp_exp"]
+        s = self.meta["glm5next.swiglu_clamp_shexp"]
+        return float(e[layer]), float(s[layer])
 
     def raw(self, name: str) -> np.ndarray:
         return np.asarray(self.m.bytes(name))
@@ -80,6 +111,42 @@ class Model:
 
 def silu(x: np.ndarray) -> np.ndarray:
     return x / (1.0 + np.exp(-x))
+
+
+# Whether the swiglu clamp actually BIT, per site.  A clamp that never fires leaves the same numbers
+# behind as no clamp at all, so a gate that only compares outputs cannot tell the two apart - this is
+# how the run reports whether the term was live.
+CLAMP_STATS: dict[str, int] = {"exp_gate": 0, "exp_up": 0, "shexp_gate": 0, "shexp_up": 0,
+                               "dense_gate": 0, "dense_up": 0, "calls": 0}
+
+
+def swiglu_ffn(wg: np.ndarray, wu: np.ndarray, wd: np.ndarray, x: np.ndarray, limit: float, tag: str):
+    """LLM_FFN_SILU + LLM_FFN_PAR with the reference's ggml_swiglu_clamp.
+
+    ggml's CPU kernel (ggml/src/ggml-cpu/ops.cpp, ggml_compute_forward_swiglu_clamp_f32) is
+
+        gate = min(gate, limit)                      <-- ONE-sided: only from above
+        up   = clamp(up, -limit, limit)              <-- two-sided
+        out  = silu(gate) * up
+
+    and llama.cpp routes GLM5NEXT here (llama-graph.cpp:2211 for the experts via
+    swiglu_clamp_exp[il], :1816 for the shared expert AND the leading dense FFN via
+    swiglu_clamp_shexp[il], which is 10.0 for every layer of this artifact).  With limit = 10.0 the
+    term is invisible until a pre-activation exceeds 10, which is why the phase-6 fixture - arbitrary
+    inputs that never got that far - passed without it.
+
+    `limit` is required and `tag` names the site: no caller can silently run without the clamp, and
+    CLAMP_STATS records whether it fired.
+    """
+    gate = wg @ x
+    up = wu @ x
+    if limit > 1e-6:
+        CLAMP_STATS["calls"] += 1
+        CLAMP_STATS[f"{tag}_gate"] += int((gate > limit).sum())
+        CLAMP_STATS[f"{tag}_up"] += int((np.abs(up) > limit).sum())
+        gate = np.minimum(gate, limit)
+        up = np.clip(up, -limit, limit)
+    return wd @ (silu(gate) * up)
 
 
 def router(w_router: np.ndarray, b: np.ndarray | None, x: np.ndarray):
@@ -115,6 +182,7 @@ def moe_forward(m: Model, layer: int, x: np.ndarray, n_expert: int = N_EXPERT, w
         except KeyError:
             continue
     topk, weights, probs = router(w_router, b, x)
+    lim_exp, lim_shexp = m.clamp_limits(layer)
 
     acc = np.zeros(N_EMBD, dtype=np.float64)
     experts = {}
@@ -123,10 +191,10 @@ def moe_forward(m: Model, layer: int, x: np.ndarray, n_expert: int = N_EXPERT, w
         wu = m.expert(p + "ffn_up_exps.weight", int(e), n_expert)
         wd = m.expert(p + "ffn_down_exps.weight", int(e), n_expert)
         experts[int(e)] = (wg, wu, wd)
-        acc += weights[i] * expert_ffn(wg, wu, wd, x.astype(np.float64))
+        acc += weights[i] * swiglu_ffn(wg, wu, wd, x.astype(np.float64), lim_exp, "exp")
 
-    shexp = expert_ffn(m.tensor(p + "ffn_gate_shexp.weight"), m.tensor(p + "ffn_up_shexp.weight"),
-                       m.tensor(p + "ffn_down_shexp.weight"), x.astype(np.float64))
+    shexp = swiglu_ffn(m.tensor(p + "ffn_gate_shexp.weight"), m.tensor(p + "ffn_up_shexp.weight"),
+                       m.tensor(p + "ffn_down_shexp.weight"), x.astype(np.float64), lim_shexp, "shexp")
     moe = acc
     out = moe + shexp
     return out, {"topk": topk, "weights": weights, "probs": probs, "moe": moe, "shexp": shexp,
@@ -134,14 +202,20 @@ def moe_forward(m: Model, layer: int, x: np.ndarray, n_expert: int = N_EXPERT, w
 
 
 def dense_forward(m: Model, layer: int, x: np.ndarray):
-    """The 3 leading blocks' FFN: the SAME arithmetic as an expert, but ff is 12288, not 2048."""
+    """The 3 leading blocks' FFN: the SAME arithmetic as an expert, but ff is 12288, not 2048.
+
+    The clamp here is swiglu_clamp_SHEXP, not _EXP: the reference reaches this site through build_ffn,
+    which reads the shexp array (llama-graph.cpp:1816) for every il >= 0.
+    """
     p = f"blk.{layer}."
     wg = m.tensor(p + "ffn_gate.weight")     # (12288, 4096)
     wu = m.tensor(p + "ffn_up.weight")
     wd = m.tensor(p + "ffn_down.weight")     # (4096, 12288)
     assert wg.shape[0] == wu.shape[0] == wd.shape[1], (wg.shape, wu.shape, wd.shape)
     assert wg.shape[1] == wd.shape[0] == x.size, (wg.shape, wd.shape, x.size)
-    return expert_ffn(wg, wu, wd, x.astype(np.float64)), {"gate": wg, "up": wu, "down": wd}
+    _, lim_shexp = m.clamp_limits(layer)
+    return swiglu_ffn(wg, wu, wd, x.astype(np.float64), lim_shexp, "dense"), \
+        {"gate": wg, "up": wu, "down": wd}
 
 
 def main() -> int:
@@ -157,6 +231,14 @@ def main() -> int:
     ap.add_argument("--bias-matters", action="store_true",
                     help="search seeds for an input where ffn_exp_probs_b changes the selection, so the "
                          "fixture can actually catch a port that ignores it")
+    ap.add_argument("--x-scale", type=float, default=0.5,
+                    help="scale of the fixture's input.  The default keeps the pre-activations well "
+                         "under the swiglu clamp's 10.0, so the clamp can NOT bite; pass a larger scale "
+                         "to build a fixture that exercises it (see --clamp-matters)")
+    ap.add_argument("--clamp-matters", action="store_true",
+                    help="report whether the swiglu clamp bites at this scale, and which scales make it "
+                         "bite: a fixture whose input never reaches the limit cannot catch a port that "
+                         "omits the clamp")
     a = ap.parse_args()
 
     m = Model(pathlib.Path(a.gguf))
@@ -165,15 +247,16 @@ def main() -> int:
     if a.dense:
         # the 3 leading blocks have NO router at all (they are the "leading_dense_block_count"), so the
         # dense path must not touch the MoE tensors - that is itself part of what this checks.
-        x = (np.random.default_rng(a.seed).standard_normal(N_EMBD) * 0.5).astype(np.float32)
+        x = (np.random.default_rng(a.seed).standard_normal(N_EMBD) * a.x_scale).astype(np.float32)
         out, mid = dense_forward(m, a.layer, x)
         ff = int(mid["gate"].shape[0])
         if a.selftest:
             print(f"layer {a.layer} dense FFN: ff {ff}, n_embd {N_EMBD}")
             print(f"  out range [{out.min():.4f}, {out.max():.4f}]  |out| {np.linalg.norm(out):.4f}")
         if a.raw_fixture:
+            _, lim_shexp = m.clamp_limits(a.layer)
             with open(a.raw_fixture, "wb") as fh:
-                fh.write(struct.pack("<5i", N_EMBD, 0, 0, ff, a.layer))
+                fh.write(struct.pack("<5i2f", N_EMBD, 0, 0, ff, a.layer, 0.0, lim_shexp))
                 fh.write(np.ascontiguousarray(x, dtype=np.float32).tobytes())
                 for n in ("gate", "up", "down"):
                     fh.write(np.ascontiguousarray(mid[n], dtype=np.float32).tobytes())
@@ -211,9 +294,30 @@ def main() -> int:
             print(f"bias-sensitive input: seed {seed} selects {found[1].tolist()} with the bias, "
                   f"{found[2].tolist()} without")
     rng = np.random.default_rng(seed)
-    x = (rng.standard_normal(N_EMBD) * 0.5).astype(np.float32)
+    x = (rng.standard_normal(N_EMBD) * a.x_scale).astype(np.float32)
 
     out, mid = moe_forward(m, a.layer, x, a.n_expert)
+
+    if a.clamp_matters:
+        # Report whether the clamp BIT at this input scale.  A fixture whose input never reaches the
+        # limit produces the same numbers with and without the clamp, so it cannot catch a port that
+        # omits it - the same blind spot the fixture had before.
+        lim_e, lim_s = m.clamp_limits(a.layer)
+        e0 = int(mid["topk"][0])
+        g0 = m.expert(p + "ffn_gate_exps.weight", e0, a.n_expert) @ x.astype(np.float64)
+        u0 = m.expert(p + "ffn_up_exps.weight", e0, a.n_expert) @ x.astype(np.float64)
+        gs = m.tensor(p + "ffn_gate_shexp.weight") @ x.astype(np.float64)
+        us = m.tensor(p + "ffn_up_shexp.weight") @ x.astype(np.float64)
+        print(f"at x-scale {a.x_scale:g} (expert {e0}):")
+        print(f"  clamp exp   {lim_e:g}: gate past {int((g0 > lim_e).sum())}, up past "
+              f"{int((np.abs(u0) > lim_e).sum())}   max |gate| {np.abs(g0).max():.3f}")
+        print(f"  clamp shexp {lim_s:g}: gate past {int((gs > lim_s).sum())}, up past "
+              f"{int((np.abs(us) > lim_s).sum())}   max |gate| {np.abs(gs).max():.3f}")
+        bites = int((g0 > lim_e).sum()) + int((np.abs(u0) > lim_e).sum()) \
+            + int((gs > lim_s).sum()) + int((np.abs(us) > lim_s).sum())
+        print(f"  -> the clamp {'BITES' if bites else 'never fires'} here, so this fixture "
+              f"{'can' if bites else 'CANNOT'} catch a port that omits it")
+
 
     if a.selftest:
         print(f"layer {a.layer}: {a.n_expert} experts, {N_USED} used, scale {W_SCALE}, norm {NORM_W}")
@@ -231,8 +335,9 @@ def main() -> int:
               f"({'DIFFERENT' if not np.array_equal(plain, mid['topk']) else 'same'})")
 
     if a.raw_fixture:
+        lim_exp, lim_shexp = m.clamp_limits(a.layer)
         with open(a.raw_fixture, "wb") as fh:
-            fh.write(struct.pack("<5i", N_EMBD, a.n_expert, N_USED, FF_EXP, a.layer))
+            fh.write(struct.pack("<5i2f", N_EMBD, a.n_expert, N_USED, FF_EXP, a.layer, lim_exp, lim_shexp))
             fh.write(np.ascontiguousarray(x, dtype=np.float32).tobytes())
             fh.write(np.ascontiguousarray(mid["w_router"], dtype=np.float32).tobytes())
             if mid["b"] is not None:

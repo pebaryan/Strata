@@ -53,8 +53,9 @@ void moe_route(const float* router, const float* probs_b, const MoeGeometry& g, 
 }
 
 void expert_ffn(const float* wg, const float* wu, const float* wd, const MoeGeometry& g, const float* x,
-                float* out) {
+                float* out, float clamp_limit) {
     const int ne = g.n_embd, ff = g.ff;
+    const bool clamp = clamp_limit > 1e-6f;
     std::vector<float> h((size_t) ff);
     for (int j = 0; j < ff; ++j) {
         const float* rg = wg + (size_t) j * ne;
@@ -63,6 +64,13 @@ void expert_ffn(const float* wg, const float* wu, const float* wd, const MoeGeom
         for (int i = 0; i < ne; ++i) {
             ag += rg[i] * x[i];
             au += ru[i] * x[i];
+        }
+        if (clamp) {
+            // ggml_swiglu_clamp, exactly as ggml's CPU kernel does it (ops.cpp,
+            // ggml_compute_forward_swiglu_clamp_f32): the GATE clamp is one-sided - only from above -
+            // and the up clamp is two-sided, both applied BEFORE the SiLU.
+            ag = std::min(ag, clamp_limit);
+            au = std::max(-clamp_limit, std::min(au, clamp_limit));
         }
         h[(size_t) j] = (ag / (1.0f + std::exp(-ag))) * au;         // silu(gate) * up
     }
@@ -88,12 +96,14 @@ void moe_forward(const float* router, const float* probs_b, const MoeGeometry& g
 
     std::vector<float> acc((size_t) ne, 0.0f), tmp((size_t) ne);
     for (int i = 0; i < k; ++i) {
-        expert_ffn(experts[i][0], experts[i][1], experts[i][2], g, x, tmp.data());
+        expert_ffn(experts[i][0], experts[i][1], experts[i][2], g, x, tmp.data(), g.clamp_exp);
         for (int j = 0; j < ne; ++j) acc[(size_t) j] += weights[(size_t) i] * tmp[(size_t) j];
     }
     if (moe_out) std::memcpy(moe_out, acc.data(), (size_t) ne * sizeof(float));
 
-    expert_ffn(shared[0], shared[1], shared[2], g, x, tmp.data());
+    // the shared expert uses swiglu_clamp_SHEXP, not the experts' limit: the reference builds it with
+    // build_ffn, which reads the shexp array
+    expert_ffn(shared[0], shared[1], shared[2], g, x, tmp.data(), g.clamp_shexp);
     if (shexp_out) std::memcpy(shexp_out, tmp.data(), (size_t) ne * sizeof(float));
 
     for (int j = 0; j < ne; ++j) out[j] = acc[(size_t) j] + tmp[(size_t) j];

@@ -55,13 +55,21 @@ int main(int argc, char** argv) {
     std::FILE* f = std::fopen(argv[1], "rb");
     if (!f) { std::fprintf(stderr, "cannot open %s\n", argv[1]); return 1; }
     int32_t hdr[5] = {0};
-    if (std::fread(hdr, sizeof(int32_t), 5, f) != 5) { std::fprintf(stderr, "bad header\n"); return 1; }
+    float lim[2] = {0.0f, 0.0f};
+    // the fixture carries the artifact's two swiglu limits (swiglu_clamp_exp, swiglu_clamp_shexp)
+    if (std::fread(hdr, sizeof(int32_t), 5, f) != 5 || std::fread(lim, sizeof(float), 2, f) != 2) {
+        std::fprintf(stderr, "bad header - if this fixture predates the swiglu clamp it has only 5 "
+                             "ints; regenerate it with tools/glm5_moe_reference.py --raw-fixture\n");
+        return 1;
+    }
 
     glm::MoeGeometry g;
     g.n_embd = hdr[0];
     g.n_expert = hdr[1];
     g.n_used = hdr[2];
     g.ff = hdr[3];
+    g.clamp_exp = lim[0];
+    g.clamp_shexp = lim[1];
     const int ne = g.n_embd, E = g.n_expert, k = g.n_used, ff = g.ff;
 
     if (E == 0) {
@@ -73,11 +81,34 @@ int main(int argc, char** argv) {
         std::vector<float> wd = read_floats(f, (size_t) ne * ff);
         const std::vector<float> e_out = read_floats(f, (size_t) ne);
         std::fclose(f);
-        std::printf("dense FFN parity vs tools/glm5_moe_reference.py --dense: layer %d, ff %d\n", hdr[4], ff);
+        std::printf("dense FFN parity vs tools/glm5_moe_reference.py --dense: layer %d, ff %d, "
+                    "swiglu clamp shexp %g\n", hdr[4], ff, (double) g.clamp_shexp);
         std::vector<float> got((size_t) ne);
-        glm::expert_ffn(wg.data(), wu.data(), wd.data(), g, x.data(), got.data());
+        glm::expert_ffn(wg.data(), wu.data(), wd.data(), g, x.data(), got.data(), g.clamp_shexp);
         bool ok = true;
         compare("out", got, e_out, ok);
+        // And: does this fixture actually EXERCISE the clamp?  A gate whose input never reaches the
+        // limit passes identically with and without the term, which is how its absence survived the
+        // first version of this test.  Count the pre-activations that go past it and fail loudly if
+        // none do - then the fixture, not the reviewer, is what guarantees the term is covered.
+        {
+            int past = 0;
+            float mx = 0.0f;
+            for (int j = 0; j < ff; ++j) {
+                double ag = 0.0, au = 0.0;
+                for (int i = 0; i < ne; ++i) {
+                    ag += (double) wg[(size_t) j * ne + i] * x[(size_t) i];
+                    au += (double) wu[(size_t) j * ne + i] * x[(size_t) i];
+                }
+                mx = std::max(mx, (float) std::fabs(ag));
+                if (ag > (double) g.clamp_shexp) ++past;
+                if (std::fabs(au) > (double) g.clamp_shexp) ++past;
+            }
+            std::printf("  clamp exercised: %d pre-activation(s) past %g, max |gate| %.3f   %s\n",
+                        past, (double) g.clamp_shexp, mx,
+                        past > 0 ? "yes" : "NO (the fixture cannot catch a port that omits it)");
+            if (past == 0) ok = false;
+        }
         std::printf("glm_moe_parity (dense): %s\n", ok ? "0 failures" : "FAILURES");
         return ok ? 0 : 1;
     }
@@ -108,6 +139,32 @@ int main(int argc, char** argv) {
     const std::vector<float> e_weights = read_floats(f, (size_t) k);
     const std::vector<float> e_moe = read_floats(f, (size_t) ne);
     const std::vector<float> e_shexp = read_floats(f, (size_t) ne);
+
+    // Does this fixture EXERCISE the two swiglu clamps?  Count the pre-activations that reach them.
+    // A fixture whose input stays under the limits passes identically with and without the term, so
+    // saying "the gate covers the clamp" requires the gate to check that - not a report from the oracle.
+    {
+        int past = 0;
+        float mx = 0.0f;
+        auto count = [&](const std::vector<float>& wg, const std::vector<float>& wu, float limit) {
+            for (int j = 0; j < ff; ++j) {
+                double ag = 0.0, au = 0.0;
+                for (int i = 0; i < ne; ++i) {
+                    ag += (double) wg[(size_t) j * ne + i] * x[(size_t) i];
+                    au += (double) wu[(size_t) j * ne + i] * x[(size_t) i];
+                }
+                mx = std::max(mx, (float) std::fabs(ag));
+                if (ag > (double) limit) ++past;
+                if (std::fabs(au) > (double) limit) ++past;
+            }
+        };
+        for (int i = 0; i < k; ++i) count(ex_gate[(size_t) i], ex_up[(size_t) i], g.clamp_exp);
+        count(s_gate, s_up, g.clamp_shexp);
+        std::printf("  clamp exercised: %d pre-activation(s) past exp %g / shexp %g, max |gate| %.3f   %s\n",
+                    past, (double) g.clamp_exp, (double) g.clamp_shexp, mx,
+                    past > 0 ? "yes" : "NO (the fixture cannot catch a port that omits it)");
+        if (past == 0) { std::printf("glm_moe_parity: FAILURES (the clamp is not covered)\n"); return 1; }
+    }
     const std::vector<float> e_out = read_floats(f, (size_t) ne);
     std::fclose(f);
 

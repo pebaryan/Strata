@@ -28,6 +28,15 @@ struct MoeGeometry {
     int ff = 2048;       ///< expert_feed_forward_length
     float w_scale = 2.5f;   ///< expert_weights_scale
     bool norm_w = true;     ///< expert_weights_norm
+
+    /// ggml_swiglu_clamp's limit, from the artifact: swiglu_clamp_exp for the routed experts and
+    /// swiglu_clamp_shexp for the shared expert AND the leading dense FFN (the reference reaches the
+    /// dense site through build_ffn, which reads the shexp array).  10.0 for every layer of this model.
+    /// 0 disables it, and that is a real behaviour difference, not a neutral default: with a limit of
+    /// 10 it is invisible until a pre-activation exceeds 10, so a caller that forgets it will still
+    /// look right on tame inputs.  Callers must set both from the artifact.
+    float clamp_exp = 0.0f;
+    float clamp_shexp = 0.0f;
 };
 
 /// The weights one MoE site needs.  The expert tensors are per-expert C rows: gate/up are [ff][n_embd],
@@ -47,8 +56,10 @@ void moe_route(const float* router, const float* probs_b, const MoeGeometry& g, 
                int32_t* ids_out, float* weights_out, float* probs_out = nullptr);
 
 /// One expert: down(silu(gate @ x) * (up @ x)).  gate/up are [ff][n_embd], down is [n_embd][ff].
+/// `clamp_limit` is ggml_swiglu_clamp's limit (MoeGeometry::clamp_exp for a routed expert,
+/// clamp_shexp for the shared expert / dense FFN); 0 disables it.
 void expert_ffn(const float* wg, const float* wu, const float* wd, const MoeGeometry& g, const float* x,
-                float* out);
+                float* out, float clamp_limit);
 
 /// The assembled site: route, then sum the weighted experts, then add the shared expert.
 /// `experts[i]` is the i-th selected expert's {gate, up, down}, in the SAME order the router returns;
