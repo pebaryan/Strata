@@ -133,6 +133,17 @@ def moe_forward(m: Model, layer: int, x: np.ndarray, n_expert: int = N_EXPERT, w
                  "experts": experts, "b": b, "w_router": w_router}
 
 
+def dense_forward(m: Model, layer: int, x: np.ndarray):
+    """The 3 leading blocks' FFN: the SAME arithmetic as an expert, but ff is 12288, not 2048."""
+    p = f"blk.{layer}."
+    wg = m.tensor(p + "ffn_gate.weight")     # (12288, 4096)
+    wu = m.tensor(p + "ffn_up.weight")
+    wd = m.tensor(p + "ffn_down.weight")     # (4096, 12288)
+    assert wg.shape[0] == wu.shape[0] == wd.shape[1], (wg.shape, wu.shape, wd.shape)
+    assert wg.shape[1] == wd.shape[0] == x.size, (wg.shape, wd.shape, x.size)
+    return expert_ffn(wg, wu, wd, x.astype(np.float64)), {"gate": wg, "up": wu, "down": wd}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
@@ -141,6 +152,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--raw-fixture")
+    ap.add_argument("--dense", action="store_true",
+                    help="the 3 leading blocks' dense FFN instead of a MoE site (same math, ff 12288)")
     ap.add_argument("--bias-matters", action="store_true",
                     help="search seeds for an input where ffn_exp_probs_b changes the selection, so the "
                          "fixture can actually catch a port that ignores it")
@@ -148,6 +161,26 @@ def main() -> int:
 
     m = Model(pathlib.Path(a.gguf))
     p = f"blk.{a.layer}."
+
+    if a.dense:
+        # the 3 leading blocks have NO router at all (they are the "leading_dense_block_count"), so the
+        # dense path must not touch the MoE tensors - that is itself part of what this checks.
+        x = (np.random.default_rng(a.seed).standard_normal(N_EMBD) * 0.5).astype(np.float32)
+        out, mid = dense_forward(m, a.layer, x)
+        ff = int(mid["gate"].shape[0])
+        if a.selftest:
+            print(f"layer {a.layer} dense FFN: ff {ff}, n_embd {N_EMBD}")
+            print(f"  out range [{out.min():.4f}, {out.max():.4f}]  |out| {np.linalg.norm(out):.4f}")
+        if a.raw_fixture:
+            with open(a.raw_fixture, "wb") as fh:
+                fh.write(struct.pack("<5i", N_EMBD, 0, 0, ff, a.layer))
+                fh.write(np.ascontiguousarray(x, dtype=np.float32).tobytes())
+                for n in ("gate", "up", "down"):
+                    fh.write(np.ascontiguousarray(mid[n], dtype=np.float32).tobytes())
+                fh.write(np.ascontiguousarray(out, dtype=np.float32).tobytes())
+            print(f"wrote raw dense fixture {a.raw_fixture}: ff {ff}")
+        return 0
+
     w_router = m.tensor(p + "ffn_gate_inp.weight")
     b_fixed = None
     for cand in ("exp_probs_b.bias", "ffn_exp_probs_b.bias"):

@@ -64,6 +64,24 @@ int main(int argc, char** argv) {
     g.ff = hdr[3];
     const int ne = g.n_embd, E = g.n_expert, k = g.n_used, ff = g.ff;
 
+    if (E == 0) {
+        // the dense FFN of the 3 leading blocks: the same arithmetic as an expert, ff = 12288 rather
+        // than 2048.  There is no router and no shared expert here, so the fixture is just the FFN.
+        std::vector<float> x = read_floats(f, (size_t) ne);
+        std::vector<float> wg = read_floats(f, (size_t) ff * ne);
+        std::vector<float> wu = read_floats(f, (size_t) ff * ne);
+        std::vector<float> wd = read_floats(f, (size_t) ne * ff);
+        const std::vector<float> e_out = read_floats(f, (size_t) ne);
+        std::fclose(f);
+        std::printf("dense FFN parity vs tools/glm5_moe_reference.py --dense: layer %d, ff %d\n", hdr[4], ff);
+        std::vector<float> got((size_t) ne);
+        glm::expert_ffn(wg.data(), wu.data(), wd.data(), g, x.data(), got.data());
+        bool ok = true;
+        compare("out", got, e_out, ok);
+        std::printf("glm_moe_parity (dense): %s\n", ok ? "0 failures" : "FAILURES");
+        return ok ? 0 : 1;
+    }
+
     std::vector<float> x = read_floats(f, (size_t) ne);
     std::vector<float> router = read_floats(f, (size_t) E * ne);
     std::vector<float> probs_b = read_floats(f, (size_t) E);
