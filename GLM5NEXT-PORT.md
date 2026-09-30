@@ -176,6 +176,29 @@ whole cache.
 * the query side uses `indexer.attn_q_b` [1536,4096] from `qr`, and `indexer.proj` [4096,32] scores
   the pooled keys; the top `top_k` = 2048 cells are what attention may read
 
+**The indexer's scoring and selection (phase 4b - read from the reference, not yet implemented)**
+
+The pieces that are easy to get subtly wrong, with the reference's own reasoning:
+
+* a pooled key is a **channel-wise gate-weighted average over its r = 4 members**:
+  `pooled[channel] = sum_member softmax_over_members(gate + ape)[member][channel] * key[member][channel]`
+* the indexer query is `indexer.attn_q_b @ qr` -> `d = 128` per head times `nh = 32` heads per token
+  (so 4096 values, from the *q_lora* vector, while the per-head gate below comes from the block input)
+* `indexer.proj @ cur` gives `nh` per-head weights, scaled by `1/sqrt(d*nh)`; the reference folds both
+  positive scalars into those small weights rather than into the big score tensor, using
+  `relu(x*s) == s*relu(x)` for `s > 0` - i.e. the heads are combined as a ReLU-gated weighted sum
+* selection is `n_sel = min(n_pool, top_k / r)` = min(n_pool, 512) **whole pools**, then the pools are
+  expanded into their members
+* **the cut is on whole pools, never on single cells.** Scoring cells with their pool's score and
+  cutting there is NOT the same thing: ReLU sends many distinct pools to exactly 0.0 and `ggml_top_k`
+  is unordered among equal keys, so cutting on cells splits pools apart. The reference cites PR #27754
+  for the diagnosis and the reference-free check (count partly selected pools).
+* **the trailing incomplete pool is always selected** (`index_kpool_always_select_tail`): it has no pool
+  key and so can never be picked by score, so its cells are appended instead of consuming pool budget.
+* the reference chunks the token loop to bound scratch memory (the score tensor is materialised twice,
+  `2*n_pool*nh*n_tokens*4 B` per device); no reduction runs across tokens, so chunking is exact - worth
+  copying if a device-side implementation ever needs the bound.
+
 **The FFN, per block (phase 6)** - the leading 3 blocks (`leading_dense_block_count`) use a plain
 parallel SILU FFN (`ffn_gate`/`ffn_up`/`ffn_down`), every other block uses MoE + a shared expert:
 
