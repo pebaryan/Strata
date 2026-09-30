@@ -170,6 +170,12 @@ add_executable(glm_kda_parity src/kernels/glm_kda_parity.cpp src/kernels/glm_kda
 target_include_directories(glm_kda_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_kda_parity PRIVATE -O2)
 
+# MoE parity (branch glm5next-port): the router (sigmoid gating, the selection-only bias, top-8 of 288,
+# normalize-then-scale) and the expert/shared-expert FFNs, against tools/glm5_moe_reference.py.
+add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe.cpp)
+target_include_directories(glm_moe_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm_moe_parity PRIVATE -O2)
+
 add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
