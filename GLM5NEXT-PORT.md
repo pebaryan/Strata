@@ -3,8 +3,10 @@
 Started 2026-09-30. This branch exists so `main` stays a clean sm_70 port of upstream; nothing here is
 merged back until it loads a GLM pack and passes a parity gate.
 
-**Status: phases 0-3 done** (inventory, packer, arch guard + layer table, expert-table stem + build-time
-model geometry). A GLM-configured build loads the pack; no GLM kernels exist yet.
+**Status: phases 0-3b done** (inventory, packer, arch guard + layer table, expert-table stem + build-time
+model geometry, and the mHC verified against an oracle). The remaining phases are the attention and MoE
+kernels plus the graph that wires them; nothing of those exists yet, and no half-finished code is left
+behind: every commit on this branch builds and passes its own gate.
 
 ```
 cmake -S . -B build-glm5 -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -142,7 +144,62 @@ Two layer kinds, by tensor names in the file (not by the paper):
 engine's existing dequant table covers every tensor type in the file. FP8 (`e4m3`) only matters if the
 *official* `zai-org` checkpoint is ingested, and the V100 has no FP8 hardware regardless.
 
-## Order of work, with the gate that closes each phase
+## Reference notes for the phases that remain (read from llama.cpp's GLM5-Next graph)
+
+These are the semantics phase 4 onward must reproduce, taken from the reference implementation rather
+than from prose. They are recorded because reading them again costs more than typing them once.
+
+**MLA block (phase 4)** - 11 blocks, nope-only, with the absorption folding:
+
+```
+qr      = rms_norm(wq_a @ cur)                 wq_a [4096,1536]      q_lora_rank 1536
+q       = wq_b @ qr        -> [256, 64, nt]    wq_b [1536,16384]     64 heads, head dim 256
+Qcur    = wk_b^T @ q       -> [512, 64, nt]    wk_b [256,512,64]     the ABSORBED query: in latent space
+kv_cmpr = rms_norm(wkv_a_mqa @ cur) -> [512]   wkv_a_mqa [4096,512]  kv_lora_rank 512, ONE head
+out     = attn(Qcur, kv_cmpr, kv_cmpr, wv_b, top_k, kq_scale=1/sqrt(256))
+```
+
+K and V are the *same* 512-dim latent; the head structure lives in `wk_b` on the query and `wv_b`
+[512,256,64] on the output. There is no rope anywhere and no k_pe, so nothing needs a position.
+`top_k` comes from the indexer (below); a GGUF without indexer weights passes null and attends the
+whole cache.
+
+**The indexer and its 4:1 pool (phase 4)** - per MLA block, using `indexer_head_size` d = 128,
+`indexer_n_head` 32, `indexer_block_size` r = 4 (`kpool`), `top_k` 2048:
+
+* `k = LayerNorm(indexer.attn_k @ cur)` using `indexer.k_norm.weight` **and** `.bias`
+* `g = indexer_compressor_gate @ cur`, and k and g are packed into ONE cache row ([2d] = 256)
+* each pool of r = 4 consecutive keys is combined into one pooled key by a **gate-weighted average over
+  the members, channel by channel**: `w = softmax_over_members(g + ape)`, `pooled = sum_m w . k_m`
+* `indexer_compressor_ape` [128, 4] is the intra-pool position bias and, with no rope in the model at
+  all, the only ordering signal the indexer has
+* the query side uses `indexer.attn_q_b` [1536,4096] from `qr`, and `indexer.proj` [4096,32] scores
+  the pooled keys; the top `top_k` = 2048 cells are what attention may read
+
+**The FFN, per block (phase 6)** - the leading 3 blocks (`leading_dense_block_count`) use a plain
+parallel SILU FFN (`ffn_gate`/`ffn_up`/`ffn_down`), every other block uses MoE + a shared expert:
+
+```
+build_moe_ffn(cur, ffn_gate_inp, ffn_up_exps, ffn_gate_exps, ffn_down_exps, ffn_exp_probs_b,
+              n_expert=288, n_expert_used=8, SILU, expert_weights_norm, expert_weights_scale,
+              expert_gating_func=2)
+shexp = build_ffn(cur, ffn_up_shexp, ffn_gate_shexp, ffn_down_shexp, ..., SILU, PAR)
+```
+
+`ffn_exp_probs_b` is a per-expert routing BIAS on the router logits (the `[288]` F32 tensor), and both
+`expert_weights_norm` and `expert_weights_scale` are metadata values that must reach the kernels - the
+engine's current router has neither, and it hardcodes k = 10 where GLM needs 8.
+
+**The MTP block (phase 7)**: `blk.45` is a full MLA + MoE block with **no hyper-connections at all**
+(unlike every trunk block), plus `nextn.enorm`, `nextn.hnorm`, `nextn.eh_proj` and
+`nextn.shared_head_norm`; the trunk's head mean-collapses the streams, rms_norms and projects.
+
+**KDA blocks (phase 5)**: 34 of the blocks are linear attention (`blk.N.ssm_*`), and llama.cpp builds
+them through its delta-net path (`llm_build_delta_net_base`), i.e. the same family as Strata's GDN -
+but with GLM's own decay/gate parameterization (`ssm_a`, `ssm_dt.bias`, the f/g low-rank pairs, and a
+kernel-4 conv1d on q, k and v). This one must be read line by line when its turn comes; the reference's
+delta-net base is in llama-model.cpp rather than in glm5next.cpp.
+
 
 The oracle is the point: llama.cpp's GLM5-Next implementation is **merged and validated**, and this box
 already has it built for sm_70 at `/home/peb/llama.cpp-glm5/build-glm5/bin/llama-cli` with the exact
@@ -155,11 +212,11 @@ from a paper. That is what makes this an open-ended task rather than an unbounde
 | 1 | packer: names, per-layer kind, pack layout | *done* - the pack's index accounts for all 1412 tensors; 43 expert blocks contiguous; experts.bin matches its header byte for byte |
 | 2 | arch guard + geometry (array `head_count_kv`, layer kinds) | *done* - the guard reads the artifact, reports the block table, and refuses 5 distinct tampered copies with precise messages |
 | 3 | expert-layout stem offset + build-time model geometry | *done* - a GLM-configured build loads the pack's expert table (46 layers, 288 experts, stem at block 3, experts.bin matching); the default build's constants are unchanged |
-| 3b | the mHC mixer | logits match the oracle for a 2-layer slice |
-| 4 | MLA + kpool indexer | attention outputs match the oracle, prefill and decode |
-| 5 | linear-attention layer (`ssm_*`) | same, including a long-context check that the recurrent state is right |
-| 6 | router top-8 + `exp_probs_b` | expert ids match the oracle exactly on fixed prompts |
-| 7 | MTP arm | draft acceptance in the project's own range (~0.7), not ~1.0 |
+| 3b | the mHC mixer | *done* - 8/8 blocks match the numpy oracle (worst 4.5e-06 absolute, i.e. float32 round-off), with the Sinkhorn shown to sit at the oracle's own fixed point |
+| 4 | MLA + the kpool indexer (semantics recorded above) | attention outputs match the oracle, prefill and decode |
+| 5 | the linear-attention block (`ssm_*`, KDA) | same, including a long-context check that the recurrent state is right |
+| 6 | router top-8, `ffn_exp_probs_b`, `expert_weights_norm/scale`; dense stem FFN; shared expert | expert ids match the oracle exactly on fixed prompts |
+| 7 | MTP arm (blk.45, which has no hyper-connections) | draft acceptance in the project's own range (~0.7), not ~1.0 |
 | 8 | end-to-end | greedy tokens identical to the oracle on a fixed prompt set |
 
 Phases 3-5 are independent of each other and can be validated in isolation with a synthetic two-layer
