@@ -72,7 +72,12 @@ void native_gu_rows(const NativeFmt&, const uint8_t*, const void* const*, int, f
 void native_down_rows(const NativeFmt&, const uint8_t*, const void* const*, int, float* const*, int, int) { std::abort(); }
 #endif
 
-bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err) {
+bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err,
+                        int64_t hidden, int64_t expert_ffn) {
+    // The expert geometry: a model whose hidden width / expert width differ from the compiled qwen4exp
+    // pair (GLM-5.3-Flash: 4096 / 2048) must say so, because native_fmt validates every layer against it.
+    const int64_t n_embd = hidden > 0 ? hidden : (int64_t) H;
+    const int64_t n_ff = expert_ffn > 0 ? expert_ffn : (int64_t) FF;
     ExpertLayout L;
     L.n_layers = n_layers;
     L.n_expert = n_expert;
@@ -91,6 +96,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
     L.offset.assign((size_t) n_layers, ~0ull);
     L.bytes.assign((size_t) n_layers, 0);
     L.max_blob = 0;
+    L.first_layer = n_layers;      // lowered by the loop below; == n_layers afterwards means "no lines"
     std::string line;
     while (std::getline(in, line)) {
         if (line.empty() || line[0] == '#') {
@@ -118,7 +124,7 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
             return false;
         }
         NativeFmt f;
-        if (!native_fmt((int) gt, (int) dt, H, FF, f, err)) return false;
+        if (!native_fmt((int) gt, (int) dt, n_embd, n_ff, f, err)) return false;
         if (f.bytes != blob) {
             err = "native_experts.txt: layer " + std::to_string(l) + " blob is " + std::to_string(blob) +
                   " B but its formats make " + std::to_string(f.bytes);
@@ -138,16 +144,30 @@ bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n
         L.fmt[(size_t) l] = f;
         L.offset[(size_t) l] = off;
         L.bytes[(size_t) l] = blob;
+        if (l < L.first_layer) L.first_layer = (int64_t) l;
         if (blob > L.max_blob) L.max_blob = blob;
     }
+    if (L.first_layer >= n_layers) {
+        err = "native_experts.txt has a header but no layer lines";
+        return false;
+    }
+    // Contiguity is checked from the FIRST layer that has experts, not from layer 0: a model with a dense
+    // MLP stem (GLM-5.3-Flash: blocks 0-2) legitimately starts its expert table at block 3.  Every layer
+    // from there to the last must be present and in order; the stem layers hold no bytes at all.
     uint64_t at = 0;
-    for (int64_t l = 0; l < n_layers; ++l) {
+    for (int64_t l = L.first_layer; l < n_layers; ++l) {
         if (L.offset[(size_t) l] != at) {
             err = "native_experts.txt: layer " + std::to_string(l) + " is missing or not contiguous";
             return false;
         }
         at += L.bytes[(size_t) l] * (uint64_t) L.n_expert;
     }
+    for (int64_t l = 0; l < L.first_layer; ++l)
+        if (L.bytes[(size_t) l] != 0) {
+            err = "native_experts.txt: layer " + std::to_string(l) + " is below the first layer with "
+                  "experts but carries bytes";
+            return false;
+        }
     L.total = at;
     g_layout = L;
     return true;

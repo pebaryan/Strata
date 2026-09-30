@@ -24,8 +24,24 @@ real artifact and reports the block table (`build-volta/strata-gguf <shard1> --g
   A v4 with per-tensor shards is the general fix; it is NOT written speculatively, because the current
   reader would take a v4 line as v3 and read the wrong bytes silently.
 - **The expert table cannot start at block 0**: blocks 0-2 are the dense stem. `expert_layout_load`
-  currently requires layer 0 to be present and contiguous, so it needs a stem offset (or a
-  per-layer presence mask) before a GLM pack can load. This is the first item of phase 3.
+  now checks contiguity from the file's own lowest layer and reports it as `first_layer`, and it takes
+  the model's expert geometry (`hidden`, `expert_ffn`) instead of assuming the compiled qwen4exp pair
+  (2560 / 640). Verify with `strata-load --layout <pack> --layout-layers 46` (it reads `hidden` and
+  `expert_ffn` from the pack's manifest.json when they are not passed).
+- **The next blocker is the CPU expert pool's COMPILE-TIME geometry**, not the layout:
+  `native_expert.cpp` refuses a layer whose activation exceeds `kNativeActBytes` (4096) / `kNativeHBytes`
+  (1024), and GLM needs 4352 / 2176 for a 4096-wide hidden and a 2048-wide expert. The same constants
+  (`H`, `FF`, and the `MAXC` / `ROW_*` / `SC_*` / `O_*` forms derived from them, plus the `ff[MAXT][FF]`
+  split buffers) run through `expert.cpp`, `pool.cpp`, `expert_source.cpp` and `iq_avx2.cpp`. Two ways
+  out, and the cost of the first one is measured rather than guessed:
+  - **(a) build-time model geometry.** Make `H`/`FF` CMake options (default 2560 / 640, so the existing
+    build is unchanged) and build a GLM configuration with 4096 / 2048. Enlarging the buffers costs
+    ~100 KB per thread in total (`ff[MAXT][FF]` 16 -> 64 KB, `hq` 8 -> 17 KB, `MAXC` 80 -> 128), so the
+    price is a second build, not memory. This matches the engine's own design: it is specialised to ONE
+    model, and it already has build switches (`STRATA_EXPERIMENTAL_SM75`, pruned-model support).
+  - **(b) runtime pool geometry.** Allocate the buffers from the model's geometry. Removes the second
+    build, but it puts indirection into the hottest loops and into the AVX-512 kernels' compile-time
+    unrolling, for a saving that only matters if two geometries must ship from one binary.
 
 
 ## Verdict first: what porting buys, and what it cannot

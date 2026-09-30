@@ -18,6 +18,11 @@ namespace strata::kernels::cpu {
 struct ExpertLayout {
     bool native = false;
     int64_t n_layers = 0, n_expert = NE;
+    /// The lowest layer that HAS experts.  A model whose first blocks are a dense MLP stem (GLM-5.3-Flash:
+    /// blocks 0-2) starts its native_experts.txt here, so layers [0, first_layer) hold no expert bytes and
+    /// no consumer may ask this table for them.  The v3 header cannot express the stem, so the file's own
+    /// lowest layer is taken as the authority.
+    int64_t first_layer = 0;
     std::vector<NativeFmt> fmt;           ///< per layer (native packs)
     std::vector<uint64_t> offset, bytes;  ///< per layer: where its 512 blobs start, bytes per blob
     /// Plan v0.3 P6: per layer, the absolute offsets of the gate / up / down tensors in the model's shard 1, so
@@ -49,6 +54,10 @@ void act_quant_any(const float* x, int n, ActQ& a);
 /// The process-wide layout (canonical Q2_0 until `expert_layout_load` finds a native pack).
 const ExpertLayout& expert_layout();
 /// Reads `<pack_dir>/native_experts.txt` when it exists (a native pack), else sets the canonical layout.
-bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err);
+/// `hidden` and `expert_ffn` are the model's expert geometry; 0 means the compiled-in qwen4exp defaults
+/// (2560 / 640).  GLM-5.3-Flash needs 4096 / 2048, and with the wrong pair the block-size check refuses
+/// the layer instead of decoding it wrongly (native_fmt), so this is a refusal to get right, not a guess.
+bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err,
+                        int64_t hidden = 0, int64_t expert_ffn = 0);
 
 }  // namespace strata::kernels::cpu

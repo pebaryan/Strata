@@ -5,11 +5,81 @@
 // load is to measure a smaller one first and project - and because pinning 34 GB evicts every page of page
 // cache on the machine, which is not something a test should do while other work is running.
 #include "strata/core/pinned.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <string>
+
+/// Read an integer out of the pack's manifest.json without a JSON parser: the manifests this tool reads
+/// are written by the packers, one key per line, and a missing key must read as 0 rather than throw.
+static int64_t manifest_int(const std::string& pack, const char* key) {
+    std::ifstream in(pack + "/manifest.json");
+    if (!in) return 0;
+    const std::string needle = std::string("\"") + key + "\"";
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t at = line.find(needle);
+        if (at == std::string::npos) continue;
+        const size_t colon = line.find(':', at + needle.size());
+        if (colon == std::string::npos) continue;
+        return std::strtoll(line.c_str() + colon + 1, nullptr, 10);
+    }
+    return 0;
+}
+
+// `--layout <pack>`: read a pack's expert table and report what it says, without touching the arena.
+// This is how a pack for a model the engine has no kernels for yet (GLM-5.3-Flash) can still be shown
+// to LOAD, which is what its port needs first: the table is what every expert consumer asks.
+static int report_layout(const std::string& pack, int64_t n_layers, int64_t hidden, int64_t ffn) {
+    if (hidden <= 0) hidden = manifest_int(pack, "hidden");
+    if (ffn <= 0) ffn = manifest_int(pack, "expert_ffn");
+    std::string err;
+    if (!strata::kernels::cpu::expert_layout_load(pack, n_layers, 0, err, hidden, ffn)) {
+        std::fprintf(stderr, "layout: %s\n", err.c_str());
+        return 1;
+    }
+    const auto& L = strata::kernels::cpu::expert_layout();
+    if (!L.native) {
+        std::fprintf(stderr, "layout: %s has no native_experts.txt (canonical Q2_0 layout)\n", pack.c_str());
+        return 1;
+    }
+    std::printf("native expert table: %s\n", pack.c_str());
+    std::printf("  geometry      hidden %lld, expert ffn %lld%s\n", (long long) hidden, (long long) ffn,
+                (hidden > 0 && ffn > 0) ? " (from the pack's manifest)" : " (compiled qwen4exp defaults)");
+    std::printf("  layers %lld   experts/layer %lld   first layer with experts %lld   max blob %llu B\n",
+                (long long) L.n_layers, (long long) L.n_expert, (long long) L.first_layer,
+                (unsigned long long) L.max_blob);
+    std::printf("  total         %.2f GB (all layers, all experts)\n", (double) L.total / 1e9);
+    if (L.first_layer > 0)
+        std::printf("  dense stem    layers 0-%lld carry no experts (this table starts at %lld)\n",
+                    (long long) L.first_layer - 1, (long long) L.first_layer);
+    std::printf("  blobs (run-length):\n");
+    for (int64_t l = L.first_layer; l < L.n_layers;) {
+        const uint64_t b = L.blob_bytes(l);
+        int64_t j = l;
+        while (j + 1 < L.n_layers && L.blob_bytes(j + 1) == b) ++j;
+        std::printf("    layer %2lld-%-2lld  %9llu B/blob  %lld layer(s)\n", (long long) l, (long long) j,
+                    (unsigned long long) b, (long long) (j - l + 1));
+        l = j + 1;
+    }
+    // A pack's experts.bin must be exactly as long as the table says; a mismatch would decode as plausible
+    // weights from the wrong offsets, so check it here rather than at the first token.
+    std::FILE* f = std::fopen((pack + "/experts.bin").c_str(), "rb");
+    if (f) {
+        std::fseek(f, 0, SEEK_END);
+        const long long size = std::ftell(f);
+        std::fclose(f);
+        std::printf("  experts.bin   %.2f GB  %s\n", (double) size / 1e9,
+                    (uint64_t) size == L.total ? "matches the table" : "DOES NOT MATCH THE TABLE");
+        if ((uint64_t) size != L.total) return 1;
+    } else {
+        std::printf("  experts.bin   absent: the experts are read from the model's own shards\n");
+    }
+    return 0;
+}
 
 int main(int argc, char** argv) {
     std::string path;
@@ -20,6 +90,9 @@ int main(int argc, char** argv) {
     uint64_t blobs_per_layer = 512;
     bool pin = true;
     bool stream = false;
+    std::string layout_pack;
+    int64_t layout_layers = 46;         // GLM-5.3-Flash; the flag exists so other models need no rebuild
+    int64_t layout_hidden = 0, layout_ffn = 0;   // 0 = take them from the pack's manifest.json
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -28,6 +101,10 @@ int main(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "--file") path = val();
+        else if (a == "--layout") layout_pack = val();
+        else if (a == "--layout-layers") layout_layers = std::strtoll(val(), nullptr, 10);
+        else if (a == "--layout-hidden") layout_hidden = std::strtoll(val(), nullptr, 10);
+        else if (a == "--layout-ffn") layout_ffn = std::strtoll(val(), nullptr, 10);
         else if (a == "--layers") layers = std::strtoull(val(), nullptr, 10);
         else if (a == "--threads") threads = std::atoi(val());
         else if (a == "--chunk-mb") chunk = std::strtoull(val(), nullptr, 10) << 20;
@@ -35,13 +112,15 @@ int main(int argc, char** argv) {
         else if (a == "--stream") stream = true;
         else if (a == "--help" || a == "-h") {
             std::printf("usage: strata-load --file experts.bin [--layers N] [--threads N] [--chunk-mb N]\n"
-                        "                   [--no-pin]\n");
+                        "                   [--no-pin]\n"
+                        "       strata-load --layout <pack> [--layout-layers N]   (read the expert table)\n");
             return 0;
         } else {
             std::fprintf(stderr, "unknown argument: %s\n", a.c_str());
             return 2;
         }
     }
+    if (!layout_pack.empty()) return report_layout(layout_pack, layout_layers, layout_hidden, layout_ffn);
     if (path.empty()) { std::fprintf(stderr, "--file is required\n"); return 2; }
 
     const uint64_t bytes = layers * blobs_per_layer * blob_bytes;

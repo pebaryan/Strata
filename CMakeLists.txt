@@ -170,7 +170,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_link_libraries(strata-device PRIVATE strata_core)
 
   add_executable(strata-load src/core/load_main.cpp)
-  target_link_libraries(strata-load PRIVATE strata_core strata_kernels)
+  target_link_libraries(strata-load PRIVATE strata_core strata_kernels strata_kernels_cpu)
 
   add_executable(strata-concurrent src/core/concurrent_main.cpp)
   target_include_directories(strata-concurrent PRIVATE ${_strata_gpu_include_directories})

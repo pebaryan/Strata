@@ -237,6 +237,10 @@ def main() -> int:
         "geometry": {
             "block_count": block_count,
             "n_expert": n_expert,
+            # the expert geometry: the engine validates every layer against this pair, and its compiled
+            # defaults are the qwen4exp ones (2560 / 640), so a GLM pack must state its own.
+            "hidden": int(m("glm5next.embedding_length", 4096)),
+            "expert_ffn": int(m("glm5next.expert_feed_forward_length", 2048)),
             "head_count_kv": head_count_kv,
             "kv_lora_rank": m("glm5next.attention.kv_lora_rank"),
             "key_length_mla": m("glm5next.attention.key_length_mla"),
