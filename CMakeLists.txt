@@ -176,6 +176,13 @@ add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe
 target_include_directories(glm_moe_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_moe_parity PRIVATE -O2)
 
+# MTP parity (branch glm5next-port): the NextN draft head's own wiring - enorm/hnorm, the concat, eh_proj
+# and the head norm - against tools/glm5_mtp_reference.py.  The block's MLA and MoE are the operators the
+# MLA and MoE parity tests already cover.
+add_executable(glm_mtp_parity src/kernels/glm_mtp_parity.cpp src/kernels/glm_mtp.cpp)
+target_include_directories(glm_mtp_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm_mtp_parity PRIVATE -O2)
+
 add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
