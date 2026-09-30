@@ -20,41 +20,42 @@ Two instrument bugs were found and fixed on the way, both silent:
   placeholder `inp->embd` and the real embedding lookup).  One file silently overwrote the other.
   Duplicates are now recorded and the first is kept.
 
-## The blocker
+## The blocker, resolved as far as it goes: the ACTIVATION dump is not trustworthy
 
-The dumped tensors are **not mutually consistent**, so a comparison against them is not yet meaningful.
-Three independent facts, all from the reference's own four dumps:
+Two runs with identical arguments produced **879/879 byte-identical tensors**, so the dump is
+deterministic and evaluation mixing is ruled out. The tensors are reproducible - and still wrong:
 
-1. `hc_attn_pre-0` and `attn_norm-0` ARE related as `rms_norm(x) * f` for a per-channel `f` that is
-   token-INDEPENDENT (per-token means agree to 1.4e-3), i.e. those two came from the same evaluation;
-2. but `f` is NOT `blk.0.attn_norm.weight` - correlation 0.000.  `f` has mean 0.1304 and std 0.0475
-   while the stored tensor has mean 0.1027 and std 0.0052, and the stored tensor was confirmed by an
-   INDEPENDENT reader (`gguf` + `quants.dequantize`, F32, 4096 values), so the reading is not at fault.
-   No value of the norm's eps makes the two agree (tested 0, 1e-8, 1e-6, 1e-5, 1e-4);
-3. and `attn_norm-0` does not produce `kda_beta-0` through the documented chain
-   (`sigmoid(ssm_beta @ attn_norm)`), failing by 5.8e-01.
+* `hc_init`'s four "streams" have **zero correlation with each other** (-0.0006, +0.0323, +0.0005),
+  i.e. four unrelated vectors. The graph builds that tensor as
+  `repeat_4d(reshape_3d(inp), n_embd, hc, n_tokens, 1)` - a broadcast. No read of a real broadcast
+  can produce unrelated streams, and no input data can either.
+* my token-embedding rows correlate ~0.02 with the dumped `inp_embd` columns and ~0.01 with
+  `hc_init` - i.e. not the same vectors at all, not merely scaled differently.
+* `attn_norm-0` is only 0.977-correlated with `rms_norm(hc_attn_pre-0)*w` per channel, where a single
+  evaluation would make that ratio *be* the weight vector, identical to machine precision.
 
-Facts 1 and 3 together are the signature of **tensors from more than one graph evaluation**: the two
-that agree were captured in the same pass, the third in another.  The likely mechanism is the CUDA graph
-warmup, which runs during the same decode window with the same tensor names and dummy data - the log
-shows `CUDA graph warmup complete` interleaved with the dump.  The dumper's "first occurrence wins" rule
-then keeps whichever pass happened to evaluate a given node first, so the manifest can hold a mix.
+The most likely mechanism is the read path, not the graph: with the experts on the CPU (`-ncmoe`) this
+graph is SPLIT across the CUDA and CPU backends, and `ggml_backend_tensor_get` on a tensor that belongs
+to the other backend can return stale bytes from the buffer rather than the computed values.  That would
+also explain why each run reads the same wrong (but deterministic) region.
 
-## The fix to apply next
+**What is trustworthy**: `tokens.txt` (the sampled generation, produced through llama's own sampler) and
+the graph's OUTPUT tensors (`result_output`, the 154880 logits) - which is what the generated tokens were
+sampled from, so they are validated by the tokens themselves.
 
-Dump exactly ONE evaluation, and make it unambiguous which:
+## What this means for phase 8
 
-* do not dump during the first decode; dump on a later decode, after the warmups are complete, and
-  record the step index in the manifest;
-* or disable CUDA graph capture for the dumping run (`GGML_CUDA_DISABLE_GRAPHS=1`) so the warmup cannot
-  interleave;
-* and record, per tensor, which evaluation produced it, so a mixed dump is detectable instead of looking
-  like a wiring bug in the port.
+The pass/fail gate stays what the plan always said: **greedy tokens identical to the reference**, plus a
+logits comparison on the last prompt token.  That is measurable with the paths that demonstrably work.
 
-Once the reference's own chain is verifiably self-consistent (`attn_norm-0 == rms_norm(hc_attn_pre-0) *
-attn_norm.weight` to float precision, and `kda_beta-0 == sigmoid(ssm_beta @ attn_norm-0)`), a mismatch in
-the block-0 comparison means the port, not the measurement.
+The layer-by-layer dump would be a *localization* aid, not the gate, and it needs the backend read fixed
+first: dump only tensors on the backend that computed them (pass the backend to the callback, or
+synchronize and read per-backend), or run the reference with a single backend (no `-ncmoe`, e.g. a
+smaller model) so no split exists.  Until then, a port divergence cannot be attributed to a layer by this
+mechanism - and pretending otherwise would send me hunting bugs that do not exist in the port.
 
-A self-consistency check belongs in the harness, not in my head: the comparison should first assert the
-reference dump's internal relations, and refuse to report a port divergence if the reference itself is
-inconsistent.  Episodes like this are exactly why the harness has to check the oracle too.
+The lesson, stated for the next person: I built the instrument for the port and did not check the
+instrument.  Two rounds of "the port disagrees with the reference" were actually "the reference's dump
+disagrees with the reference's graph", and the thing that caught it was a relation that must hold by
+construction (a broadcast whose copies differ), not a tolerance.
+
