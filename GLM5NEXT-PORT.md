@@ -218,11 +218,48 @@ engine's current router has neither, and it hardcodes k = 10 where GLM needs 8.
 (unlike every trunk block), plus `nextn.enorm`, `nextn.hnorm`, `nextn.eh_proj` and
 `nextn.shared_head_norm`; the trunk's head mean-collapses the streams, rms_norms and projects.
 
-**KDA blocks (phase 5)**: 34 of the blocks are linear attention (`blk.N.ssm_*`), and llama.cpp builds
-them through its delta-net path (`llm_build_delta_net_base`), i.e. the same family as Strata's GDN -
-but with GLM's own decay/gate parameterization (`ssm_a`, `ssm_dt.bias`, the f/g low-rank pairs, and a
-kernel-4 conv1d on q, k and v). This one must be read line by line when its turn comes; the reference's
-delta-net base is in llama-model.cpp rather than in glm5next.cpp.
+**KDA blocks (phase 5) - and why this phase is SMALLER than the plan assumed**
+
+Reading the reference changed the estimate, so this is worth stating precisely. 34 of the 46 blocks are
+linear attention, and llama.cpp builds them through `llm_build_delta_net_base::build_recurrent_attn`
+(delta-net-base.cpp), which ends in the fused op `ggml_gated_delta_net`. The CPU reference for that op
+(ggml/src/ggml-cpu/ops.cpp) contains this branch:
+
+```cpp
+const bool kda = (neg0 == S_v);        // the ONLY structural difference in the recurrence
+```
+
+So the recurrence is shared with the GDN that **qwen4exp already uses** - the model this engine serves -
+and KDA differs from GDN in exactly one place: the decay is per-channel instead of per-head.
+
+```
+decay:   KDA:  S[i][j] *= exp(g[i])     (g has S_v entries per head)
+         GDN:  S[i][j] *= exp(g[0])     (one scalar per head)
+delta:   delta[j] = (v[j] - sum_i S[i][j]*k[i]) * beta
+update:  S[i][j] += k[i] * delta[j]
+output:  attn[j]  = (sum_i S[i][j]*q[i]) * scale        (scale = 1/sqrt(head_dim), applied to q)
+```
+
+Strata already has `gdn_step(state, q, k, v, gate, ...)` in include/strata/kernels/gdn.hpp with
+`dec = exp(gate)` and a gate of shape `(h_v,)` - i.e. the scalar variant. **The kernel work phase 5 needs
+is the per-channel decay: a gate of `(h_v, S_v)` and a row-wise elementwise multiply instead of one
+scalar scale.** That is 8 lines of math in the reference, not a new recurrence.
+
+What IS new is GLM's front end, and it differs from qwen4exp's in ways that matter:
+
+* **three separate causal convolutions** (q, k, v each with their own `ssm_conv1d_*`, kernel 4) and
+  **no SiLU** on the conv output, where qwen4exp convolves q|k|v together and applies SiLU;
+* the gate: `g = gate_lower_bound * sigmoid(-(ssm_a * (ssm_f_b(ssm_f_a(x)) + dt_bias)))` with
+  `ssm_a` holding `-exp(A_log)`, so the effective factor is `exp(A_log)`; `gate_lower_bound` is -5.0,
+  so the decay exponent lives in [-5, 0]. It is per (head_dim, head), which is what makes it KDA;
+* `beta = sigmoid(ssm_beta @ x)`, one scalar per head;
+* `q` and `k` are L2-normalised with a hard-coded eps of **1e-6** (qwen4exp uses the model's
+  `f_norm_rms_eps` instead);
+* the output is an RMS norm **gated by a sigmoid** (`ssm_o_norm` then `sigmoid(ssm_g_b(ssm_g_a(x)))`),
+  where qwen4exp's path gates with SiLU - a sigmoid-vs-SiLU swap is exactly the kind of detail that
+  silently changes generations.
+
+
 
 
 The oracle is the point: llama.cpp's GLM5-Next implementation is **merged and validated**, and this box
