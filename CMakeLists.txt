@@ -143,6 +143,15 @@ target_link_libraries(strata_artifact INTERFACE strata_warnings)
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact)
 
+# ---- mHC parity (branch glm5next-port) -------------------------------------
+# GLM-5.3-Flash's hyper-connections, against the numpy reference transcribed from llama.cpp's GLM5-Next
+# graph (tools/glm5_hc_reference.py --raw-fixture).  Host-only and dependency-free on purpose: the point
+# is to get the architecture right before any of it goes on the device.  No add_test(): a meaningful
+# fixture needs the real model, so it is run by hand like native_expert_parity.
+add_executable(glm_hc_parity src/kernels/glm_hc_parity.cpp src/kernels/glm_hc.cpp)
+target_include_directories(glm_hc_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm_hc_parity PRIVATE -O2)
+
 add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"
