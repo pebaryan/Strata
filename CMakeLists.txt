@@ -158,6 +158,12 @@ add_executable(glm_mla_parity src/kernels/glm_mla_parity.cpp src/kernels/glm_mla
 target_include_directories(glm_mla_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_mla_parity PRIVATE -O2)
 
+# Indexer parity (branch glm5next-port): the 4:1 key pool and the whole-pool selection, against
+# tools/glm5_indexer_reference.py.
+add_executable(glm_indexer_parity src/kernels/glm_indexer_parity.cpp src/kernels/glm_indexer.cpp)
+target_include_directories(glm_indexer_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm_indexer_parity PRIVATE -O2)
+
 add_executable(strata-dequant src/artifact/dequant.cpp)
 target_link_libraries(strata-dequant PRIVATE strata_artifact)
 # this file is now nothing but the CLI entry point, and its inherited guard spells that as a "selftest"

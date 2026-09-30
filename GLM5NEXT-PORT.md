@@ -3,10 +3,11 @@
 Started 2026-09-30. This branch exists so `main` stays a clean sm_70 port of upstream; nothing here is
 merged back until it loads a GLM pack and passes a parity gate.
 
-**Status: phases 0-3b done** (inventory, packer, arch guard + layer table, expert-table stem + build-time
-model geometry, and the mHC verified against an oracle). The remaining phases are the attention and MoE
-kernels plus the graph that wires them; nothing of those exists yet, and no half-finished code is left
-behind: every commit on this branch builds and passes its own gate.
+**Status: phases 0-4 done** (inventory, packer, arch guard + layer table, expert-table stem + build-time
+model geometry, the mHC, and the MLA block with its indexer - each verified against an oracle). The
+remaining phases are the linear-attention blocks, the MoE/router, the MTP block and the graph that wires
+them; nothing of those exists yet, and no half-finished code is left behind: every commit on this branch
+builds and passes its own gate.
 
 ```
 cmake -S . -B build-glm5 -G Ninja -DCMAKE_BUILD_TYPE=Release \
@@ -236,7 +237,7 @@ from a paper. That is what makes this an open-ended task rather than an unbounde
 | 2 | arch guard + geometry (array `head_count_kv`, layer kinds) | *done* - the guard reads the artifact, reports the block table, and refuses 5 distinct tampered copies with precise messages |
 | 3 | expert-layout stem offset + build-time model geometry | *done* - a GLM-configured build loads the pack's expert table (46 layers, 288 experts, stem at block 3, experts.bin matching); the default build's constants are unchanged |
 | 3b | the mHC mixer | *done* - 8/8 blocks match the numpy oracle (worst 4.5e-06 absolute, i.e. float32 round-off), with the Sinkhorn shown to sit at the oracle's own fixed point |
-| 4 | MLA + the kpool indexer (semantics recorded above) | attention outputs match the oracle, prefill and decode |
+| 4 | MLA + the kpool indexer | *done* - MLA 4/4 layers (worst 1.2e-05, every intermediate checked) and the indexer 4/4 (cache rows, pooled keys, scores, bias, the selection set, plus the whole-pool and always-select-tail invariants) |
 | 5 | the linear-attention block (`ssm_*`, KDA) | same, including a long-context check that the recurrent state is right |
 | 6 | router top-8, `ffn_exp_probs_b`, `expert_weights_norm/scale`; dense stem FFN; shared expert | expert ids match the oracle exactly on fixed prompts |
 | 7 | MTP arm (blk.45, which has no hyper-connections) | draft acceptance in the project's own range (~0.7), not ~1.0 |
