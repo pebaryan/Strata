@@ -443,7 +443,14 @@ private:
             if (a->u) align = a->u;
         alignment_ = align;
         data_start_ = (c.pos() + align - 1) / align * align;
-        if (data_start_ > size_) throw std::runtime_error("GGUF: data section starts past EOF");
+        // A metadata-only shard ends at its tensor table, so aligning past it lands just beyond EOF.
+        // GLM-5.3-Flash's shard 1 is exactly that: 72 metadata keys, zero tensors, 9.4 MB.  Nothing can
+        // be read out of a file that holds no tensors, so clamp instead of refusing - while keeping the
+        // strict check when tensors DO exist, since then a past-EOF data start is real corruption.
+        if (data_start_ > size_) {
+            if (!tensors_.empty()) throw std::runtime_error("GGUF: data section starts past EOF");
+            data_start_ = size_;
+        }
     }
 
     std::string path_;
@@ -494,6 +501,143 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
             return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
     }
     return {}; // empty == ok
+}
+
+// ---- GLM-5.3-Flash (branch glm5next-port).  The qwen4exp guard above asserts one scalar geometry,
+// which cannot express this model: two attention kinds inside one file, a dense MLP stem, an MTP
+// block, and a per-layer KV head count that GGUF stores as an ARRAY.  So the block table is derived
+// from the tensor names and then CROSS-CHECKED against the metadata - a guard that trusts only the
+// header cannot catch a file whose tensors disagree with it.
+enum class AttnKind : uint8_t { None, Linear, Mla };
+enum class MlpKind : uint8_t { Dense, Moe };
+
+struct Glm5Block {
+    AttnKind attn = AttnKind::None;
+    MlpKind mlp = MlpKind::Dense;
+    bool mtp = false, indexer = false;
+    uint32_t kv_heads = 0;     // from the metadata array: 0 means this block keeps no per-token KV
+};
+
+struct Glm5NextGeometry {
+    uint32_t block_count = 46, hidden = 4096, head_count = 64, experts = 288, experts_used = 8,
+             shared_experts = 1, expert_ffn = 2048, leading_dense = 3, nextn = 1,
+             q_lora_rank = 1536, kv_lora_rank = 512, key_length = 512, value_length = 512,
+             key_length_mla = 256, value_length_mla = 256, kda_head_dim = 128,
+             hc_count = 4, hc_sinkhorn = 20,
+             indexer_heads = 32, indexer_key_length = 128, indexer_kpool = 4, indexer_top_k = 2048;
+    uint32_t first_moe = 0, mtp_block = 0;   // the expert layout starts at first_moe, not at 0
+    std::vector<Glm5Block> blocks;
+};
+
+inline std::string check_glm5next_architecture(const GgufFile& g, Glm5NextGeometry& out,
+                                               const std::set<std::string>* other_shards = nullptr) {
+    const MetaValue* arch = g.get("general.architecture");
+    if (!arch) return "missing general.architecture";
+    if (arch->s != "glm5next") return "architecture is '" + arch->s + "', expected 'glm5next'";
+
+    struct Req { const char* key; uint64_t want; };
+    const Req reqs[] = {
+        {"glm5next.block_count", 46},
+        {"glm5next.embedding_length", 4096},
+        {"glm5next.attention.head_count", 64},
+        {"glm5next.attention.key_length", 512},
+        {"glm5next.attention.value_length", 512},
+        {"glm5next.attention.q_lora_rank", 1536},
+        {"glm5next.attention.kv_lora_rank", 512},
+        {"glm5next.attention.key_length_mla", 256},
+        {"glm5next.attention.value_length_mla", 256},
+        {"glm5next.kda.head_dim", 128},
+        {"glm5next.expert_count", 288},
+        {"glm5next.expert_used_count", 8},
+        {"glm5next.expert_shared_count", 1},
+        {"glm5next.expert_feed_forward_length", 2048},
+        {"glm5next.leading_dense_block_count", 3},
+        {"glm5next.nextn_predict_layers", 1},
+        {"glm5next.hyper_connection.count", 4},
+        {"glm5next.hyper_connection.sinkhorn_iterations", 20},
+        {"glm5next.attention.indexer.head_count", 32},
+        {"glm5next.attention.indexer.key_length", 128},
+        {"glm5next.attention.indexer.kpool", 4},
+        {"glm5next.attention.indexer.top_k", 2048},
+    };
+    for (const auto& r : reqs) {
+        const MetaValue* v = g.get(r.key);
+        if (!v) return std::string("missing ") + r.key;
+        if (v->type == MetaType::ARRAY) return std::string(r.key) + " is an array, expected a scalar";
+        if (v->u != r.want)
+            return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
+    }
+    out.block_count = 46;
+    out.hidden = 4096;   out.head_count = 64;
+    out.experts = 288;   out.experts_used = 8;   out.shared_experts = 1;   out.expert_ffn = 2048;
+    out.leading_dense = 3;   out.nextn = 1;
+    out.q_lora_rank = 1536;  out.kv_lora_rank = 512;  out.key_length = 512;  out.value_length = 512;
+    out.key_length_mla = 256;  out.value_length_mla = 256;  out.kda_head_dim = 128;
+    out.hc_count = 4;  out.hc_sinkhorn = 20;
+    out.indexer_heads = 32;  out.indexer_key_length = 128;  out.indexer_kpool = 4;  out.indexer_top_k = 2048;
+
+    // The per-layer KV head count is an array here, and it is the one field that says which blocks
+    // attend over real KV.  Its length must equal the block count or the two disagree about the model.
+    const MetaValue* kv = g.get("glm5next.attention.head_count_kv");
+    if (!kv) return "missing glm5next.attention.head_count_kv";
+    if (kv->type != MetaType::ARRAY) return "glm5next.attention.head_count_kv is not an array";
+    if (kv->count != out.block_count)
+        return "head_count_kv has " + std::to_string(kv->count) + " entries for " +
+               std::to_string(out.block_count) + " blocks";
+    for (const auto& item : kv->items)
+        if (!item.is_num()) return "head_count_kv holds a non-numeric entry";
+
+    // derive the block table from the tensors, then cross-check it against that array.  A split model
+    // keeps most tensors in the other shards, so the caller passes their names in and presence here
+    // means "declared by the model", not "in this file".
+    out.blocks.assign(out.block_count, Glm5Block{});
+    auto has = [&](uint32_t b, const char* suffix) {
+        char name[128];
+        std::snprintf(name, sizeof name, "blk.%u.%s", b, suffix);
+        return g.find(name) != nullptr || (other_shards && other_shards->count(name) != 0);
+    };
+    out.first_moe = out.block_count;   // ~0: "no MoE block yet"
+    uint32_t mtp_seen = 0, mla_seen = 0, moe_seen = 0;
+    for (uint32_t b = 0; b < out.block_count; ++b) {
+        Glm5Block& blk = out.blocks[b];
+        const bool ssm = has(b, "ssm_a");
+        const bool mla = has(b, "attn_kv_a_mqa.weight");
+        blk.mtp = has(b, "nextn.eh_proj.weight");
+        blk.indexer = has(b, "indexer.attn_k.weight");
+        blk.mlp = has(b, "ffn_gate_exps.weight") ? MlpKind::Moe : MlpKind::Dense;
+        blk.kv_heads = (uint32_t)kv->items[b].u;
+        if (ssm && mla) return "blk." + std::to_string(b) + " has both the linear and the MLA tensors";
+        if (ssm) blk.attn = AttnKind::Linear;
+        else if (mla) blk.attn = AttnKind::Mla;
+        else return "blk." + std::to_string(b) + " has neither ssm_a nor attn_kv_a_mqa.weight";
+        if (blk.attn == AttnKind::Mla) ++mla_seen;
+        if (blk.mlp == MlpKind::Moe) {
+            ++moe_seen;
+            if (b < out.first_moe) out.first_moe = b;
+        }
+        if (blk.mtp) { ++mtp_seen; out.mtp_block = b; }
+        // the cross-check: the array must agree with the tensors about which blocks keep KV
+        if ((blk.attn == AttnKind::Mla) != (blk.kv_heads > 0))
+            return "blk." + std::to_string(b) + ": the metadata says " + std::to_string(blk.kv_heads) +
+                   " KV head(s) but the tensors say " +
+                   (blk.attn == AttnKind::Mla ? "MLA" : "linear attention");
+    }
+    if (mla_seen != (uint32_t)std::count_if(kv->items.begin(), kv->items.end(),
+                                            [](const MetaValue& v) { return v.u > 0; }))
+        return "the KV-head array and the MLA tensors disagree on how many blocks carry KV";
+    if (mtp_seen != out.nextn)
+        return std::to_string(mtp_seen) + " block(s) carry nextn tensors, the metadata says " +
+               std::to_string(out.nextn);
+    if (out.mtp_block != out.block_count - 1)
+        return "the MTP block is " + std::to_string(out.mtp_block) + ", not the last block";
+    if (out.first_moe != out.leading_dense)
+        return "the first MoE block is " + std::to_string(out.first_moe) + " but the metadata's leading "
+               "dense block count is " + std::to_string(out.leading_dense);
+    for (uint32_t b = out.first_moe; b < out.block_count; ++b)
+        if (out.blocks[b].mlp != MlpKind::Moe)
+            return "blk." + std::to_string(b) + " has no experts although every block from the stem on "
+                   "must be a Mixture-of-Experts block";
+    return {};   // empty == ok
 }
 
 } // namespace strata

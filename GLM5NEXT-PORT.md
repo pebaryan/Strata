@@ -3,9 +3,30 @@
 Started 2026-09-30. This branch exists so `main` stays a clean sm_70 port of upstream; nothing here is
 merged back until it loads a GLM pack and passes a parity gate.
 
-**Status: planning complete, no kernel work started.** This document plus `tools/glm5_inventory.py` and
-`docs/glm5next-tensor-inventory.md` (both generated from the artifact that will actually be served, not
-from the model card) are the branch's first commit.
+**Status: phases 0-2 done** (inventory, packer, arch guard + layer table). No kernel work started.
+Phase 1's pack passed its gate (`/home/peb/moredata/strata-pack-glm5`), and phase 2's guard reads the
+real artifact and reports the block table (`build-volta/strata-gguf <shard1> --glm5next`).
+
+## What the phases found that the plan did not predict
+
+- **`general.architecture` is `glm5next`, and the metadata is self-describing**: `block_count` 46 (a
+  COUNT, not a last index), `leading_dense_block_count` 3, `nextn_predict_layers` 1,
+  `hyper_connection.count` 4 with `sinkhorn_iterations` 20, `kda.head_dim` 128, `expert_used_count` 8,
+  `expert_shared_count` 1, `indexer.kpool` 4 / `top_k` 2048, `kv_lora_rank` 512. The mHC shape I had
+  inferred from tensor bytes (4 streams, Sinkhorn-normalised) is stated outright in the header.
+- **`rope.dimension_count` is 0**: no rotary embeddings anywhere in this model. The linear-attention
+  blocks use conv1d + decay, the MLA blocks are noPE. So the port needs no RoPE path for GLM at all.
+- **The reader refused the artifact for a reason that had nothing to do with GLM's architecture**:
+  shard 1 holds 72 metadata keys and **zero tensors**, so aligning past its tensor table lands 29 bytes
+  beyond EOF. Fixed by clamping when there are no tensors, keeping the strict refusal when there are.
+- **A shard boundary falls inside block 25**: gate/up in one file, down in another. v3
+  `native_experts.txt` names one shard per layer, so the pack is written with `--experts-bin` instead.
+  A v4 with per-tensor shards is the general fix; it is NOT written speculatively, because the current
+  reader would take a v4 line as v3 and read the wrong bytes silently.
+- **The expert table cannot start at block 0**: blocks 0-2 are the dense stem. `expert_layout_load`
+  currently requires layer 0 to be present and contiguous, so it needs a stem offset (or a
+  per-layer presence mask) before a GLM pack can load. This is the first item of phase 3.
+
 
 ## Verdict first: what porting buys, and what it cannot
 
@@ -104,10 +125,10 @@ from a paper. That is what makes this an open-ended task rather than an unbounde
 
 | phase | work | gate |
 |---|---|---|
-| 0 | this inventory + tooling | *done* — tensor inventory matches the metadata |
-| 1 | packer: names, per-layer kind, pack layout | a GLM pack is produced and its index matches the inventory |
-| 2 | arch guard + geometry (array `head_count_kv`, layer kinds) | engine loads the pack headers and reports the layer table |
-| 3 | mHC mixer | logits match the oracle for a 2-layer slice |
+| 0 | this inventory + tooling | *done* - tensor inventory matches the metadata |
+| 1 | packer: names, per-layer kind, pack layout | *done* - the pack's index accounts for all 1412 tensors; 43 expert blocks contiguous; experts.bin matches its header byte for byte |
+| 2 | arch guard + geometry (array `head_count_kv`, layer kinds) | *done* - the guard reads the artifact, reports the block table, and refuses 5 distinct tampered copies with precise messages |
+| 3 | expert-layout stem offset, then the mHC mixer | logits match the oracle for a 2-layer slice |
 | 4 | MLA + kpool indexer | attention outputs match the oracle, prefill and decode |
 | 5 | linear-attention layer (`ssm_*`) | same, including a long-context check that the recurrent state is right |
 | 6 | router top-8 + `exp_probs_b` | expert ids match the oracle exactly on fixed prompts |
