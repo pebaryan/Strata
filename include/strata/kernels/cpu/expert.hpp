@@ -25,14 +25,20 @@
 // per weight block is the natural-looking mistake.
 #pragma once
 
+#include "strata/model_geometry.hpp"   // generated: STRATA_MODEL_H / STRATA_MODEL_FF
+
 #include <cstdint>
 #include <cstddef>
 
 namespace strata::kernels::cpu {
 
-// ---- geometry, all of it fixed by the artifact (tools/verify_q2_0_geometry.py: 202/202 tensors at QK=64) ----
-inline constexpr int H = 2560;      // n_embd
-inline constexpr int FF = 640;      // expert intermediate width
+// ---- geometry.  H and FF come from the build (cmake/model_geometry.hpp.in): the CPU expert path is
+// built for ONE model, and a build configured for another geometry (GLM-5.3-Flash: 4096 / 2048) sizes
+// its buffers and its canonical pack form from it.  The remaining constants describe that model's
+// canonical Q2_0 form, so they move with H and FF by construction.
+// (tools/verify_q2_0_geometry.py checks the default 2560/640 form: 202/202 tensors at QK=64.)
+inline constexpr int H = STRATA_MODEL_H;    // n_embd
+inline constexpr int FF = STRATA_MODEL_FF;  // expert intermediate width
 inline constexpr int NE = 512;      // routed experts per layer
 inline constexpr int QK = 64;       // QK2_0: weights per fp16 scale
 inline constexpr int QKA = 32;      // QK8_1/QK8_0: ACTIVATION elements per scale

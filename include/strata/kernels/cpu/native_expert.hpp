@@ -7,16 +7,23 @@
 // is one `vec_dot`, exactly what llama.cpp's CPU backend computes for the same tensor.
 #pragma once
 
+#include "strata/model_geometry.hpp"   // generated: STRATA_MODEL_H / STRATA_MODEL_FF
+
 #include <cstddef>
 #include <cstdint>
 #include <string>
 
 namespace strata::kernels::cpu {
 
-/// Bytes of the largest quantized activation any native layer uses (2560 values as Q8_K: 10 x 292).
-inline constexpr size_t kNativeActBytes = 4096;
-/// Bytes of the largest quantized down activation (640 values as Q8_0: 20 x 34, or Q8_K 3 x 292).
-inline constexpr size_t kNativeHBytes = 1024;
+/// Bytes of the largest quantized activation any native layer uses.  Derived from the model geometry so a
+/// build configured for another width is consistent by construction: the widest activation format these
+/// kernels quantize to is Q8_1-shaped (4 B scale + 4 B sum + 32 codes = 40 B per 32 elements, 1.25 B per
+/// element), plus one row of slack.  For the default 2560 / 640 the floors below reproduce the historical
+/// 4096 / 1024 exactly; a 4096-wide model gets 5184 / 2624 instead of silently overflowing the buffers.
+inline constexpr size_t kModelActBytes = (size_t) STRATA_MODEL_H * 40 / 32 + 64;
+inline constexpr size_t kModelHBytes = (size_t) STRATA_MODEL_FF * 40 / 32 + 64;
+inline constexpr size_t kNativeActBytes = kModelActBytes > 4096 ? kModelActBytes : 4096;
+inline constexpr size_t kNativeHBytes = kModelHBytes > 1024 ? kModelHBytes : 1024;
 
 /// One layer's native expert geometry.
 struct NativeFmt {

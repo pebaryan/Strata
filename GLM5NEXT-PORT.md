@@ -3,9 +3,22 @@
 Started 2026-09-30. This branch exists so `main` stays a clean sm_70 port of upstream; nothing here is
 merged back until it loads a GLM pack and passes a parity gate.
 
-**Status: phases 0-2 done** (inventory, packer, arch guard + layer table). No kernel work started.
-Phase 1's pack passed its gate (`/home/peb/moredata/strata-pack-glm5`), and phase 2's guard reads the
-real artifact and reports the block table (`build-volta/strata-gguf <shard1> --glm5next`).
+**Status: phases 0-3 done** (inventory, packer, arch guard + layer table, expert-table stem + build-time
+model geometry). A GLM-configured build loads the pack; no GLM kernels exist yet.
+
+```
+cmake -S . -B build-glm5 -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=/usr/bin/gcc-14 -DCMAKE_CXX_COMPILER=/usr/bin/g++-14 \
+  -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14 -DCMAKE_CUDA_ARCHITECTURES=70 \
+  -DSTRATA_ENABLE_CUDA=ON -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=OFF \
+  -DSTRATA_EXPERIMENTAL_SM75=ON -DSTRATA_MODEL_H=4096 -DSTRATA_MODEL_FF=2048
+ninja -C build-glm5 strata
+./build-glm5/strata-load --layout /home/peb/moredata/strata-pack-glm5 --layout-layers 46
+```
+
+That last command is the phase-3 gate: it reports 46 layers, 288 experts/layer, the table starting at
+block 3 (the dense stem), 86.41 GB total, and `experts.bin` matching the table byte for byte.
+
 
 ## What the phases found that the plan did not predict
 
@@ -28,20 +41,17 @@ real artifact and reports the block table (`build-volta/strata-gguf <shard1> --g
   the model's expert geometry (`hidden`, `expert_ffn`) instead of assuming the compiled qwen4exp pair
   (2560 / 640). Verify with `strata-load --layout <pack> --layout-layers 46` (it reads `hidden` and
   `expert_ffn` from the pack's manifest.json when they are not passed).
-- **The next blocker is the CPU expert pool's COMPILE-TIME geometry**, not the layout:
-  `native_expert.cpp` refuses a layer whose activation exceeds `kNativeActBytes` (4096) / `kNativeHBytes`
-  (1024), and GLM needs 4352 / 2176 for a 4096-wide hidden and a 2048-wide expert. The same constants
-  (`H`, `FF`, and the `MAXC` / `ROW_*` / `SC_*` / `O_*` forms derived from them, plus the `ff[MAXT][FF]`
-  split buffers) run through `expert.cpp`, `pool.cpp`, `expert_source.cpp` and `iq_avx2.cpp`. Two ways
-  out, and the cost of the first one is measured rather than guessed:
-  - **(a) build-time model geometry.** Make `H`/`FF` CMake options (default 2560 / 640, so the existing
-    build is unchanged) and build a GLM configuration with 4096 / 2048. Enlarging the buffers costs
-    ~100 KB per thread in total (`ff[MAXT][FF]` 16 -> 64 KB, `hq` 8 -> 17 KB, `MAXC` 80 -> 128), so the
-    price is a second build, not memory. This matches the engine's own design: it is specialised to ONE
-    model, and it already has build switches (`STRATA_EXPERIMENTAL_SM75`, pruned-model support).
-  - **(b) runtime pool geometry.** Allocate the buffers from the model's geometry. Removes the second
-    build, but it puts indirection into the hottest loops and into the AVX-512 kernels' compile-time
-    unrolling, for a saving that only matters if two geometries must ship from one binary.
+- **The CPU expert pool's geometry is now a BUILD option** (chosen and implemented, branch
+  `glm5next-port`): `-DSTRATA_MODEL_H` / `-DSTRATA_MODEL_FF` (defaults 2560 / 640, the qwen4exp model)
+  are configured into a generated `strata/model_geometry.hpp`, which `expert.hpp` uses for `H`/`FF` and
+  `native_expert.hpp` uses to size the pooled activation buffers from the geometry itself (the widest
+  activation these kernels quantize to is Q8_1-shaped, 1.25 B/element, plus a row of slack, with the
+  historical 4096/1024 kept as floors so the default build is unchanged). A GLM build is
+  `-DSTRATA_MODEL_H=4096 -DSTRATA_MODEL_FF=2048`. Measured cost of the larger buffers: ~100 KB per thread.
+  The alternative — runtime-sized pool buffers — was rejected because it puts indirection into the hottest
+  loops and into the AVX-512 kernels' compile-time unrolling, to avoid a second build directory.
+  **One model per build**, which is the engine's own design: in a GLM-configured build the qwen4exp pack is
+  refused at the first layer (`blob is 2176000 B but its formats make 11141120`).
 
 
 ## Verdict first: what porting buys, and what it cannot
@@ -144,7 +154,8 @@ from a paper. That is what makes this an open-ended task rather than an unbounde
 | 0 | this inventory + tooling | *done* - tensor inventory matches the metadata |
 | 1 | packer: names, per-layer kind, pack layout | *done* - the pack's index accounts for all 1412 tensors; 43 expert blocks contiguous; experts.bin matches its header byte for byte |
 | 2 | arch guard + geometry (array `head_count_kv`, layer kinds) | *done* - the guard reads the artifact, reports the block table, and refuses 5 distinct tampered copies with precise messages |
-| 3 | expert-layout stem offset, then the mHC mixer | logits match the oracle for a 2-layer slice |
+| 3 | expert-layout stem offset + build-time model geometry | *done* - a GLM-configured build loads the pack's expert table (46 layers, 288 experts, stem at block 3, experts.bin matching); the default build's constants are unchanged |
+| 3b | the mHC mixer | logits match the oracle for a 2-layer slice |
 | 4 | MLA + kpool indexer | attention outputs match the oracle, prefill and decode |
 | 5 | linear-attention layer (`ssm_*`) | same, including a long-context check that the recurrent state is right |
 | 6 | router top-8 + `exp_probs_b` | expert ids match the oracle exactly on fixed prompts |

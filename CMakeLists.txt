@@ -33,6 +33,15 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(STRATA_ENABLE_CUDA "Build the CUDA targets (Phase 2+)" OFF)
+# The CPU expert path is built for ONE model geometry (see cmake/model_geometry.hpp.in): the pooled
+# activation buffers and the canonical Q2_0 expert form are sized from these.  The defaults are the
+# qwen4exp model, so an unchanged build stays byte-identical in behaviour; a GLM-5.3-Flash build passes
+# -DSTRATA_MODEL_H=4096 -DSTRATA_MODEL_FF=2048 (this is branch glm5next-port).
+set(STRATA_MODEL_H 2560 CACHE STRING "model hidden width the CPU expert path is built for")
+set(STRATA_MODEL_FF 640 CACHE STRING "model expert intermediate width the CPU expert path is built for")
+configure_file(${CMAKE_CURRENT_SOURCE_DIR}/cmake/model_geometry.hpp.in
+               ${CMAKE_CURRENT_BINARY_DIR}/generated/strata/model_geometry.hpp @ONLY)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/generated)
 option(STRATA_ENABLE_HIP "Build the HIP targets for gfx1100 wave32 hardware" OFF)
 option(STRATA_PREFILL_MMQ "Build the optional GGML MMQ prefill path for HIP" OFF)
 if(STRATA_PREFILL_MMQ AND NOT STRATA_ENABLE_HIP)
