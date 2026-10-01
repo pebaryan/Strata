@@ -161,3 +161,38 @@ tensor whose value is a KNOWN FUNCTION OF THE KNOWN INPUT and nothing else, and 
 runtime for its shape AND its memory offset together in the same run, then check whether a read at
 t.data - off (i.e. the buffer base) is what another named tensor holds.  If the buffer base holds a
 neighbour, the read is losing the offset for host buffers too and the fix belongs in the dumper's read.
+
+## Part 5: CORRECTION - the dump was never broken.  My reshape was.
+
+The read-path investigation is closed, and the answer is not the one parts 3 and 4 concluded.  The
+reference dump is trustworthy and always was.  The bug was in the analysis scripts.
+
+ggml stores a tensor of ne=[4096,4,5,1] with nb=[4,16384,65536,327680] bytes, so the fp32 payload index
+is i_embd + 4096*i_hc + 16384*i_tok.  The right reshape is (tok, hc, embd).  My checks used
+(embd, hc, tok), whose C-order strides are 20*e + 5*h + t - a different mapping, i.e. I was comparing the
+wrong axis.  Both readings on the SAME file:
+
+    reshape(embd, hc, tok)  ->  hc spread 4.091e+00   <- the "four streams differ" claim
+    reshape(tok, hc, embd)  ->  hc spread 0.000e+00   <- correct: a perfect broadcast, as constructed
+
+So hc_init - the anchor the whole investigation started from - reads back exactly, in every dump, from the
+first one on.  Consequences, stated plainly:
+
+  * Everything in parts 3 and 4 is an artifact of this error: the "device tensors at nonzero offsets read
+    wrong", the "liveness hypothesis", the host-copy and CPU-forced fixes.  The offset correlation was
+    real in the manifest but never the cause - a wrong axis produces mismatched numbers whatever the
+    buffer is.
+  * The "attn_norm-0 is not rms_norm(hc_attn_pre-0) * attn_norm.weight and no eps reconciles it"
+    conclusion used the same helper, on the same shape of tensor, and is equally void.  There is no
+    evidence that the graph applies a different weight.
+  * No instrument change was needed.  The fork's STRATA_DUMP_FILTER extension and the --only filter are
+    harmless (env-gated, inert by default) but unnecessary; keep or drop as convenience.
+
+LESSON, and it is the same one this file already records twice: check the instrument by construction, and
+when a relation that MUST hold fails, suspect the measurement machinery before the graph.  Here the
+relation that must hold was a broadcast having identical slices; it did hold, and the tool that said
+otherwise was mine.  A five-minute check against ggml's own strides (nb, printed in the provenance column
+I had already added) would have caught it - the data was in the manifest the whole time.
+
+The reference dump is usable for per-block bisection.  That is the next step, and it is the one the port
+has been waiting for since phase 8 started.
