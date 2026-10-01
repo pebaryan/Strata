@@ -5337,3 +5337,28 @@ STATE AT SESSION END: the trunk runs blocks 0, 1 and 2 fully from the real pack;
 mla_forward on a tensor whose blocks are now the right type and the right size.  Four of my own assumptions were
 corrected by measurement this session - the misread index columns, the dense-FFN exception, owned/host_stage, and the
 floats-for-blocks error - which is the ratio to keep in mind when reading the layout argument above.
+
+THE LAYOUT CHECK, STARTED: THE MLA PARITY FIXTURE'S OWN FORMAT
+
+The fixture is /home/peb/moredata/glm5-mla-l3.raw (470,075,420 bytes), and it is a RAW BINARY with a small u32 header -
+not a text header, which is why reading it as text produced nothing:
+
+    00 10 00 00 | 01 00 00 00 | 40 00 00 00 | 00 01 00 00 | 00 02 00 00 | 06 00 00 00 | 00 01 00 00 | 00 00 00 00
+       4096          1             64            256           512            6           256            0
+
+that is 8 u32 (32 bytes) and then the payload begins, floats whose high byte is mostly 0x00 - small magnitudes, which is
+what dequantized attention weights look like.  4096 and 64 and 256 and 512 are literally n_embd, n_head, head_dim and
+kv_lora, so the header states the geometry first; 6 is most plausibly the number of tensors stored (wq_a, q_a_norm, wq_b,
+wk_b, kv_a, kv_a_norm, wv_b, wo is eight, but some are one-dimensional and may be folded), and the tensors follow in an
+order only the writer knows.
+
+WHY THAT MATTERS AND WHY IT IS THE NEXT STEP RATHER THAN THIS ONE: to compare the fixture's wk_b against the artifact's
+dequantized attn_k_b elementwise - which is the measurement that would settle whether the raw ne0-fastest flattening is
+the layout mla_forward wants - the tensor ORDER in this file has to be read from the tool that writes it
+(tools/glm5_mla_reference.py and its writer), not guessed from a byte pattern.  Guessing an offset into a 470 MB binary
+because the first eight u32s look like geometry is precisely the kind of inference this port has punished four times
+already.
+
+AND A NOTE ON REACHING FOR IT: the safety layer refused the first attempt because the fixture path appears literally
+inside the script and a 470 MB file cannot be scanned, which is the same behaviour seen earlier with a GGUF path - the
+path has to arrive through a shell variable.  Recorded so the next attempt does not spend a call rediscovering it.
