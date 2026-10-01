@@ -1116,3 +1116,34 @@ kinds cannot.
 CONSEQUENCE FOR THE KDA GATE: attn_q/k/v stay natively quantized for this artifact (types other than 8), so the
 gate still needs either a dequantizer for the type they use or F32 attention weights in its fixture.  What is
 gone is the hazard: widening the branch can no longer poison the context.
+
+HOW THE KDA GATE GETS FLOAT WEIGHTS - THE OPTIONS, MEASURED AS FAR AS THEY GO
+
+The engine's dequantizers are exactly: dequant_q8_0 and dequant_q8_K (quantize_act.hpp), plus dequant_f32 /
+dequant_f16 / dequant_bf16 and dequant_s2 for other paths.  There is NO dequantizer for the 22-byte-block type
+that blk.0.attn_q.weight actually uses (native_mmvq_weight_bytes case 6), which is why the widened branch read past
+the end before it was gated by native_type == 8.
+
+And the pack does not hand attn_q/k/v over as floats either: a default-configuration run reports 12 rows still
+"=quantized" in block 0, attn_q/k/v among them, so native serving is the only source for those three.
+
+Three routes to a KDA gate, in order of what they cost:
+
+  1. WRITE THE MISSING DEQUANTIZER.  A Q5_1-style dequantizer for the 22-byte type, with its own parity gate
+     against ggml's own conversion (the same discipline the q8_0 one had).  Extensible, and it is the real
+     engineering answer - but it is a new kernel plus a new gate, not a step.
+  2. GATE THE KERNEL WITH FIXTURE WEIGHTS.  Have the Python side write the oracle's own wq/wk/wv to a file and let
+     the driver load them as floats.  Works today and validates kda_forward end to end.  Its limit is the standing
+     rule: a gate that builds its own fixtures validates the kernel and never the wiring, so it must be followed by
+     a real binding check once route 1 exists.
+  3. GATE ONLY WHAT IS ALREADY FLOAT.  Everything else the KDA call consumes in block 0 IS float in the pack -
+     conv_q/k/v, ssm_a, ssm_dt.bias, ssm_f_a/b, ssm_beta, ssm_g_a/b, ssm_norm, attn_output and attn_norm are all
+     F32 rows - so the smallest real gate is to run kda_forward with wq/wk/wv supplied from a fixture and every
+     other weight taken from the engine's own binding.
+
+Route 3 is the recommended next step: it exercises the engine's binding for eleven of the sixteen KDA inputs, needs
+one small driver addition (read three matrices from a file), and keeps the fixture honest about exactly which
+inputs it substitutes.
+
+STATE: default path exit 0, stage 1 = -0.359747499 / 0.424176991 / 3.25002776.  The widened path exits 0 with 0
+failures now that the type guard is in place.
