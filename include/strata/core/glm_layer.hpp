@@ -14,6 +14,7 @@
 #include <string>
 
 #include "strata/kernels/glm_kda.hpp"
+#include "strata/kernels/glm_moe.hpp"
 
 #include "strata/kernels/glm_hc.hpp"
 
@@ -43,5 +44,15 @@ bool glm_stage_hc_norm(const float* x, int n_embd, const float* hc_fn, const flo
 /// `state` must be zeroed for a fresh sequence (nh*hd*hd floats).
 bool glm_stage_kda(const float* xn, const kernels::glm::KdaWeights& w, const kernels::glm::KdaGeometry& g,
                    int tokens, float* out, float* state, std::string& err);
+
+/// Stage 3: the site's hc_post - the hyper-connection combination, which produces HC rows for the next site's
+/// hc_pre rather than a single vector.  `residual` is the block input `x` ([HC][n_embd]).
+bool glm_stage_hc_post(const float* site_out, const float* residual, const kernels::glm::HcMix& mix,
+                       int n_embd, float* out, std::string& err);
+
+/// Stage 4: the FFN site's feed-forward - one expert_ffn call, serving both a leading dense block and a routed
+/// expert.  `clamp_limit` is the artifact's swiglu clamp for this site (10.0 for this model).
+bool glm_stage_ffn(const float* xn, const float* wg, const float* wu, const float* wd,
+                   const kernels::glm::MoeGeometry& g, float* out, float clamp_limit, std::string& err);
 
 }  // namespace strata::core::glm

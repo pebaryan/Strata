@@ -2631,3 +2631,25 @@ which independently confirms the new stage calls it with the right seven argumen
 
 STATE: the block has 2 of its 8 stages wired (hc_norm, kda).  Next in the order: hc_post (attn site), then the ffn
 site's hc_pre + norm, expert_ffn, and the final hc_post.  Every one of those already exists as verified code.
+
+CHAIN ASSEMBLY: 3 STAGES WIRED, AND ONLY ONE NEW ONE REMAINS
+
+    glm_stage_hc_norm   stage 1 (previously verified)     glm_stage_hc_post   a verified kernel call
+    glm_stage_kda       the attention call                glm_stage_ffn       the FFN call (added this round)
+
+The count matters more than the individual additions: the FFN site needs hc_pre + its norm, which IS glm_stage_hc_norm,
+and then hc_post, which IS glm_stage_hc_post.  So the block's eight-step sequence needs only four stage functions,
+two of which are new.  Everything is a call into an already-verified kernel; no arithmetic has been added anywhere.
+
+DATA FLOW, which alternates shape and is the easiest thing to get wrong silently because both are float*:
+    x                  [HC][n_embd]   the block's input streams
+    hc_pre  -> layer_in [n_embd]      one vector per token
+    norm    -> xn       [n_embd]
+    attention -> attn_output [n_embd]
+    hc_post ->         [HC][n_embd]   HC rows again, because the next site's hc_pre consumes exactly that
+    ... repeated for the FFN site ...
+    l_out              [HC][n_embd]   the block's output, and therefore the next block's input
+
+VERIFICATION DISCIPLINE, now standard: a symbol count after every addition, because this session has three times
+read an absence of error output as success - a target that did not contain the file, a grep that hid the error it was
+searching for, and a truncated buffer.  nm -C ... | grep -c answers the question; nothing else does.

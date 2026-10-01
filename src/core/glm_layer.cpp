@@ -6,6 +6,7 @@
 
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/glm_kda.hpp"
+#include "strata/kernels/glm_moe.hpp"
 
 namespace strata::core::glm {
 
@@ -59,6 +60,48 @@ bool glm_stage_kda(const float* xn, const kernels::glm::KdaWeights& w, const ker
         return false;
     }
     kernels::glm::kda_forward(w, g, xn, tokens, out, state, nullptr);
+    return true;
+}
+
+/// Stage 3: the site's hc_post.  The hyper-connection block is not a plain residual: the site's output and the
+/// incoming streams are combined through the mix that hc_pre recorded, and the result has HC rows again - which is
+/// what the NEXT site's hc_pre consumes (`x` is [HC][n_embd]).  So the residual here is the block's own input, and
+/// the output is the next site's input rather than a single vector.
+///
+/// No arithmetic: hc_post is verified (2.551e-07 against the oracle, the tightest agreement in the port).
+bool glm_stage_hc_post(const float* site_out, const float* residual, const kernels::glm::HcMix& mix,
+                       int n_embd, float* out, std::string& err) {
+    if (!site_out || !residual || !out) {
+        err = "glm_stage_hc_post: null argument";
+        return false;
+    }
+    if (n_embd <= 0) {
+        err = "glm_stage_hc_post: n_embd must be positive";
+        return false;
+    }
+    kernels::glm::hc_post(site_out, residual, mix, n_embd, out);
+    return true;
+}
+
+/// Stage 4: the FFN site's feed-forward.  One call to expert_ffn, which serves both a routed expert and a leading
+/// dense block - the difference being the geometry's ff (12288 for a dense block, 2048 for a routed expert) and the
+/// clamp limit, which is an explicit argument rather than a field because the engine's own header warns that with a
+/// limit of 10 the clamp is invisible until a pre-activation exceeds 10, so a caller who forgets it passes most
+/// tests.  The leading dense FFN uses swiglu_clamp_shexp, not the routed experts' clamp_exp; both are 10.0 here.
+///
+/// No arithmetic: expert_ffn is verified on block 0 at the fp32 floor with its clamp proven by a demonstrated
+/// failure, and matches on block 1 at the same floor.
+bool glm_stage_ffn(const float* xn, const float* wg, const float* wu, const float* wd,
+                   const kernels::glm::MoeGeometry& g, float* out, float clamp_limit, std::string& err) {
+    if (!xn || !wg || !wu || !wd || !out) {
+        err = "glm_stage_ffn: null argument";
+        return false;
+    }
+    if (g.n_embd <= 0 || g.ff <= 0) {
+        err = "glm_stage_ffn: geometry must have positive n_embd and ff";
+        return false;
+    }
+    kernels::glm::expert_ffn(wg, wu, wd, g, xn, out, clamp_limit);
     return true;
 }
 
