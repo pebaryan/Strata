@@ -4041,3 +4041,42 @@ STATE: two blocks verified to the fp32 floor, both isolated and chained.  What r
 in scope - the pack-based chain target (WeightTable/arena/NativeDense, 45 binds, FileExpertSource, native_fmt from the
 pack's own types, 34 KDA states and 11 MLA caches), the head, and the gate argmax == 12089.  The MLA path has still
 never executed at all, and block 3 is the first MLA layer.
+
+THE MLA PATH IS VERIFIED AT THE KERNEL LEVEL - the branch that had never executed
+
+    $PY tools/glm5_mla_reference.py --gguf $GGUF --layer 3 --tokens 1 --raw-fixture /home/peb/moredata/glm5-mla-l3.raw
+        -> 470,075,420 bytes, layer 3, cache 1 latent
+    ./build-glm5/glm_mla_parity /home/peb/moredata/glm5-mla-l3.raw
+        qr     max abs 5.722e-06  (1.97e-06 of scale)   PASS
+        kv     max abs 2.861e-06  (1.88e-06 of scale)   PASS
+        qcur   max abs 4.470e-06  (9.66e-07 of scale)   PASS
+        attn   max abs 0.000e+00  (0.00e+00 of scale)   PASS   <- bit-exact
+        out    max abs 1.836e-05  (4.00e-06 of scale)   PASS
+        invariants: with a 1-entry cache every head returns that entry (worst 0.000e+00)
+        glm_mla_parity: 0 failures
+
+Block 3 is the first MLA layer and the MLA branch of the trunk loop had never executed in any form.  It has now, and
+the kernel agrees with the oracle at five stages - including attn BIT-EXACT and the 1-entry-cache invariant, which is
+the one MLA-specific claim that a tolerance cannot cover: with a single cached latent every head must return that entry,
+and it does to 0.000e+00.
+
+The gate and its fixture builder both already existed (glm_mla_parity, glm5_mla_reference.py --raw-fixture); what was
+missing was the fixture, which is one command.  Recorded because the same is true of the routed expert path:
+
+    $PY tools/glm5_moe_reference.py --gguf $GGUF --raw-fixture <path>
+    ./build-glm5/glm_moe_parity <path>
+
+which is the remaining kernel-level gap now that MLA is closed.
+
+WHAT REMAINS UNTESTED, stated precisely, because the distinction matters after this result:
+
+  * the MLA KERNEL is verified; the MLA WIRING is not.  glm_trunk_forward's is_mla branch - which decides that MLA
+    gets the site norm applied and KDA does not (the double-norm fix), and which threads the latent cache and its
+    growing length - has still never run, and cannot until a block whose attention is MLA can be built, which means
+    the pack;
+  * the routed expert path (blocks 3..44) has never run in the loop either; its kernel gate is the command above;
+  * the head and the token gate argmax == 12089 remain.
+
+STATE: two blocks verified to the fp32 floor, isolated and chained; the KDA and MLA kernels both verified against the
+oracle; the dense FFN and both dequantizers bit-exact or at the floor.  Nothing in the port is known to be wrong; what
+is missing is execution of the parts that need the pack.
