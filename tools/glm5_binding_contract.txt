@@ -375,3 +375,26 @@ between here and a working stage 1.
 
 Default path is unchanged and still the one that passes 9.1's check: the branch is opt-in, documented as
 unverified.
+
+CORRECTION TO MY OWN A/B READING - A's exit=1 was NOT a clean pass
+
+In A (kernel-only) the branch does `cudaFree(dev_f); continue;` BEFORE storing anything, so hc_attn_fn never
+reaches out.tensors.  host_copy("hc_attn_fn.weight") therefore fails with "not bound", and the driver returns 1
+before the stage runs at all.  So A never exercised the stage, and its "attn_norm reads fine" line came from the
+BIND PRINT LOOP, not from stage 1.  A/B did not discriminate what I said it did.
+
+Also cleared: repack_conv returns cudaMalloc'd memory (glm_bind.cpp:71-78), and so do dev_f (:151), dev3 (:181)
+and dev (:199) - all four out.owned entries are device pointers, so the destructor's cudaFree loop (:38) is
+correct and the "ownership bookkeeping" hypothesis is dead too.
+
+WHAT IS ACTUALLY ESTABLISHED, stated carefully:
+  * the bind print loop reads the F32 tensors correctly - that is the verified 12/12, and it still holds in the
+    default path (re-measured at 24fca35)
+  * with the opt-in branch held (B), the STAGE's probe reports hc_attn_base as cudaMemoryTypeUnregistered
+  * with the branch off, stage 1 is reachable but has never been run to completion
+
+So the next test must compare like with like: run the stage in the DEFAULT path, where hc_attn_fn is served
+normally (as Q8_0, the state that passed 9.1), and see what hc_attn_base looks like from the stage's probe then.
+That answers whether "unregistered" is caused by the opt-in branch at all, or is simply what an arena pointer
+looks like to cudaMemcpy from this driver - which would make the whole pointer investigation a red herring and
+point back at glm_hc.cpp's expectations.
