@@ -5362,3 +5362,39 @@ already.
 AND A NOTE ON REACHING FOR IT: the safety layer refused the first attempt because the fixture path appears literally
 inside the script and a 470 MB file cannot be scanned, which is the same behaviour seen earlier with a GGUF path - the
 path has to arrive through a shell variable.  Recorded so the next attempt does not spend a call rediscovering it.
+
+MEASURED, NOT ARGUED: THE FETCHED LAYOUT IS RIGHT, BIT FOR BIT
+
+The check I said I would run before trusting the argument, run:
+
+    reader wk_b: shape (64, 512, 256) elements 8388608
+    fixture wk_b: 8388608 floats, first 4 [0.001499, 0.038979, -0.033981, -0.025486], rms 0.0280065
+    FLAT (ne0-fastest) : max|diff| 0          ratio 0
+    TRANSPOSED         : max|diff| 0.280203   ratio 10.005
+
+The fixture stores wk_b in EXACTLY the ne0-fastest order the artifact reader produces - zero difference, not a small one -
+and the transposed variant is wrong by ten times the rms, which is the separation that makes this a measurement rather
+than a coincidence of magnitudes.  So a straight Q8_0 dequantization of the artifact's blocks, in storage order, IS the
+array mla_forward was verified against, and NO TRANSPOSE IS NEEDED anywhere in this path.
+
+This is worth stating carefully because it RETIRES the prime suspect: the layout argument I made four commits ago was
+right, and the reason it was right is the reason the artifact's [256, 512, 64] reverses to the fixture's (64, 512, 256) -
+ggml stores ne0 fastest and the fixture's reader reshapes with reversed(t.shape), so both are the same flattening.
+
+AND THEREFORE THE SIGSEGV INSIDE mla_forward IS SOMETHING ELSE, which narrows the field to the things this check could
+not see:
+
+  * the MLA CACHE.  mla_forward takes its state as a MlaIntermediates const& - a REFERENCE, so a bad one is a fault
+    rather than a wrong number, which is exactly the failure shape here.  The record already contains one instance of
+    this: glm_stage_mla once had no MlaIntermediates parameter at all, so the trunk loop's cache writes were dead code
+    and the MLA attended to a stale latent.  That was fixed for block3_gate, whose cache the GATE threads by hand -
+    but the 45-block runner supplies its own state, and "11 MLA caches (5 cells each)" is a statement about ALLOCATION,
+    not about what the trunk is handed.  A gate that threads its own cache cannot see whether the runner's trunk call
+    does the same, which is the same shape as every other defect in this port.
+  * the other three tensors of the layer (wq_a, wq_b, kv_a, wo) - staged from the pack, no failure reported.
+  * a geometry disagreement: the runner passes MlaGeometry built from the artifact's metadata, mla_forward's gate used
+    its own constants, and nothing has yet compared the two.
+
+NEXT, in order: print the MlaIntermediates pointer the trunk is handed for layer 3 against the runner's own cache
+allocation (a two-line diagnostic, the same shape as the arena/pointer diagnostic that found the device-vs-host split),
+and if they differ, that is the defect; if they agree, compare the runner's MlaGeometry against the MLA gate's.
