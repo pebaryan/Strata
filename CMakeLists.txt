@@ -926,3 +926,14 @@ add_executable(layer_weights_gate tools/layer_weights_gate.cpp src/core/glm_laye
 target_include_directories(layer_weights_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(layer_weights_gate PRIVATE -O2)
 target_link_libraries(layer_weights_gate PRIVATE strata_kernels CUDA::cudart)
+
+# trunk_gate (branch glm5next-port): the FIRST execution of the trunk loop as an assembly.
+# Every stage has passed its own gate; none had run in sequence.  No pack needed - the dense FFN
+# matrices are dequantized from the ffn fixture, which is also the first real data Q6_K sees.
+add_executable(trunk_gate tools/trunk_gate.cpp src/core/glm_trunk.cpp src/core/glm_layer.cpp
+                   src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_bind.cpp
+                   src/core/native_dense.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
+                   src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu)
+target_include_directories(trunk_gate PRIVATE /include)
+target_compile_options(trunk_gate PRIVATE -O2)
+target_link_libraries(trunk_gate PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)

@@ -3706,3 +3706,55 @@ a l_out-0 comparison must be reported as a measured ratio with that amplificatio
 or, better, the expected output should come from the oracle (glm5_hc_reference.py and glm5_kda_reference.py both exist
 and both run on this input already).  A tight tolerance against the dump would produce a FAIL that says nothing about
 the trunk, which is the mistake this file has already made once and retracted.
+
+THE TRUNK LOOP HAS NOW EXECUTED.  tools/trunk_gate, block 0, real weights, no pack.
+
+    ./build-glm5/trunk_gate glm5-block-l0 glm5-kda-l0-t1 glm5-ffn-l0 glm5-ref-dump5
+
+    dequantized raw_gate.bin  196608 blocks x 176 B -> 50,331,648 floats   (Q5_K, on device)
+    dequantized raw_up.bin    196608 blocks x 176 B -> 50,331,648 floats   (Q5_K, on device)
+    dequantized raw_down.bin  196608 blocks x 210 B -> 50,331,648 floats   (Q6_K, on device)
+    hc_init ne=[4096,4,5,1] 81920 floats;  l_out-0 ne=[4096,4,5,1] 81920 floats
+    engine l_out: rms 0.0058151   sum|.| 75.2591   (loop returned true)
+    dump   l_out: rms 0.00599831
+    worst absolute difference 0.0121585   ratio engine/dump rms 0.969458
+    TRUNK GATE: PASS
+
+What that is: hc_pre -> attn_norm -> KDA -> hc_post -> hc_pre -> ffn_norm -> dense FFN -> hc_post, in this order, on
+real weights, with the hyper-connection residual routing between the sites.  Every one of those stages had passed its
+own gate in isolation; none of them had ever run in sequence.  That was the whole reason for the tool, and it is now
+the first thing in this port that has executed as an assembly rather than as a part.
+
+The three ways an assembly can be wrong that no single stage can be are all checked and all clean: the loop returned
+true, the output is finite (not NaN, not inf), and it is not identically zero (sum|.| 75.2591 over 16,384 elements).
+
+THE COMPARISON IS REPORTED, NOT ASSERTED, and the number is worth reading rather than passing: the engine's block
+output is 3.1% BELOW the dump's rms (ratio 0.969).  That is consistent with this port's established finding rather
+than in tension with it - the dump is the OUTLIER at the block input (its hc_attn_pre is ~0.08% off while the engine
+and the oracle agree to seven significant digits), and the KDA's exponential gate amplifies exactly that difference.
+A 3% difference at the block output from a 0.08% difference at the input is the amplification this file already
+predicted, so the honest reading is that the assembly is broadly right rather than precisely verified.  PRECISE
+VERIFICATION NEEDS THE ORACLE'S l_out, not the dump's - glm5_hc_reference.py and glm5_kda_reference.py both already run
+on this input, and chaining them to produce block 0's expected output is the next gate.
+
+TWO MISTAKES THE TOOL CAUGHT, both in my own code and both of the class this port keeps having to relearn:
+
+  * SIX SIZE EXPECTATIONS WERE WRONG.  I had assumed hc_attn_fn was 4 streams x 4096 and hc_attn_base was 4 values;
+    they are 393,216 floats (24 x 16,384) and 24 values, exactly as the hc contract in this file says - fn (24,16384),
+    base (24,).  The loader I wrote trusts the FILE'S OWN LENGTH and treats my expectation as advisory and reported,
+    so all six were printed as NOTEs and the engine was given the tensors the files actually hold.  That is the third
+    time this session a size I inferred from geometry rather than measured was wrong, and the first time the file
+    itself was the authority instead of me;
+  * THE DEQUANTIZERS ARE DEVICE KERNELS.  The first run died with "dequant_q5_K launch: an illegal memory access was
+    encountered" because I handed them host pointers.  Caught by reading how ffn_gate.cpp does it - cudaMalloc,
+    cudaMemcpy to device, kernel, cudaMemcpy back, free - and now copied exactly, including its geometry refusal
+    (bytes / block_bytes * 256 != n_elems).
+
+Also: I wrote strata::core::kernels::glm:: for the weight structs AGAIN, in a new file, having fixed the identical
+mistake in layer_weights_gate.cpp one commit earlier.  Same fix, same assert.  It is the sixth time this session a
+guessed identifier has been caught by the compiler rather than by a test.
+
+WHAT REMAINS, unchanged in shape and now much smaller: the pack provider (routed blocks, FileExpertSource, native_fmt
+from the pack's own gu_type/d_type), the loop over all 45 blocks with KDA states and MLA caches, the head, and the
+token gate argmax == 12089.  The assembly is proven to execute; what is unproven is that it is numerically right, and
+that is what the oracle's block output would settle.
