@@ -236,7 +236,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
                 if (std::getenv("STRATA_NATIVE_TRACE") &&
-                    tensor.name.find("attn_q") != std::string::npos) {
+                    tensor.name.find("blk.0.") != std::string::npos) {
                     // What was ALLOCATED versus what a Q8_0 reader with the plan row's element count would READ.
                     std::fprintf(stderr,
                                  "native upload %s: gguf shape=%llu,%llu  ref=%d,%d  alloc=%llu B  "

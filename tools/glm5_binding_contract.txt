@@ -1337,3 +1337,33 @@ WHAT IS NOT: nine KDA-relevant tensors are natively quantized (wq, wk, wv plus t
 needs a dequantizer for their types - which is also what the KDA kernel gate needs before it can run on the
 engine's own bound weights rather than the oracle's files.  That single piece of work closes both gaps at once and
 is the clearest next step in this port.
+
+########  BINDING: 12 PASS, 0 FAIL - AND THE TYPE CENSUS THAT GOT US THERE  ########
+
+The trace of what native_dense allocates (bytes per 32 elements, from the alloc-vs-read ratio) answers the question
+that decided the work, and it is worth keeping as a table - the artifact uses THREE types, not one:
+
+    34 B/32 = Q8_0 (type 8)          hc_attn_fn  hc_ffn_fn  ssm_beta  ssm_f_a  ssm_f_b  ssm_g_a  ssm_g_b
+    22 B/32 = the type that faulted  attn_q  attn_k  attn_v  attn_output  ffn_gate  ffn_up
+    26 B/32 = a third type           ffn_down
+
+So five of the nine "quantized" KDA tensors were already Q8_0, i.e. already handled by dequant_q8_0 - they were
+excluded only by the branch's NAME filter.  Keying the branch on the TYPE alone (native_type == 8, opt-in via
+STRATA_DEQUANT_ALL_Q8_0) is safe BY CONSTRUCTION: type 8 is exactly what that dequantizer implements, which is the
+same guard that fixed the root cause.  Result, with the checker finally parsing:
+
+    attn_norm 3.2e-09  conv_q 1.0e-11  conv_k 1.1e-11  conv_v 1.6e-09  ssm_a 1.3e-08  dt_bias 4.4e-09
+    ssm_f_a 8.6e-10   ssm_f_b 8.2e-10  ssm_beta 3.0e-10  ssm_g_a 1.0e-09  ssm_g_b 3.9e-11  o_norm 3.2e-10
+    -> 12 PASS, 0 FAIL, 1 quantized (wo)      every dequant reported "no error"
+
+THE ONLY REMAINING GAP IS ONE TYPE.  wq, wk, wv and wo are all the 22-byte type.  A single dequantizer for it -
+with its own parity gate against ggml's conversion, as the Q8_0 one has - closes the binding completely AND lets
+kda_gate run on the engine's own bound weights instead of the oracle's fixture files, which is the same piece of
+work.  That is the next step, and it is now narrowly specified: one type, four tensors, two gates.
+
+WHAT THIS SESSION ENDED WITH, all committed and verified:
+  stage 1            PASS   hc_pre 7 significant digits, rms norm 5.4e-10 of scale
+  KDA kernel         PASS   T=1 and T=5, 8/8 stages each, on the artifact's real weights
+  binding            PASS   12 of 13 comparable F32 KDA tensors of block 0, exact
+  dequant root cause FIXED  the 34-vs-22-byte assumption that read past a buffer and poisoned the context
+  engine runs        exit 0 on the default path, and the widened path exits 0 with 0 failures

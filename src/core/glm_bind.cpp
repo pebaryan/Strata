@@ -119,9 +119,7 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             }
         } else if (std::getenv("STRATA_HC_DEQUANT") && w->native_type == 8 &&
                    ((full.size() >= 10 && full.compare(full.size() - 10, 10, "_fn.weight") == 0) ||
-                    (std::getenv("STRATA_DEQUANT_ATTN_Q") &&
-                     full.compare(0, full.find('.'), "blk") == 0 &&
-                     full.find(".attn_q.weight") != std::string::npos))) {
+                    (std::getenv("STRATA_DEQUANT_ALL_Q8_0")))) {
             // The hc function matrices (hc_attn_fn / hc_ffn_fn) are consumed as FLOATS by hc_pre, which reads
             // them as the ggml weight [hc*n_embd, (2+hc)*hc] - see the note in glm_hc.hpp.  Native serving
             // hands over Q8_0 blocks in the swapped orientation the ATTENTION kernels want, which is both the
