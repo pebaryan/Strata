@@ -435,3 +435,44 @@ by line, and compare each term against the reference dump - do not re-derive it 
 Suspects in order, all inside the recurrence: the decay's axis (per head i, not per channel j), whether the
 read happens before or after the update, the scale (1/sqrt(head_dim) = 1/sqrt(128)), and the placement of
 beta.  attn_output-0 is the pre-norm, pre-wo output, so the gated norm and wo are NOT yet implicated.
+
+## Part 14: the RECURRENCE bug, found by reading llama.cpp's own loop
+
+ggml/src/ggml-cpu/ops.cpp, ggml_compute_forward_kda's inner loop (the kda branch at :11002), with the state
+stored transposed as `s_out[j*S_v + i] = S[i][j]`:
+
+    decay    delta[i] = expf(g_d[i]);  for each row j: M[j][:] *= delta   ->  S[i][j] *= exp(g[i])
+    pred     sum = dot(row j of M, k)                                     ->  sum_i S[i][j]*k[i]   indexed by j
+    delta    delta[j] = (v_d[j] - sum) * beta_val                         ->  indexed by j
+    update   M[j][:] += k_d * delta[j]                                    ->  S[i][j] += k[i]*delta[j]
+    read     attn[j] = dot(row j of M, q) * scale                         ->  sum_i S[i][j]*q[i]   indexed by j
+
+So in the state, i is the KEY axis (it pairs with k in pred and q in the read) and j is the VALUE axis (it
+pairs with v and delta).  Our oracle's recurrence has them swapped:
+
+    pred  = np.einsum("hij,hj->hi", S, k)          contracts k on the VALUE axis
+    delta = (v[t] - pred) * beta[t][:, None]       indexed by i, not j
+    S    += np.einsum("hi,hj->hij", delta, k)      k and delta swapped
+    attn  = np.einsum("hij,hj->hi", S, q) * scale  contracts q on the VALUE axis
+
+This is not a relabeling and cannot be one, because the decay ties the axes to specific tensors: g is a
+per-key-channel quantity and llama.cpp decays i (the axis that pairs with k and q) while ours decays an
+axis that pairs with nothing.  Decaying one axis while contracting the other is a different recurrence.
+
+Corrected oracle (S[i][j] = key i, value j, matching the reference):
+
+    S    *= np.exp(g[t])[:, :, None]                    # decay the key axis
+    pred  = np.einsum("hij,hi->hj", S, k[t])            # contract the key axis with k, indexed by j
+    delta = (v[t] - pred) * beta[t][:, None]            # indexed by the value axis
+    S    += np.einsum("hi,hj->hij", k[t], delta)        # S[i][j] += k[i] * delta[j]
+    attn[t] = np.einsum("hij,hi->hj", S, q[t]) * scale  # read AFTER the update, scale = 1/sqrt(S_v)
+
+Note the decay line is unchanged - it already multiplies axis 1 of S, which is correct once the contractions
+are fixed.  The C++ kernel in src/kernels/glm_kda.cpp mirrors the oracle and needs the same correction.
+
+Why the parity gate passed 3/3: its fixtures were generated from this same oracle, so the wrong recurrence
+agreed with itself.  Third instance of the pattern (swiglu clamp, router bias, and now this): a gate whose
+inputs come from the implementation cannot detect a wrong implementation.
+
+Verification after the fix: attn_output-0 must drop from r +0.5267 (2.187e-02 on a 0.0243 scale) to
+agreement, and l_out-0 must follow.  That is the test; nothing less counts.
