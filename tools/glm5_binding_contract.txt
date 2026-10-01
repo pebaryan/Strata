@@ -563,3 +563,30 @@ tools/glm5_bind_check.cpp: confirm what cst is actually initialised from, and co
 code I think it is after four successive in-place edits to it.  Four edits to the same block is precisely how a
 stale binding like this creeps in, and it is the only remaining explanation that does not require CUDA to behave
 inconsistently with itself.
+
+STALE-cst HYPOTHESIS REFUTED TOO - THE LAMBDA IS EXACTLY AS IT APPEARS
+
+    :215  const cudaError_t cst = cudaMemcpy(dst.data(), q, want * sizeof(float), cudaMemcpyDeviceToHost);
+    :216  if (cst != cudaSuccess) { ... cudaGetErrorString(cst) ... }
+
+cst is assigned from this memcpy, nothing else.  So the call genuinely returns "invalid argument" in the stage and
+genuinely succeeds in the loop, for the same address, same count, same kind, in the same run, with nothing but
+host file I/O between them.
+
+EVERY hypothesis proposed this session has now been eliminated by measurement:
+    pointer kind (device/host/managed)     - the loop reads it as device, fine
+    the arena being freed or invalid       - the loop reads it fine
+    duplicate/stale entry in bound.tensors - the addresses printed are identical
+    sizing / type confusion                - want == n == 24, printed on both sides
+    ordering, and the hc_attn_fn copy      - base-first still failed; skipping fn still failed
+    destination vector being empty         - dst printed non-null, want 24
+    stale cst                              - refuted by reading :215
+
+THE ONE EXPERIMENT THAT DISTINGUISHES WHAT REMAINS: move the host_copy lambda's DEFINITION above the print loop
+and call it FROM the loop for hc_attn_base (the same tensor, the same vector type).  If the lambda succeeds there
+and fails in the stage, then two calls that are textually identical differ by their position in the program, and
+the difference is in what the compiler did to each - which is a disassembly question, not a reasoning one.  If the
+lambda fails in the loop as well, then the loop's own two copies differ from the lambda in some way that reading
+the source has not revealed, and the same disassembly question applies to those two.
+
+That is where this belongs now: stop reasoning about it from the source, and look at what was compiled.
