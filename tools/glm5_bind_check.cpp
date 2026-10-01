@@ -107,6 +107,16 @@ int main(int argc, char** argv) {
             continue;
         }
         std::fprintf(stderr, "  loopcopy %-22s t.ptr=%p n=%zu\n", t.name.c_str(), (const void*) t.ptr, n);
+        if (t.name == "hc_attn_base.weight") {
+            // Same scope, same vector type, same expressions as the stage lambda, immediately after the copy
+            // that just succeeded.  If this fails, the lambda's body differs from its appearance; if it
+            // succeeds, the difference between the loop and the stage is TEMPORAL.
+            std::vector<float> tmp;
+            tmp.resize(n);
+            const cudaError_t st2 = cudaMemcpy(tmp.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
+            std::fprintf(stderr, "  inloop 2nd copy of hc_attn_base: %s\n", cudaGetErrorString(st2));
+            fflush(stderr);
+        }
         host.resize(n);
         const cudaError_t st = cudaMemcpy(host.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
         if (st != cudaSuccess) {

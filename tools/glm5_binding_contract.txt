@@ -517,3 +517,25 @@ TEST: call the stage's copy path FROM INSIDE the print loop (before the loop's o
 vector type) and print both results for hc_attn_base.  If the lambda's copy succeeds there, the difference is
 temporal and lies between the loop and the stage; if it fails there too, the lambda's body differs from its
 appearance and the answer is in the two lines themselves.
+
+SOLVED AS FAR AS IT NEEDS TO GO - IT IS TEMPORAL, AND THE PRIME SUSPECT IS THE hc_attn_fn COPY
+
+    loopcopy hc_attn_base.weight  t.ptr=0x7f605a00c000  n=24
+    inloop 2nd copy of hc_attn_base: no error          <- the lambda's EXACT expressions, in the loop's scope
+    hostcopy hc_attn_base.weight  q=0x7f605a00c000  ne=24,0  want=24 -> "invalid argument"
+
+Same address, same count, same expressions: works inside the loop, fails in the stage.  So the lambda's body is
+correct and the difference is TEMPORAL - and it also explains why the base-first test did not refute the ordering
+idea: base was still copied AFTER the print loop, and the print loop copies hc_attn_fn before the stage runs.
+
+The loop copies in the tensor table's order, so hc_attn_base comes BEFORE hc_attn_fn - which is exactly why the
+in-loop second copy succeeds.  After hc_attn_fn's 393216-float copy, copies stop working:
+
+    hc_attn_fn = 393216 elements = 1.5 MB.  With STRATA_HC_DEQUANT=1 that buffer IS 1.5 MB (cudaMalloc(n*4)),
+    so the copy should be exactly in bounds... and yet everything after it fails.  In the DEFAULT path the same
+    loop reads 1.5 MB out of a 417792-BYTE Q8_0 allocation, which is an over-read, and that is the configuration
+    where "invalid argument" was first seen.
+
+TEST, one line, no new theory: in the print loop, SKIP the hc_attn_fn copy (or do it last) and see whether the
+stage's copies then succeed.  If they do, the hc_attn_fn read is what poisons the context and the remaining
+question is only why a correctly-sized 1.5 MB read does it.
