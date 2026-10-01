@@ -1398,3 +1398,30 @@ WHAT THAT MEANS FOR THE WORK, stated plainly because it is bigger than it looked
 STATE: stage 1 PASS; KDA kernel PASS at T=1 and T=5; binding 12 PASS 0 FAIL; dequant root cause fixed; engine exit 0
 on both paths.  Fixtures glm5-kda-l0-t1 and glm5-kda-l0-t5, gate tools/kda_gate.cpp, checker
 tools/kda_binding_check.py - all committed and working.
+
+THE REMAINING TYPES VERIFIED AGAINST GGML ITSELF - NOT AGAINST NAMES OR MY ARITHMETIC
+
+    395-404  ggml.h:  GGML_TYPE_Q5_0 = 6    GGML_TYPE_Q5_K = 13    GGML_TYPE_Q6_K = 14
+    353-355  ggml-common.h:  block_q5_K { ggml_half d, dm; uint8_t scales[K_SCALE_SIZE=12]; uint8_t qh[32];
+                            uint8_t qs[128]; }  -> 2+2+12+32+128 = 176 bytes
+    362-367  ggml-common.h:  block_q6_K { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; ggml_half d; }
+                            -> 128+64+16+2 = 210 bytes
+    both carry a static_assert(sizeof(...) == ...) so the sizes are compiler-checked, not documentation
+
+176 and 210 are exactly the two geometries measured from the trace's allocation sizes, and the type NUMBERS match
+the engine's own switch in native_mmvq.cu (case 13: 256 elems / 176 B, case 14: 256 / 210).  So the identification
+is now confirmed from two independent directions - the artifact's byte counts and ggml's own struct sizes - and the
+earlier chain of, first, calling this "22 bytes per 32 elements" and, second, calling the 26-byte reading a "third
+type", are both retired: 22 was 176/8 and 26 was 210*32/256.  One type family, K-quants, and two block sizes.
+
+THE WORK, FULLY SPECIFIED FOR WHOEVER PICKS IT UP:
+  1. transcribe dequantize_row_q5_K from ggml/src/ggml-quants.c into src/kernels/cuda/quantize_act.cu, in the same
+     "transcribed, not replaced" style as nearest_int and the Q8_0 path, exposing the same
+     `void dequant_qX_K(const uint8_t* blocks, float* x, int64_t n, void* stream)` shape;
+  2. give it a parity gate against ggml's own conversion before it is trusted - the Q8_0 one had one;
+  3. only then widen the bind-time dequant from native_type == 8 to {8, 13}, which is safe for the same reason 8
+     alone was: the guard must match the types a dequantizer actually implements;
+  4. re-run tools/kda_binding_check.py, which should then report 12 PASS and zero quantized, and re-run kda_gate
+     with the engine's own bound weights instead of the fixture files - the second gate.
+  5. ffn_down (type 14) is NOT needed for either KDA gate; transcribe it only when the ffn stage runs on bound
+     weights.
