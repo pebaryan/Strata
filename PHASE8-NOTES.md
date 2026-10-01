@@ -638,3 +638,36 @@ block 0 in the full run and compare against the driver's - that settles it in on
 The e2e test is the right top-level gate from here: it is cheap, it fails loudly, and its oracle side is
 verified against the golden tokens rather than assumed.  Chase every fix through it rather than through the
 per-tensor bisect alone.
+
+## Part 20: END TO END PASS - the trunk produces the reference's output
+
+With the conv1d layout fixed (part 19's diagnosis, applied in load_weights), the full 45-block trunk run and
+tools/glm5_e2e_test.py:
+
+    hidden state : corr +0.99338   max|d| 6.438e-01   (reference scale 9.262)
+    reference    : argmax 12089  (golden 12089)  OK
+    ours         : argmax 12089   logits corr +0.99628   relative err 8.9%
+    the reference's top token ranks 1 in our logits; top-5 overlap 5/5
+    E2E VERDICT: PASS
+      ours: [12089, 279, 825, 264, 7407]
+      ref : [12089, 279, 825, 264, 7407]
+
+Per-block l_out against the reference, same run: l_out-0 1.460e-03 r +0.9999, l_out-1 r +1.0000,
+l_out-2 1.605e-03 r +1.0000, l_out-3 (MLA) 2.190e-02 r +0.9999, l_out-4/5 (MoE) 2.2e-02 r +0.9999 - so the
+trunk is correct at every block, including the MLA and MoE blocks that had never been checked. What remains is
+fp32-vs-quantized rounding compounding with depth (0.6-3% per block).
+
+Clamp activity over this run: exp_gate 5, exp_up 3, shexp_gate 2, shexp_up 15 of 1890 calls.
+
+WHAT THE BUG WAS: one reshape. The artifact stores ssm_conv1d_{q,k,v}.weight as (d_inner, 1, d_conv) with
+d_conv fastest, so the (d_conv, d_inner) array the kernel wants is reshape(d_inner, d_conv).T; we loaded
+reshape(d_conv, d_inner), interleaving four channels' taps. It survived a long investigation because the gate
+and beta never touch the conv, so they measured perfect (r +1.0000) while q, k and v were scrambled - and
+because every parity gate's fixtures were generated from the same broken loader.
+
+REMAINING FOR A WORKING GLM-5.3 IN THE ENGINE (not the oracle):
+  1. src/kernels/glm_kda.cpp - the same conv layout fix in C++.
+  2. Regenerate the KDA fixtures and re-derive the parity gate from llama.cpp, not from our loader.
+  3. Wire the engine path and chase every step through tools/glm5_e2e_test.py.
+  4. Serving reality: ~75-85 GB resident vs 63 GB of VRAM+RAM on this box, so expect disk-streamed, low
+     tokens/sec. Correctness is now established; that part is throughput.
