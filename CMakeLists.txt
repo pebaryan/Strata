@@ -916,3 +916,13 @@ add_executable(block_gate tools/block_gate.cpp src/core/glm_layer.cpp src/core/g
                    src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp
                    src/kernels/cuda/quantize_act.cu)
 target_link_libraries(block_gate PRIVATE strata_kernels CUDA::cudart)
+
+# layer_weights_gate (branch glm5next-port): does glm_fill_layer_weights put each tensor in the RIGHT field?
+# A mapping mistake there is invisible - every pointer is a valid float* to a plausibly-shaped array - so
+# the pairs that would still "work" (f_a for f_b, o_norm for attn_norm, dt_bias for ssm_a) are asserted not
+# to hold, and a block with one tensor removed must fail naming it.  No pack, no CUDA, no expert source.
+add_executable(layer_weights_gate tools/layer_weights_gate.cpp src/core/glm_layer_weights.cpp
+                   src/core/glm_bind.cpp src/core/native_dense.cpp)
+target_include_directories(layer_weights_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(layer_weights_gate PRIVATE -O2)
+target_link_libraries(layer_weights_gate PRIVATE strata_kernels CUDA::cudart)

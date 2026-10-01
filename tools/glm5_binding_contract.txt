@@ -3631,3 +3631,35 @@ and the pieces that are new this session have each been compiled and symbol-chec
 WHAT HAS NOT HAPPENED: none of it has run together, and the trunk has never executed at all.  The remaining work is
 integration of verified parts, and the first execution is the first test of the assembly - which this port has learned,
 repeatedly, is a different thing from the sum of its parts passing their own gates.
+
+layer_weights_gate: THE PROVIDER'S MAPPING IS VERIFIED AT RUNTIME, 25 CHECKS PASS
+
+    tools/layer_weights_gate.cpp + a CMake target, run against the fixtures already on disk
+    ./build-glm5/layer_weights_gate /home/peb/moredata/glm5-block-l0 /home/peb/moredata/glm5-kda-l0-t1   -> PASS
+
+This is the FIRST runtime verification of any of this session's new chain code: everything else new - the two MoE
+paths, the trunk loop, the provider - had only been compiled and symbol-checked.
+
+It builds a GlmBoundBlock from fixture arrays (no pack, no expert source, no bound artifact) and asserts:
+
+  * all fifteen positive mappings, field by field: hc_attn_fn/base/scale, attn_norm, hc_ffn_fn, ffn_norm, and the KDA
+    set - wq, wk, ssm_a, dt_bias, ssm_f_a, ssm_f_b, o_norm, wo, attn_norm;
+  * the FIVE SWAPS THAT WOULD STILL "WORK", asserted not to hold: f_a against f_b's buffer, f_b against f_a's,
+    o_norm against attn_norm's, dt_bias against ssm_a's, ssm_a against dt_bias's.  These are the assertion that earns
+    the gate: every one of those mistakes yields a valid float* to a similarly-shaped array and a model that computes
+    something.  This port has already been bitten by exactly this class once - the size table where ssm_f_a was given
+    ssm_f_b's row - which is why the mapping got its own gate instead of being trusted because it compiled;
+  * the ONE TENSOR REACHED BY TWO NAMES: kda.attn_norm is the same pointer as w.attn_norm;
+  * a block with one tensor REMOVED fails, and the error names that tensor - checked by dropping ssm_f_b.weight and
+    requiring the message to mention it.
+
+A MID-COURSE CORRECTION WORTH RECORDING: the first run reported PASS while the mapping assertions had all been
+SKIPPED, because the dense FFN matrices are not in that fixture and the fill returns false before reaching them.  Two
+checks had passed and twenty-three had not run - a green result that tested almost nothing, which is the same shape as
+the earlier "no error output read as success".  The fix was to recognise that the provider assigns the common and
+attention fields BEFORE the FFN step, so a failure there does not invalidate them: the mapping checks now run
+regardless, and the failure is pinned to the dense FFN step by name.  A gate that reports PASS because it skipped
+everything is worse than no gate, because it produces confidence.
+
+Also corrected in the same pass: I had written `strata::core::kernels::glm::` for the weight structs, but the
+namespace is `strata::kernels::glm::` - caught by the compiler, which is the fifth guessed identifier this session.
