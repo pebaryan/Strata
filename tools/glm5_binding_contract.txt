@@ -2074,3 +2074,33 @@ thing that fails.  The fixture already contains all four (inter_xn.bin, inter_qc
 Adding them to the gate's stage list puts the divergence between two adjacent stages instead of across four, and
 the first comparison that fails names the operation: qc failing means xn @ wq.T + conv + silu, qc passing with q
 failing means l2_norm.  That is the next action, and it is cheaper than any hypothesis.
+
+THE SKIPPED-STAGE PLAN HITS AN INTERFACE LIMIT, AND NARROWS THE SUSPECTS ANYWAY
+
+kda_gate's table reports g, beta, q, k, v, attn, o - and that list is exactly what the engine's KdaIntermediates
+struct exposes.  xn, qc, kc and vc, which the fixture contains, are NOT available from the engine, so adding them to
+the comparison is an interface change (extend the struct, have kda_forward fill them), not a table edit.  Recorded so
+the next attempt does not start by editing the wrong file.
+
+The pattern narrows it further without that change.  In the oracle's recipe:
+    beta = sigmoid(xn @ ssm_beta.T)                    -> PASS
+    g    = from xn via ssm_f_*/ssm_g_*/ssm_a           -> PASS
+    q    = l2_norm(silu(conv1d(xn @ wq.T, conv_q)))    -> FAIL
+    k    = l2_norm(silu(conv1d(xn @ wk.T, conv_k)))    -> FAIL
+    v    = silu(conv1d(xn @ wv.T, conv_v))             -> FAIL, and much worse
+
+Two of the three failing stages are l2-normalized and the third is not, which explains why v fails worst: a
+magnitude error survives in v and is removed from q and k, while a DIRECTION error shows in all three.  So the
+conv/matmul/silu step is wrong for block 1, and it is wrong in a way that block 0 does not exercise.
+
+Everything feeding that step has already been excluded by check: xn (beta and g pass), the weights and their conv
+repack (the block-0 self-test reproduced all 16 w_*.bin at 0.000e+00), the conv geometry (block 1's ssm_conv1d_*
+are (8192, 1, 4), identical to block 0's), the binding (not on this path - kda_gate uses fixture weights), and the
+kernel in general (8/8 at two token counts on block 0).
+
+That leaves a data-dependent difference in the engine's conv/matmul/silu path - which is worth stating plainly
+because it is the opposite of the usual failure mode.  CHEAPEST DECISIVE PROBE, and it needs no interface change:
+the engine's q and k are printed by kda_gate, and if the engine normalizes correctly then each head's 128 values
+must have sum of squares 1.  Compute that from the fixture's engine-side output.  A unit-norm q with a wrong
+direction localizes the fault to qc; a NON-unit q localizes it to l2_norm itself, which would be a cleaner bug and a
+much shorter investigation.  That is one print, not a new build.
