@@ -130,8 +130,14 @@ def main() -> int:
             kw = KDA.load_weights(w.m, il)
             kda_out, _kmid = KDA.kda_block(kw, cur_raw.T, len(toks), want_state=True)
             attn_out = kda_out.T                                         # [n_embd, T]
+        # stage dumps for the bisection: the attention site's output, in the container convention
+        # write_tensor declares (ne0 fastest), which is what makes them comparable with the engine's.
+        if dump is not None:
+            DRV.write_tensor(dump, f"attn_output-{il}", attn_out)
 
         inpL = DRV.hc_post_3d(attn_out, residual, post, comb)
+        if dump is not None:
+            DRV.write_tensor(dump, f"hc_attn_post-{il}", inpL)
 
         # ---- FFN site
         residual = inpL
@@ -139,6 +145,8 @@ def main() -> int:
                                         w.tensor(p + "hc_ffn_scale.weight"),
                                         w.tensor(p + "hc_ffn_base.weight"))
         cur = DRV.rms_norm_ne0(cur, w.tensor(p + "ffn_norm.weight"))
+        if dump is not None:
+            DRV.write_tensor(dump, f"ffn_norm-{il}", cur)
 
         if il < DENSE_LEAD:
             lim = float(moe_m.meta["glm5next.swiglu_clamp_shexp"][il])
@@ -147,6 +155,8 @@ def main() -> int:
         else:
             outs = [MOE.moe_forward(moe_m, il, cur[:, t].astype(np.float64))[0] for t in range(len(toks))]
             ffn = np.stack(outs).T
+        if dump is not None:
+            DRV.write_tensor(dump, f"ffn_out-{il}", ffn)
 
         inpL = DRV.hc_post_3d(ffn, residual, post, comb)
         if dump is not None:

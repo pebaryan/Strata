@@ -4561,3 +4561,33 @@ confident, wrong answer about which half of the block is broken.
 This is the third time this session that verifying the FIXTURE came before using it, and it is the same rule each time:
 check that a fixture agrees with itself - or with an independent authority - before checking that the engine agrees
 with the fixture.
+
+BLOCK 3'S STAGE REFERENCES NOW COME FROM THE AUTHORITATIVE RUNNER, AND THE REF-DUMP DISAGREEMENT HAS A MECHANISM
+
+glm5_full_run.py - the runner whose full 45-block run is what produces token 12089 - now dumps four stage families in
+addition to l_out, for every block, on the same container convention (ne0 fastest):
+
+    attn_output-{il}    the attention site's output, before hc_post
+    hc_attn_post-{il}   the attention site's hc_post result
+    ffn_norm-{il}       the FFN site's normed input
+    ffn_out-{il}        the FFN's output, before hc_post
+
+A four-block run writes them (attn_output-3, ffn_norm-3, ffn_out-3, hc_attn_post-3, l_out-3 all present).  These are
+the references the bisection needs, and they come from the same code path as the token gate rather than from a second
+implementation.  Note the four-block run reports argmax 6196 against the expected 12089 - that is NOT a regression: a
+four-block run is not the model, and only the full 45-block run is gated on the token.
+
+AND THE REF-DUMP DISAGREEMENT IS NOW EXPLAINED, which sharpens the warning rather than softening it.  The same
+four-block run reports |l_out| 45.5243 for block 3, whose rms over 81,920 values is 0.159 - and the driver dump's
+l_out-3 rms is 0.158985821.  The two agree to four digits on a permutation-invariant quantity while their ELEMENTWISE
+comparison differs by 0.0219 (13.8%).  That is the signature of the same trap this session has already been bitten by
+once: an rms cannot see a layout error.  So the ref dump's block-3 values are most likely the right numbers in a
+different ORDER (the five-token axis being the obvious candidate), not wrong numbers - which is exactly why the check
+had to be elementwise, and exactly why a bisection run against it would have been misleading in a way that looked
+quantitative.
+
+NEXT STEP, now instrumented on one side only: the engine's own stages must be dumpable to complete the comparison.  The
+loop needs an optional stage callback - the same shape as the weight provider it already takes - so a gate can receive
+(layer, name, data, n) for each stage and compare against the files above.  With that, block 3's 6% splits into "before
+the FFN" or "the FFN" in one run: compare attn_output-3 to separate the attention site, and ffn_out-3 to separate the
+routed MoE.
