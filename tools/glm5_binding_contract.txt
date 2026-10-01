@@ -1531,3 +1531,30 @@ raw_q5k_blocks.bin, cudaMallocs the output, calls dequant_q5_K, copies back and 
 against oracle_dequantised.bin in python.  About forty lines and one CMake target, but it needs the header touched,
 a new file and a build - four steps, and this file should be the sixth port artifact that gets built in one pass
 rather than a fifth that gets patched repeatedly.
+
+########  STEP 2 DONE: dequant_q5_K IS BIT-EXACT AGAINST THE ORACLE  ########
+
+    raw blocks   131,072 x 176 B = 23,068,672 B, from GGUF shard 2, blk.0.attn_q.weight
+    engine       min -0.374668121  max +0.404712915
+    oracle       min -0.374668     max +0.404713
+    ELEMENTWISE  worst absolute difference 0.000e+00 over 33,554,432 elements
+                 elements differing by more than 1e-5 of scale: 0
+    Q5_K PARITY GATE: PASS
+
+Not within a tolerance - EXACTLY equal, element for element, over a 134 MB tensor.  The transcribed
+get_scale_min_k4 and dequantize_row_q5_K are therefore right, and right for the reasons that matter rather than by
+coincidence: the 6-bit scale/min unpacking, the two high-bit planes (u1/u2 shifted by 2 per 64-element group), the
+low/high nibble split within ql, and the per-block d/dmin halves all agree with an implementation that was written
+from the ggml spec independently of the C this was copied from.
+
+TOOLS: tools/q5k_parity.cpp (reads the raw blocks, runs the kernel, writes engine_output.bin, reports stats) with
+its own CMake target q5k_parity; the comparison itself is np.fromfile on the two files.  Fixture:
+/home/peb/moredata/glm5-q5k-parity.  This is the fourth working gate artifact in the port alongside glm5_bind_check,
+kda_gate and kda_binding_check.py.
+
+NEXT, and it is now small: widen the bind-time dequant's guard from native_type == 8 to {8, 13} and dispatch to the
+kernel by type - the branch currently calls dequant_q8_0 unconditionally, so a type switch is needed, not just a
+condition change.  That is safe for the same reason the type guard was: each dequantizer is called only for the
+type it implements, and this one has now been proven bit-exact rather than merely compiled.  Then
+tools/kda_binding_check.py should report 13 PASS and zero quantized, and kda_gate can be re-run with the engine's
+own bound weights instead of the oracle's fixture files - the last gate before the chain continues past attention.

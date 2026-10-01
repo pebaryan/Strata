@@ -191,6 +191,14 @@ target_include_directories(kda_gate PRIVATE /include)
 target_compile_options(kda_gate PRIVATE -O2)
 target_link_libraries(kda_gate PRIVATE strata_core strata_kernels CUDA::cudart)
 
+# Q5_K parity gate (branch glm5next-port): dequant_q5_K against the ORACLE's own dequantization of
+# blk.0.attn_q.weight, not against llama.cpp's C it was transcribed from.  Links strata_kernels, which holds the
+# kernel, and is the gate that must pass before the bind-time dequant is widened to type 13.
+add_executable(q5k_parity tools/q5k_parity.cpp)
+target_include_directories(q5k_parity PRIVATE /include)
+target_compile_options(q5k_parity PRIVATE -O2)
+target_link_libraries(q5k_parity PRIVATE strata_kernels CUDA::cudart)
+
 # MoE parity (branch glm5next-port): the router (sigmoid gating, the selection-only bias, top-8 of 288,
 # normalize-then-scale) and the expert/shared-expert FFNs, against tools/glm5_moe_reference.py.
 add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe.cpp)

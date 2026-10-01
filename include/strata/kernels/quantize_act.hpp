@@ -32,6 +32,11 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
 // The inverse, for round-trip checks: each element becomes `q * d16`.
 void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream);
 
+/// Dequantize Q5_K (ggml type 13, 176-byte blocks of 256 elements) - the type the GLM-5.3 pack uses for
+/// attn_q/k/v, attn_output, ffn_gate and ffn_up.  Transcribed from ggml-quants.c's dequantize_row_q5_K; see the
+/// note at its definition in quantize_act.cu, which also records that it is not yet gated against the oracle.
+void dequant_q5_K(const uint8_t* blocks, float* x, int64_t n, void* stream);
+
 // x (n floats) -> ggml's block_q8_K layout: 292 bytes per 256 elements
 //   { float d ; int8_t qs[256] ; int16_t bsums[16] }
 // n must be a multiple of 256.  `stream` may be null, in which case the call synchronises.
