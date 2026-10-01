@@ -5524,3 +5524,39 @@ staging's pointer arithmetic is reusing buffers across layers and the re-map is 
 Printing the bound block's own tensor pointers for layers 0 and 4 beside these answers it in one run - if the bound
 tensors differ and the mapped struct does not, the defect is in the mapping; if they are the same, the defect is that
 p->bound[4] was never distinct from p->bound[0].
+
+THE DEFECT THE DIFFERENTIAL FOUND, IN MY OWN STAGING, AND IT IS A LIFETIME BUG
+
+The provider does three things per layer and two of them are wrong together:
+
+    for (float* f : p->staged) std::free(f);        // free the PREVIOUS layer's host floats
+    p->staged.clear();
+    ...
+        t.ptr = h;                                  // repoint the BOUND BLOCK at this layer's staged buffer
+        t.quantized = false;                        // and mark it so it is never staged again
+
+    * A bound block is mutated PERMANENTLY: its tensor now points at a host buffer that belongs to the CURRENT layer and
+      is freed on the NEXT provider call.
+    * And because the quantized flag was cleared, the tensor is never re-staged, so the pointer is never refreshed.
+
+THEREFORE EVERY LAYER'S BLOCK HOLDS A DANGLING POINTER THE MOMENT THE NEXT LAYER IS ASKED FOR.  The trunk's token loop
+is OUTER - it runs all forty-five layers per token and the state carries across - so the second token walks blocks whose
+pointers were freed during the first, and the allocator having recycled those exact addresses is what makes the
+differential read as it does: layer 4's staged fields comparing EQUAL to layer 0's, because they are the same addresses
+recycled, and four device pointers matching across the two layers because the same aliasing reaches the mapped struct.
+
+AND THIS IS THE SAME SHAPE AS EVERYTHING ELSE IN THIS PORT, for the seventh time: the staging and the mapping are each
+correct in isolation and the LIFETIME between them is not.  glm_fill_layer_weights is pure assignment and says so; the
+staging is a dequantize-and-repoint and says so; nothing owns the question of how long a staged buffer must live, and the
+answer is longer than the code assumed.
+
+THE FIX, small and specific: the mutation must be UNDONE when the buffers are freed.  Keep a record per staged tensor -
+which block, which tensor index, its original pointer and its original quantized flag - and on the next provider call
+restore all three BEFORE freeing, so each layer's block returns to the state the binder left it in and the next visit
+re-stages cleanly.  That keeps the per-layer lifetime that makes the memory affordable, and it removes the aliasing,
+because a freed buffer will no longer be referenced by anything.
+
+A NOTE ON WHY THE FIRST TOKEN DID NOT FAIL AT LAYER 0 TOO: it did not need to.  Layer 0 is staged, runs, and is fine
+until layer 1 frees its buffers; the aliasing is only visible through a pointer that is read AFTER the free, and the
+first read of a stale pointer in this run happens to be a KDA field of a later layer.  The differential printed layers 0
+and 4 in the SAME pass, which is what made the recycling visible.
