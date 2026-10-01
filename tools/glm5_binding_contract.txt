@@ -875,3 +875,28 @@ Two things to carry in from the measurements already made: the conv orientation 
 repacks to [d_conv][d_inner], so the kernel's conv_w[k*d_inner + ch] indexing is satisfied), and the swiglu clamp
 of 10.0 applies to the ffn stage rather than here.  The T>1 state carry - phase 8's full debugging cycle - only
 matters once more than one token is run per call, which this gate does not need.
+
+KDA STAGE - WHERE IT STANDS, AND THE NEXT ACTION EXACTLY
+
+The KDA gate is one step from running, and the step is a single diagnostic:
+
+  * KdaGeometry{4096, 64, 128, 4} and kda_forward(w, g, x, tokens, out, ...) are confirmed
+    (include/strata/kernels/glm_kda.hpp:81), and kda_forward applies attn_norm internally - so the gate feeds
+    it the PRE-NORM hc_pre output and compares against kda_block(load_weights(m, 0), <same x>, 1), which
+    normalizes internally too.  Feeding the post-norm value would double-normalize.
+  * the tensor mapping (16 fields, recorded above) is right, BUT a lookup of those names in bound.tensors
+    returned MISSING for all sixteen - while the print loop reads blk.0.attn_norm.weight in the same run.  So
+    the names as they sit in bound.tensors are NOT simply "blk.<n>.<suffix>": they may carry a layer prefix, or
+    the print loop may be printing a name taken from somewhere other than Tensor::name.
+
+  NEXT ACTION, in order:
+    1. print bound.tensors[i].name for i < 8 (one fprintf) and read the real names off the screen - do NOT
+       assume the format again, which is what produced the MISSING result;
+    2. fill KdaWeights from those names, call kda_forward on the pre-norm hc_pre output;
+    3. copy the output back with cudaMemcpyDeviceToHost, write it to a file, and compare elementwise against
+       kda_block's first return value - elementwise, not min/max/sum, since that is now cheap and the oracle
+       gives the whole array.
+
+  AND THE PROCESS RULE, learned the hard way twice today: this driver must be edited by regenerating it or by
+  ONE targeted patch, never by multi-anchor string surgery - the attempt above deleted part of the stage block
+  and compiled stale, which is indistinguishable from a wrong result until the error text is read.
