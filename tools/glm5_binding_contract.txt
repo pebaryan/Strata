@@ -979,3 +979,31 @@ std::getenv twice and std::string::find on every row; neither is obviously dange
 needs a clean measurement rather than a story.
 
 REVERTED.  Verified state: 0 build errors, exit 0, stage 1 = -0.359747499 / 0.424176991 / 3.25002776.
+
+THE WIDENED-BRANCH FAILURE - EVERY MECHANISM NOW ELIMINATED, AND THE ONE REMAINING FORK
+
+Read rather than assumed, all in this session:
+
+  native_dense.cpp:231-235  the upload only proceeds when the GGUF tensor's shape equals the canonical ref's
+                            ne0/ne1, and sizes the buffer as native_mmvq_weight_bytes(type, ne0, ne1);
+  native_mmvq.cu:1447-1452  case 8 (Q8_0) -> block_elems 32, block_bytes 34, i.e. the ordinary ggml block
+                            format - so native_data IS raw Q8_0 blocks and the MMVQ-ness is in the access
+                            pattern, not the storage;
+  native_dense.cpp:259      native_data = item.data (a PER-TENSOR cudaMalloc), while only native_q8_1 is the
+                            shared scratch - so no weight aliasing either;
+  probe on blk.0.attn_q     plan ne=4096,8192 -> n=33554432 (correct), ttype=8, native_data live device
+                            pointer, pack bytes=0 (legitimate: the pack holds nothing for a native tensor);
+  10 consecutive runs       with STRATA_HC_DEQUANT=1 alone: 10/10 clean, 0 cudaMalloc failures, so the
+                            working configuration is deterministic, not flaky.
+
+So the element count, the buffer size, the buffer kind, the buffer's origin and the run-to-run stability are all
+now cleared, and my dequant's read extents match the allocation exactly.  THE ONLY REMAINING EXPLANATION IS ORDER
+OR THE CLAUSE ITSELF, and the single test that separates them is one fprintf: print every tensor the branch
+enters, in the order it enters, so the actual bind order is read off the screen rather than inferred from the print
+loop (which runs AFTER the bind and is therefore not the bind order - that inference is what made "hc_attn_fn is
+first" look like a fact).  If attn_q dequantizes BEFORE hc_attn_fn, the upstream-poisoning explanation is alive
+again and the target of interest is what attn_q's dequant does to the context; if it does not, the added clause is
+implicated and should be tested trivially-true in isolation.
+
+Note the pattern to break: four successive mechanisms were invented and then killed by one cheap read each.  The
+next session should make its FIRST act the order printout, not a hypothesis.
