@@ -59,3 +59,39 @@ instrument.  Two rounds of "the port disagrees with the reference" were actually
 disagrees with the reference's graph", and the thing that caught it was a relation that must hold by
 construction (a broadcast whose copies differ), not a tolerance.
 
+## Part 2: the read path, and where the diagnosis stands
+
+The scheduler's callback fires AFTER the node is computed and after `ggml_backend_synchronize`
+(ggml-backend.cpp:1824-1834: with a callback set, each node is computed alone as a one-node graph view,
+then synchronized, then reported).  The "it fires pre-compute" hypothesis is dead.
+
+The dumper now records PROVENANCE for every tensor - `view=Y/N`, `contig=Y/N`, strides, and the backend
+buffer name - because a dump that is wrong cannot otherwise be told from a dump of the wrong tensor.
+That immediately settled two of the anomalies:
+
+* `inp_embd` is a PLACEHOLDER, not data: the graph names two tensors `inp_embd` (the inputs-embeds
+  buffer and the real embedding lookup), the placeholder is written first, and for a token-based batch
+  nothing fills it.  Not a read bug.
+* the weights are dumped as the loader's VIEWS (`blk.0.hc_attn_scale.weight (view)`, view=Y contig=Y).
+  Comparing them against the file gives 180 exact agreements and 180 "disagreements" that are slices of
+  stacked per-layer tables, where the view's offset is not 0 - inconclusive, not a verdict.
+
+STILL UNEXPLAINED, and it is what blocks per-block localization: `hc_init` is recorded `view=N contig=Y
+nb=[4,16384,65536,327680]`, a MATERIALISED contiguous [4096,4,5,1] tensor whose four hc slices must be
+identical (the graph builds it with `repeat_4d`), yet they differ by 6.3e-02 - and dump5 is
+byte-identical to dump3, so it is not a torn write.  A contiguous materialised broadcast cannot have
+differing slices.  Three attempts to settle it from ggml's internals did not, and a fourth is not worth
+it: the measurement needs to be PROVEN right by construction, not argued right by inference.
+
+THE FIX TO BUILD NEXT: patch the fork's `graph::build` to append a `ggml_dup` COPY node for each tensor
+we want, with a unique name we choose, and read them after `llama_decode` returns (the graph's buffers
+stay valid until the next decode).  A copy materialises the value and gives a tensor whose `data` is
+unambiguous, and it removes the placeholder/duplicate-name problem at the same time.  An end-to-end read
+test belongs in the dumper either way: write a known pattern into the embedding input and confirm the
+dump returns it, BEFORE trusting any activation from the same path.
+
+Port state meanwhile: the trunk runs all 45 blocks to the logits; against the reference's
+`result_output` (validated: its argmax reproduces the sampled token) the correlation is +0.46, the right
+token ranks 331, top-50 overlap 2/50.  A partial semantic error accumulating over 45 blocks - and
+localizing it needs exactly the per-block ground truth this section is about.
+

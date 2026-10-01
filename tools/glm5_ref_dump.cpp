@@ -62,18 +62,27 @@ void dump_tensor(ggml_tensor * t) {
     std::replace(safe.begin(), safe.end(), '/', '_');
     const std::string path = g_d.dir + "/" + safe + ".bin";
 
+    // Provenance, recorded for EVERY tensor including the ones skipped below: which backend buffer it
+    // lives in, whether it is a view of something else, whether it is contiguous, and its strides.
+    // Without this a "wrong values" dump cannot be told from a "wrong tensor" dump.
+    char prov[256];
+    const char * bufn = t->buffer ? ggml_backend_buffer_name(t->buffer) : "(none)";
+    std::snprintf(prov, sizeof(prov), "view=%s contig=%s nb=[%zu,%zu,%zu,%zu] buf=%s",
+                  t->view_src ? "Y" : "N", ggml_is_contiguous(t) ? "Y" : "N",
+                  (size_t) t->nb[0], (size_t) t->nb[1], (size_t) t->nb[2], (size_t) t->nb[3], bufn);
+
     // A non-contiguous tensor is a VIEW (a broadcast, a permute, a reshape of something else).  Reading
     // its buffer yields the underlying bytes, not the values the graph sees through it - which silently
     // produced a "hc_init" whose four broadcast streams differed from each other.  Skip, and say so.
     if (!ggml_is_contiguous(t)) {
-        g_d.manifest << name << "\t" << t->ne[0] << "\t" << t->ne[1] << "\t" << t->ne[2] << "\t" << t->ne[3]
+        g_d.manifest << name << "\t" << t->ne[0] << "\t" << t->ne[1] << "\t" << t->ne[2] << "\t" << t->ne[3] << "\t" << prov
                      << "\t" << ggml_type_name(t->type) << "\tSKIPPED-NON-CONTIGUOUS-VIEW\n";
         return;
     }
     // Two tensors can share a name in this graph (the graph's inputs-embeds placeholder and the real
     // embedding lookup are both "inp_embd"), in which case one file overwrites the other.  Record which.
     if (g_d.seen.count(name)) {
-        g_d.manifest << name << "\t" << t->ne[0] << "\t" << t->ne[1] << "\t" << t->ne[2] << "\t" << t->ne[3]
+        g_d.manifest << name << "\t" << t->ne[0] << "\t" << t->ne[1] << "\t" << t->ne[2] << "\t" << t->ne[3] << "\t" << prov
                      << "\t" << ggml_type_name(t->type) << "\tDUPLICATE-NAME (already written)\n";
         g_d.dupes.push_back(name);
         return;
@@ -103,7 +112,7 @@ void dump_tensor(ggml_tensor * t) {
     o.write((const char *) f.data(), (std::streamsize) (f.size() * sizeof(float)));
     o.close();
 
-    g_d.manifest << name << "\t" << t->ne[0] << "\t" << t->ne[1] << "\t" << t->ne[2] << "\t" << t->ne[3]
+    g_d.manifest << name << "\t" << t->ne[0] << "\t" << t->ne[1] << "\t" << t->ne[2] << "\t" << t->ne[3] << "\t" << prov
                  << "\t" << ggml_type_name(t->type) << "\t" << safe << ".bin\n";
     g_d.dumped++;
 }
