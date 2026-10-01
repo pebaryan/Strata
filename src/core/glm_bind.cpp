@@ -115,6 +115,31 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             } else {
                 got.ptr = p;
             }
+        } else if (full.size() >= 10 && full.compare(full.size() - 10, 10, "_fn.weight") == 0) {
+            // The hc function matrices (hc_attn_fn / hc_ffn_fn) are consumed as FLOATS by hc_pre, which reads
+            // them as the ggml weight [hc*n_embd, (2+hc)*hc] - see the note in glm_hc.hpp.  Native serving
+            // hands over Q8_0 blocks in the swapped orientation the ATTENTION kernels want, which is both the
+            // wrong type (hc_pre would read ~1.5 MB out of a ~418 KB buffer: the segfault) and the wrong
+            // layout.  So take the artifact's own bytes and dequantize them once at bind time.
+            if (!w->native_data) { err = "glm_bind: " + full + " is not natively served"; return false; }
+            const int64_t n = (int64_t) t.ne0 * (t.ne1 > 0 ? t.ne1 : 1);
+            float* dev_f = nullptr;
+            if (cudaMalloc(&dev_f, (size_t) n * sizeof(float)) != cudaSuccess) {
+                err = "glm_bind: cudaMalloc failed for " + full; return false;
+            }
+            // w->native_data is the artifact's own Q8_0 blocks, already resident on the DEVICE and in the
+            // artifact's orientation (NativeDense copies them as they are).  dequant_q8_0 takes device blocks
+            // - handing it a host pointer faults and poisons the context, which is how the second call here
+            // came back as "cudaMalloc failed".
+            strata::kernels::dequant_q8_0((const uint8_t*) w->native_data, dev_f, n, stream);
+            if (stream) cudaStreamSynchronize((cudaStream_t) stream);
+            out.owned.push_back(dev_f);
+            got.ptr = dev_f;
+            got.quantized = false;
+            got.ne0 = t.ne0;                 // the artifact's orientation, NOT swapped
+            got.ne1 = t.ne1;
+            out.tensors.push_back(got);
+            continue;
         } else if (!w->native_data && w->bytes == 0) {
             // Marked natively served but not uploaded: NativeDense skips 3-D tensors (glm5next's MLA k_b/v_b,
             // whose blocks the MMVQ upload path cannot take), so their row exists and their data does not.
