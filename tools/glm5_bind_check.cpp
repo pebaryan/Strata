@@ -86,7 +86,7 @@ int main(int argc, char** argv) {
     cudaStream_t stream = nullptr;
     // GLM-5.3-Flash geometry, from the artifact's own metadata
     const int d_inner = 8192, d_conv = 4;
-    if (!bind_glm_block(v, block, d_inner, d_conv, bound, (void*) stream, err)) {
+    if (!bind_glm_block(v, block, d_inner, d_conv, shards, bound, (void*) stream, err)) {
         std::fprintf(stderr, "bind: %s\n", err.c_str()); return 1;
     }
 

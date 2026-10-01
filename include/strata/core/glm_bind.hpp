@@ -19,7 +19,12 @@ struct GlmBoundBlock {
     const float* find(const std::string& n) const;
 };
 
-bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv, GlmBoundBlock& out,
-                    void* stream, std::string& err);
+/// `gguf_shards` is needed for the tensors NativeDense marks but cannot upload: glm5next's 3-D MLA tensors
+/// (attn_k_b / attn_v_b and friends), whose MMVQ-path blocks are not the MLA kernel's layout.  The binding
+/// fetches those straight from the artifact, which is the one place the GGUF is the source rather than the
+/// pack.  Pass an empty vector and those tensors report that they are unavailable instead.
+bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
+                    const std::vector<std::string>& gguf_shards, GlmBoundBlock& out, void* stream,
+                    std::string& err);
 
 }  // namespace strata::core

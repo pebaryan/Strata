@@ -12,11 +12,15 @@
 ///      neighbouring constant or a remembered convention.
 #include <cuda_runtime.h>
 
+#include <memory>
+
 #include <cstdint>
 #include <string>
 #include <vector>
 
 #include "strata/core/glm_bind.hpp"
+
+#include "strata/artifact/gguf_reader.hpp"
 #include "strata/core/glm5_blocks_gen.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -73,8 +77,15 @@ static float* repack_conv(const float* src, int d_inner, int d_conv) {
 }
 
 /// Bind one GLM block's weights.  `block` only selects the `blk.<n>.` suffix, so this works for every layer.
-bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv, GlmBoundBlock& out,
-                    void* stream, std::string& err) {
+bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
+                    const std::vector<std::string>& gguf_shards, GlmBoundBlock& out, void* stream,
+                    std::string& err) {
+    // opened once per call and held for its duration, so a tensor can be found by name
+    std::vector<std::unique_ptr<strata::GgufFile>> ggufs;
+    for (const std::string& p : gguf_shards) {
+        try { ggufs.push_back(std::make_unique<strata::GgufFile>(p)); }
+        catch (const std::exception&) { /* a missing shard is reported per tensor */ }
+    }
     const std::string prefix = "blk." + std::to_string(block) + ".";
     const int n_rows = glm_block_row_count(block);
     if (!n_rows) { err = "glm_bind: no tensor table for block " + std::to_string(block); return false; }
@@ -109,9 +120,29 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv, GlmB
             // whose blocks the MMVQ upload path cannot take), so their row exists and their data does not.
             // The binding has to fetch these from the GGUF itself, in the layout the MLA kernel wants - that
             // is the remaining half of 9.1 rather than something to paper over.
-            err = "glm_bind: " + full + " is marked native but has no data (3-D tensor; the binding must "
-                  "fetch it from the GGUF itself)";
-            return false;
+            // Option (c): fetch it from the artifact itself.  NativeDense will not upload a 3-D tensor
+            // (the MMVQ path is 2-D by construction) and the pack does not hold it either, so the GGUF is
+            // the only source.  Copied once at bind time, not per token.
+            const strata::TensorInfo* found = nullptr;
+            strata::GgufFile* owner = nullptr;
+            for (auto& g : ggufs) {
+                for (const auto& ti : g->tensors()) {
+                    if (ti.name == full) { found = &ti; owner = g.get(); break; }
+                }
+                if (found) break;
+            }
+            if (!found) { err = "glm_bind: " + full + " is in no shard"; return false; }
+            const size_t nbytes = (size_t) w->ne0 * (size_t) (w->ne1 > 0 ? w->ne1 : 1) * 4;
+            float* dev3 = nullptr;
+            if (cudaMalloc(&dev3, nbytes) != cudaSuccess) { err = "glm_bind: alloc failed for " + full; return false; }
+            if (cudaMemcpy(dev3, owner->tensor_data(*found), nbytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                cudaFree(dev3); err = "glm_bind: upload failed for " + full; return false;
+            }
+            out.owned.push_back(dev3);
+            got.ptr = dev3;
+            got.quantized = true;
+            out.tensors.push_back(got);
+            continue;
         } else if (w->native_data) {
             // Served straight from the GGUF, which is the orientation the verified oracle works in, so this
             // must NOT be transposed.  Transposing it - which an earlier version of this file did - is trap 7
