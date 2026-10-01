@@ -164,7 +164,12 @@ def main() -> int:
         attn = kmid["attn"]                                          # (T, nh, hd), pre-norm/wo
         write_tensor(dump, f"kda_gate-{il}", np.transpose(g, (2, 1, 0)))        # [hd, nh, T]
         write_tensor(dump, f"kda_beta-{il}", beta.T[None])                      # [1, nh, T]
-        write_tensor(dump, f"attn_output-{il}", np.transpose(attn, (2, 1, 0)))  # [hd, nh, T]
+        # the reference's attn_output-N is [hd, nh, T]: a PER-HEAD tensor, so it is the value AFTER the
+        # within-head RMS norm and the sigmoid gate and BEFORE wo - not the raw recurrence output.  The raw
+        # one is kept under its own name because it is still useful for localizing inside the recurrence.
+        write_tensor(dump, f"kda_attn_raw-{il}", np.transpose(attn, (2, 1, 0)))   # [hd, nh, T] pre-norm
+        _o = kmid["o"].reshape(len(toks), KDA.NH, KDA.HD)                         # post norm+gate, pre-wo
+        write_tensor(dump, f"attn_output-{il}", np.transpose(_o, (2, 1, 0)))      # [hd, nh, T]
 
         inpL = hc_post_3d(kda_out.T, residual, post, comb)           # [n_embd, hc, T]
         write_tensor(dump, f"hc_attn_post-{il}", inpL)

@@ -538,3 +538,42 @@ THE RULE this phase keeps re-teaching, now four times over: before comparing two
 construction that they are the same quantity - the same guard that worked for rms_norm (verified to 6e-08)
 and for the gate (verified to 0.88%).  A tensor's SHAPE is the cheapest such evidence and it was sitting in
 the manifest the whole time: [hd, nh, T] cannot be a post-wo tensor.
+
+## Part 17: part 16 is also refuted, and the recurrence is where the half-agreement lives
+
+Part 16 argued attn_output-0 must be post-norm/post-gate because its shape is [hd, nh, T].  Measured by
+dumping that value instead:
+
+    kda_gate-0                4.373e-02   r +1.0000   (correct)
+    kda_beta-0                6.887e-04   r +1.0000   (correct)
+    attn_output-0 (raw rec.)  2.201e-02   r +0.5207
+    attn_output-0 (post-gate) 5.228e-02   r +0.2431   <- WORSE
+    l_out-0                   6.881e-02   r +0.4134
+
+So post-processing it made the agreement worse, which means attn_output-0 is the RAW recurrence output after
+all and the shape argument was wrong: a per-head tensor can be pre-norm, and [hd, nh, T] does not by itself
+imply "after the gated norm".  Part 16 retracted as well.
+
+What survives, and it is thin but measured:
+  * Everything up to and including kda_beta is correct (r +1.0000 to under 1% error).
+  * The recurrence output agrees only about half way (r +0.52), and neither candidate quantity matches.
+  * The block output is wrong (r +0.41), unambiguously.
+  * Changing the recurrence's contraction axes changes nothing (part 14), and post-processing the comparison
+    makes it worse (this part) - so the error is inside the recurrence's arithmetic or its inputs.
+
+THE NEXT TEST, and it is the one that separates the two remaining readings: run the oracle's recurrence with
+g REPLACED by the reference's own dumped kda_gate-0 instead of the oracle-computed gate.
+
+  * If attn then matches the reference, the recurrence code is right and the 0.88% gate error is amplified by
+    the dynamics (exp of a log-decay, applied 5 times, with g near -5 - a 0.04 absolute error in g is a 4%
+    compounding factor per step).
+  * If it still disagrees, the recurrence's arithmetic or its other inputs (q/k/v, the L2 norms, the v-path
+    silu, the scale) are wrong, and the search moves into those terms.
+
+That is one small script and it is cheap.  It also removes the gate from the equation entirely, which is what
+makes it decisive.
+
+Standing rule, now with four retractions behind it: a hypothesis about THIS operator is only worth acting on
+after the quantity being compared has been established by construction.  Parts 14, 16 and 9 were each
+killed by one cheap measurement; the pattern is that source-reading and shape-reasoning both feel like
+evidence and neither is.
