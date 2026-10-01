@@ -3990,3 +3990,21 @@ exactly the wrong conclusion.
 STATE: the trunk loop executes end to end and block 0 matches the oracle to the fp32 floor.  What remains is the pack
 provider for the routed blocks, all 45 blocks with KDA states and MLA caches, the head, and the token gate
 argmax == 12089.
+
+THE TOOL NOW REPORTS WHAT IT ACTUALLY MEASURES
+
+    engine l_out: rms 0.00595305
+    oracle l_out (same extent): rms 0.00595305
+    worst absolute difference 7.35745e-08   relative to rms 1.23591e-05   ratio 1
+
+The reference rms is now taken over the same extent as the comparison, so the ratio reads 1 instead of the 0.992576 the
+mismatched denominators produced, and the number beside the worst difference is the one that means something: 1.24e-05
+of rms - the fp32 floor this port measured independently on the block-1 FFN gate (1.480e-05).
+
+The retired NOTE is replaced rather than deleted.  It matters that the record shows the old text claimed the dump was
+the outlier and that no assertion was possible, and that both claims were symptoms of the double-norm bug: a future
+reader who finds only the corrected text will not know that this exact observation was used to excuse a real 3% error
+for most of a session.
+
+BLOCK 0 IS VERIFIED.  The assembly executes end to end and agrees with the oracle to 1.2e-05 of rms, which for fp32
+accumulation over a KDA block plus a 12288-wide SwiGLU with two dequantized operands is the arithmetic's own floor.

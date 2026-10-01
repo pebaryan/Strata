@@ -303,13 +303,22 @@ int main(int argc, char** argv) {
     if (want.size() >= out.size()) {
         double worst = 0.0;
         for (size_t i = 0; i < out.size(); ++i) worst = std::max(worst, std::fabs((double) out[i] - want[i]));
-        const double w_rms = rms_of(want);
-        std::printf("  dump   l_out: rms %.6g\n", w_rms);
-        std::printf("  worst absolute difference %.6g   ratio engine/dump rms %.6g\n", worst, e_rms / (w_rms ? w_rms : 1.0));
-        std::printf("  NOTE: not an assertion.  The dump is this port's known OUTLIER at the block input (its\n");
-        std::printf("        hc_attn_pre is ~0.08%% off while the engine and oracle agree to 7 digits) and the KDA's\n");
-        std::printf("        exponential gate amplifies exactly that difference, so a tight bound here would say\n");
-        std::printf("        nothing about the trunk.\n");
+        // The reference rms is computed over the SAME extent as the comparison.  The engine ran one token's worth of
+        // the file, so taking the reference's rms over all five tokens divides by a different population and prints a
+        // ratio that reads as a 0.7% error on a tensor that in fact agrees to 7.4e-08.  Measuring the two the same way
+        // is not tidiness: a reader who trusted that ratio would draw exactly the wrong conclusion about the block.
+        std::vector<float> want_slice(want.begin(), want.begin() + (ptrdiff_t) out.size());
+        const double w_rms = rms_of(want_slice);
+        std::printf("  oracle l_out (same extent): rms %.6g\n", w_rms);
+        std::printf("  worst absolute difference %.6g   relative to rms %.6g   ratio engine/oracle rms %.6g\n", worst,
+                    worst / (w_rms ? w_rms : 1.0), e_rms / (w_rms ? w_rms : 1.0));
+        std::printf("  NOTE: the previous text here said the dump was the outlier and that this could not be asserted.\n");
+        std::printf("        That is RETIRED.  The 3%% it described was a real bug - the KDA was normalised twice,\n");
+        std::printf("        once here and once inside the kernel - and with it fixed this comparison lands at the\n");
+        std::printf("        fp32 floor.  A tight bound IS meaningful, but only because the engine consumed the\n");
+        std::printf("        oracle's own input: a ne0-fastest file from the fixed write_tensor.  Earlier runs compared\n");
+        std::printf("        differently-arranged files through an rms, which is permutation-invariant and so could not\n");
+        std::printf("        detect that the two sides held different arrangements at all.\n");
     }
     std::printf("TRUNK GATE: PASS (the loop executed end to end on real weights; see the note on the comparison)\n");
     return 0;
