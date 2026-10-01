@@ -155,9 +155,14 @@ def load_weights(m: Model, layer: int) -> dict:
         "wq": m.tensor(p + "attn_q.weight"),
         "wk": m.tensor(p + "attn_k.weight"),
         "wv": m.tensor(p + "attn_v.weight"),
-        "conv_q": m.tensor(p + "ssm_conv1d_q.weight").reshape(D_CONV, D_INNER),
-        "conv_k": m.tensor(p + "ssm_conv1d_k.weight").reshape(D_CONV, D_INNER),
-        "conv_v": m.tensor(p + "ssm_conv1d_v.weight").reshape(D_CONV, D_INNER),
+        # The artifact stores these as (d_inner, 1, d_conv) with d_conv FASTEST, so the (d_conv, d_inner)
+        # array conv1d_causal wants is reshape(d_inner, d_conv).T.  reshape(d_conv, d_inner) instead
+        # interleaves four different channels' taps and is silently wrong.  Measured on block 0:
+        # reshape(d_inner,d_conv).T -> attn_output-0 corr +1.00000, 0.02% error
+        # reshape(d_conv,d_inner)   -> attn_output-0 corr +0.52073, 90.56% error
+        "conv_q": np.ascontiguousarray(m.tensor(p + "ssm_conv1d_q.weight").reshape(D_INNER, D_CONV).T),
+        "conv_k": np.ascontiguousarray(m.tensor(p + "ssm_conv1d_k.weight").reshape(D_INNER, D_CONV).T),
+        "conv_v": np.ascontiguousarray(m.tensor(p + "ssm_conv1d_v.weight").reshape(D_INNER, D_CONV).T),
         "ssm_a": m.tensor(p + "ssm_a"),
         "dt_bias": m.tensor(p + "ssm_dt.bias"),
         "ssm_f_a": m.tensor(p + "ssm_f_a.weight"),

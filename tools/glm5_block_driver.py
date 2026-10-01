@@ -167,9 +167,12 @@ def main() -> int:
         # the reference's attn_output-N is [hd, nh, T]: a PER-HEAD tensor, so it is the value AFTER the
         # within-head RMS norm and the sigmoid gate and BEFORE wo - not the raw recurrence output.  The raw
         # one is kept under its own name because it is still useful for localizing inside the recurrence.
-        write_tensor(dump, f"kda_attn_raw-{il}", np.transpose(attn, (2, 1, 0)))   # [hd, nh, T] pre-norm
+        # The reference's attn_output-N IS the raw recurrence output: correlating every intermediate
+        # against it gives attn +1.00000 with the conv layout fixed, o +0.24, q/k/g ~0.  Part 16 said
+        # otherwise and was wrong.
+        write_tensor(dump, f"attn_output-{il}", np.transpose(attn, (2, 1, 0)))    # [hd, nh, T]
         _o = kmid["o"].reshape(len(toks), KDA.NH, KDA.HD)                         # post norm+gate, pre-wo
-        write_tensor(dump, f"attn_output-{il}", np.transpose(_o, (2, 1, 0)))      # [hd, nh, T]
+        write_tensor(dump, f"kda_o-{il}", np.transpose(_o, (2, 1, 0)))            # [hd, nh, T]
 
         inpL = hc_post_3d(kda_out.T, residual, post, comb)           # [n_embd, hc, T]
         write_tensor(dump, f"hc_attn_post-{il}", inpL)
