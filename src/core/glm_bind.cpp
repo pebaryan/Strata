@@ -16,26 +16,17 @@
 #include <string>
 #include <vector>
 
+#include "strata/core/glm_bind.hpp"
 #include "strata/core/glm5_block0_gen.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/kernels/quantize_act.hpp"
 
 namespace strata::core {
 
-/// A block's bound weights: pointers the kernels can take, plus whatever this function had to allocate
-/// (dequantized blobs, and the repacked copies the two layout transforms require).
-struct GlmBoundBlock {
-    struct Tensor { std::string name; const float* ptr = nullptr; int ne0 = 0; int ne1 = 0; };
-    std::vector<Tensor> tensors;
-    std::vector<float*> owned;                 ///< device or host allocations made here
-    std::vector<void*> host_stage;             ///< host staging buffers (the transpose needs one)
-    ~GlmBoundBlock();                          ///< frees owned + host_stage
-
-    const float* find(const std::string& n) const {
-        for (const Tensor& t : tensors) if (t.name == n) return t.ptr;
-        return nullptr;
-    }
-};
+const float* GlmBoundBlock::find(const std::string& n) const {
+    for (const Tensor& t : tensors) if (t.name == n) return t.ptr;
+    return nullptr;
+}
 
 GlmBoundBlock::~GlmBoundBlock() {
     for (float* p : owned) if (p) cudaFree(p);

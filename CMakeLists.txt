@@ -170,6 +170,14 @@ add_executable(glm_kda_parity src/kernels/glm_kda_parity.cpp src/kernels/glm_kda
 target_include_directories(glm_kda_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_kda_parity PRIVATE -O2)
 
+# 9.1's pass check: bind layer 0 from the pack with the ENGINE'S OWN loader (WeightTable + LayerView) and
+# print a checksum per bound tensor, for tools/glm5_bind_check.py to diff against the verified oracle's
+# bound tensors.  A binding that compiles is not a binding that binds the right numbers.
+add_executable(glm5_bind_check tools/glm5_bind_check.cpp)
+target_include_directories(glm5_bind_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm5_bind_check PRIVATE -O2)
+target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::cudart)
+
 # MoE parity (branch glm5next-port): the router (sigmoid gating, the selection-only bias, top-8 of 288,
 # normalize-then-scale) and the expert/shared-expert FFNs, against tools/glm5_moe_reference.py.
 add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe.cpp)
