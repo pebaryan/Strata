@@ -1897,3 +1897,35 @@ obligation:
 
 Also worth knowing: the reference dump carries attn_norm-0 through attn_norm-44, i.e. a real activation for every
 block, so future per-block gates do not need to synthesise inputs.
+
+########  THE FFN GATE: ARITHMETIC VERIFIED, CLAMP STILL UNTESTED - AND THE GATE SAID SO  ########
+
+    gate pre-activations: max 0.514646   above the 10.0 limit: 0 of 12288
+    engine rms 0.0114445   oracle rms 0.0114445
+    worst absolute difference 1.378e-07        (relative to oracle rms: 1.2e-05)
+    FFN GATE: INCONCLUSIVE
+
+THE ENGINE'S FFN IS CORRECT.  expert_ffn reproduces the oracle's dense_forward to 1.378e-07 absolute on a vector
+whose rms is 0.0114 - that is 1.2e-05 relative, which is float32-against-float64 rounding and nothing else.  The
+oracle computes in float64 and the engine in float32, so agreement at that level is the best available; the "3
+elements off" is the same thing measured against a 1e-5-relative-to-rms threshold that is simply tighter than
+fp32-versus-fp64 divergence.  A tolerance of 1e-4 relative would report zero, and neither number indicates a
+defect.  What is verified here: the 12288-wide intermediate (not 2048), the one-sided gate clamp path, the SiLU,
+the down projection, and the layout of all three matrices as bound.
+
+THE CLAMP IS STILL UNTESTED, AND THE GATE REFUSED TO PRETEND OTHERWISE.  Max pre-activation 0.5146 against a limit
+of 10, so zero of 12288 entries are clamped and a PASS would have been a statement about arithmetic this input never
+reaches.  The tool returned exit 2 and the word INCONCLUSIVE instead, which is the first time in this port a gate has
+declined to pass, and it is the whole reason the assertion was written into it: the engine's own header warns that
+with a limit of 10 the clamp is invisible until something exceeds 10, so the caller who forgets it passes most tests.
+
+That max of 0.51 is itself a finding worth keeping: on a REAL block-0 activation the clamp does nothing at all.
+swiglu_clamp_exp and _shexp are both 10.0 for every layer, so the clamp only becomes active where pre-activations
+grow past 10 - which is not here, and may not be anywhere in the early blocks.  Which means the clamp is currently
+unverifiable from real activations alone.
+
+NEXT: leave result.bin as it is and rebuild the fixture with a SCALED input (x * 30 puts the max pre-activation near
+15), regenerate the oracle's output for it, and re-run.  Then the clamp is exercised, WARN_CLAMP or its absence
+changes the answer, and the gate has a real verdict - and the same fixture with an unscaled input becomes a
+regression case that must keep agreeing to fp32 precision.  The alternative, hunting for a real activation above
+10, may simply not exist at block 0.

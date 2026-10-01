@@ -199,6 +199,14 @@ target_include_directories(q5k_parity PRIVATE /include)
 target_compile_options(q5k_parity PRIVATE -O2)
 target_link_libraries(q5k_parity PRIVATE strata_kernels CUDA::cudart)
 
+# FFN gate (branch glm5next-port): block 0's leading dense FFN against tools/glm5_moe_reference.py's dense_forward.
+# Dequantizes the fixture's raw blocks with the two bit-exact K-quant kernels, and asserts that its own input
+# actually exceeds the clamp limit before reporting a verdict.
+add_executable(ffn_gate tools/ffn_gate.cpp src/kernels/glm_moe.cpp)
+target_include_directories(ffn_gate PRIVATE /include)
+target_compile_options(ffn_gate PRIVATE -O2)
+target_link_libraries(ffn_gate PRIVATE strata_core strata_kernels CUDA::cudart)
+
 # MoE parity (branch glm5next-port): the router (sigmoid gating, the selection-only bias, top-8 of 288,
 # normalize-then-scale) and the expert/shared-expert FFNs, against tools/glm5_moe_reference.py.
 add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe.cpp)
