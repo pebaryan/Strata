@@ -106,6 +106,7 @@ int main(int argc, char** argv) {
                         t.ne0, t.ne1, n);
             continue;
         }
+        std::fprintf(stderr, "  loopcopy %-22s t.ptr=%p n=%zu\n", t.name.c_str(), (const void*) t.ptr, n);
         host.resize(n);
         const cudaError_t st = cudaMemcpy(host.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
         if (st != cudaSuccess) {

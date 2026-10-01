@@ -494,3 +494,26 @@ is a read of the data, not another theory.
 
 NOT TO BE FORGOTTEN: everything above is about the DRIVER's readback.  The binding itself is verified in the
 default path (9.1's 12/12, re-measured at 24fca35), and stage 1 has still to print its first number.
+
+THE POINTERS ARE IDENTICAL - every structural difference is now eliminated
+
+    loopcopy hc_attn_base.weight  t.ptr=0x7f975400c000  n=24         -> reads -8 / 2.69234943 / -116.46156
+    hostcopy hc_attn_base.weight  q=0x7f975400c000  ne=24,0  want=24 -> cudaMemcpyDeviceToHost "invalid argument"
+
+Same address, same element count, same direction, same call, same process, same run.  So it is NOT a duplicate
+entry, NOT a stale pointer, NOT a size or type confusion, NOT ordering, NOT the destination vector being empty
+(dst=0x55fe03895d80 was printed, and want=24).
+
+What remains is that an identical CUDA call with identical arguments succeeds in one place and fails in another,
+which is not a property of the arguments - it is a property of the CONTEXT in which the call is made.  Two
+candidate mechanisms, both testable in one run:
+  1. the driver's cudaPointerGetAttributes calls (in the earlier arg probe / any remaining one) leave a sticky
+     error that cudaMemcpy surfaces as "invalid argument";
+  2. the lambda runs after something that changes the device's mapping state - the print loop's own last copy,
+     the binding's dequant, or arena-related setup - and calling the same copy from inside the print loop would
+     then also fail.
+
+TEST: call the stage's copy path FROM INSIDE the print loop (before the loop's own copy, same scope, same
+vector type) and print both results for hc_attn_base.  If the lambda's copy succeeds there, the difference is
+temporal and lies between the loop and the stage; if it fails there too, the lambda's body differs from its
+appearance and the answer is in the two lines themselves.
