@@ -2504,3 +2504,29 @@ STATE: blocks 0, 1, 2 and 4 pass the KDA gate 12/12.  Block 0 passes the FFN gat
 clamp verified by a demonstrated failure) and the hc_post gate (2.551e-07).  The block-1 FFN fixture is blocked on
 the size discrepancy above; nothing else about it is in question, and the weights for it dumped at the expected sizes
 (34,603,008 / 34,603,008 / 41,287,680 bytes, matching block 0's exactly).
+
+BLOCK 1's FFN MATCHES THE ORACLE AT THE fp32 FLOOR, AND THE CLAMP IS HONESTLY REPORTED AS UNTESTED
+
+    input.bin 16384 bytes = 4096 float32     <- the fix for the float64 write, confirmed by size
+    gate pre-activations: max 3.60009   above the 10.0 limit: 0 of 12288
+    engine rms 0.086581   oracle rms 0.0865809
+    worst absolute difference 1.281e-06   relative to oracle rms 1.480e-05   elements off: 0
+    FFN GATE: INCONCLUSIVE
+
+1.480e-05 of rms is the same figure block 0 shows and the same figure the fp32-vs-fp64 floor produces anywhere in
+this port, with zero elements outside tolerance - so block 1's FFN arithmetic, its 12288 intermediate and its three
+matrix layouts are correct on block 1's own weights.  The gate returns INCONCLUSIVE because the maximum gate
+pre-activation is 3.60 against a limit of 10, so the clamp does nothing on this input; a PASS would have been a
+claim about arithmetic the comparison never reached.  The scaled-input trick used for block 0 works here too if the
+clamp needs exercising on this block.
+
+THE DEFECT, RECORDED BECAUSE IT IS A RECURRING SHAPE: x was float64 and written with a bare tofile, so input.bin
+held 8-byte elements - 32768 bytes, which the gate read as 8192 float32s - while result.bin was written with an
+explicit dtype and was correct.  The gate refused on the size instead of gating on a mismatched input, and the cause
+was the TYPE, not the arithmetic.  This is the fourth instance in this session of a writer and a reader disagreeing
+about format: a dump container header read as data, per-site (view) slices taken for packed arrays, five derived
+array sizes wrong by up to 4096x, and now a float64 file read as float32.  The habit that catches all four is to
+print the byte count actually written at creation time and assert it against the intent.
+
+FFN GATE STATUS: block 0 PASS at the fp32 floor with the clamp verified by a demonstrated failure (clamp disabled
+costs 15000x over 4092 elements); block 1 matches at the same floor with the clamp untested on a real activation.
