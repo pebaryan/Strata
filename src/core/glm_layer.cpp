@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "strata/kernels/elementwise.hpp"
+#include "strata/kernels/glm_kda.hpp"
 
 namespace strata::core::glm {
 
@@ -38,6 +39,26 @@ bool glm_stage_hc_norm(const float* x, int n_embd, const float* hc_fn, const flo
         for (int i = 0; i < n_embd; ++i) layer_in[i] = layer_in[i] * rms * norm_w[i];
     }
 
+    return true;
+}
+
+/// Stage 2: the attention call.  Stage 1 has already produced the site's input, and for a KDA block that input is
+/// exactly what kda_forward consumes - the dump's attn_norm-N is the same quantity the gate passes as x.  So this
+/// stage adds no arithmetic: it calls the kernel with the block's bound weights and geometry.
+///
+/// `state` is the recurrent S matrix, nh*hd*hd floats, and MUST be zeroed for a fresh sequence.  The gate fixtures
+/// are all T=1 or a fresh T=5, so nothing here carries state across calls yet; a real sequential decode would.
+bool glm_stage_kda(const float* xn, const kernels::glm::KdaWeights& w, const kernels::glm::KdaGeometry& g,
+                   int tokens, float* out, float* state, std::string& err) {
+    if (!xn || !out || !state) {
+        err = "glm_stage_kda: null argument";
+        return false;
+    }
+    if (tokens <= 0 || g.n_embd <= 0) {
+        err = "glm_stage_kda: tokens and n_embd must be positive";
+        return false;
+    }
+    kernels::glm::kda_forward(w, g, xn, tokens, out, state, nullptr);
     return true;
 }
 

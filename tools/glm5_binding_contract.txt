@@ -2599,3 +2599,35 @@ the same shape convention as attn_norm-N.  Read the header, as always: hc_attn_p
 WHAT THIS MEANS FOR THE ASSEMBLY WORK: implement the order above in glm_layer.cpp, then check each stage against the
 matching dump family, then check l_out against the next block's real input by feeding it back in.  No new arithmetic
 and no new reference data are needed - both halves already exist.
+
+########  CHAIN ASSEMBLY BEGUN: glm_stage_kda, THE SECOND OF THE BLOCK'S STAGES  ########
+
+src/core/glm_layer.cpp now holds two stages:
+
+    glm_stage_hc_norm   hc_pre + the site's RMS norm        (stage 1, previously verified)
+    glm_stage_kda       the attention call                 (NEW: binds the KDA weight views and calls kda_forward)
+
+glm_stage_kda contains no arithmetic by design: for a KDA block, stage 1's output is what kda_forward consumes
+directly, so the function is the wiring that lets a chain call the verified kernel with a block's own bound weights.
+Its contract notes that `state` (the recurrent S matrix, nh*hd*hd floats) must be zeroed for a fresh sequence -
+every gate fixture so far is T=1 or a fresh T=5, so nothing carries state across calls yet, and a real sequential
+decode is a different test.
+
+THREE FILTERED VIEWS MISLED ME IN A ROW, and the fix was the same each time - a check that cannot be satisfied by an
+absence:
+
+  * the first build printed no error lines, which I read as success.  It had built a target that does not contain
+    glm_layer.cpp at all; the tell was "ninja: no work to do" after a touch, which I passed over;
+  * the second build printed "collect2: error: ld returned 1 exit status" while my grep, searching for "error:",
+    hid the undefined-reference line that said exactly what was wrong;
+  * only nm -C ... | grep -c glm_stage_kda settled it: 0 symbols in strata_core (the file is not in that target),
+    then 2 in glm5_bind_check once src/kernels/glm_kda.cpp was added to it.
+
+The lesson generalises: when the question is "did this compile", a symbol count answers it and an absence of error
+text does not.
+
+A USEFUL SIDE EFFECT: the linker's undefined-reference message printed the full demangled signature of kda_forward,
+which independently confirms the new stage calls it with the right seven arguments, right types, right namespace.
+
+STATE: the block has 2 of its 8 stages wired (hc_norm, kda).  Next in the order: hc_post (attn site), then the ffn
+site's hc_pre + norm, expert_ffn, and the final hc_post.  Every one of those already exists as verified code.

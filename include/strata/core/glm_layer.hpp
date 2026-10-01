@@ -13,6 +13,8 @@
 
 #include <string>
 
+#include "strata/kernels/glm_kda.hpp"
+
 #include "strata/kernels/glm_hc.hpp"
 
 namespace strata::core::glm {
@@ -35,5 +37,11 @@ namespace strata::core::glm {
 bool glm_stage_hc_norm(const float* x, int n_embd, const float* hc_fn, const float* hc_base,
                        const float* hc_scale, const float* norm_w, float* layer_in,
                        kernels::glm::HcMix* mix, float eps, void* stream, std::string& err);
+
+/// Stage 2: the attention call.  For a KDA block, stage 1's output is the kernel's input directly, so this adds no
+/// arithmetic - it is the wiring that lets the chain call the kernel with a block's own bound weights.
+/// `state` must be zeroed for a fresh sequence (nh*hd*hd floats).
+bool glm_stage_kda(const float* xn, const kernels::glm::KdaWeights& w, const kernels::glm::KdaGeometry& g,
+                   int tokens, float* out, float* state, std::string& err);
 
 }  // namespace strata::core::glm
