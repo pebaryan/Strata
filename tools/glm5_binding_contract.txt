@@ -2908,3 +2908,36 @@ EXPECT THE FIRST RUN TO DISAGREE SOMEWHERE.  The loop has never executed, and th
 routing at the two hc_post stages and the shape alternation between [n_embd] and [HC][n_embd] - both are float*, so a
 mistake there compiles and runs and produces wrong numbers rather than an error.  That is exactly why the comparison
 is per stage as well as end to end.
+
+KdaWeights AS DECLARED, AND WHY NO MAPPING TABLE IS NEEDED
+
+    include/strata/kernels/glm_kda.hpp:40
+
+    attn_norm  [n_embd]          wq/wk/wv  [d_inner][n_embd]     conv_q/k/v  [d_conv][d_inner]
+    ssm_a      [nh]  holds -exp(A_log)                          dt_bias     [d_inner]
+    ssm_f_a    [hd][n_embd]      ssm_f_b   [d_inner][hd]
+    ssm_beta   [nh][n_embd]      ssm_g_a   [hd][n_embd]          ssm_g_b     [d_inner][hd]
+    o_norm     [hd], the gain of ssm_norm                       wo          [n_embd][d_inner]
+
+Every size measured off the fixture matches one of those declared shapes exactly:
+
+    524,288 = hd x n_embd = 128 x 4096      (f_a, g_a)
+  1,048,576 = d_inner x hd = 8192 x 128     (f_b, g_b)
+    262,144 = nh x n_embd = 64 x 4096       (beta)
+         64 = nh                            (ssm_a)
+      8,192 = d_inner                         (dt_bias)
+        128 = hd                              (o_norm)
+
+So the "x64 / x128 / x32" sizes I first wrote were hd and n_embd in disguise, and the fixture's FILE names are the
+struct's FIELD names - dt_bias, o_norm, ssm_a, attn_norm and the rest.  The fill is therefore a mechanical loop over
+the sixteen, with no mapping table and no renaming: load w_<field>.bin into <field>.  That is worth having checked
+rather than assumed, because the two names that differ in the ARTIFACT (ssm_bias for dt_bias, o_norm for ssm_norm) are
+a different layer from the fixture, and this port has already been bitten once by assuming a name carried across.
+
+Also declared and useful: KDA_RMS_EPS = 1e-5f (attention.layer_norm_rms_epsilon), KDA_L2_EPS = 1e-6f, and
+KDA_GATE_LOWER = -5.0f, each named after the metadata key it comes from so the two eps cannot be swapped.
+
+The remaining work is unchanged and still unstarted: fill GlmBlockWeights, allocate x/l_out and a zeroed
+nh*hd*hd = 1,048,576-float state, call glm_block_forward, compare l_out and then each stage against the dump, then
+feed l_out-0 back in as block 1's input.  With the field names now known to be identical to the fixture's, step 1 is
+a loop rather than a table, which is the last thing that could have been got wrong in the loading.
