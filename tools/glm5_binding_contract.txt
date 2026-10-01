@@ -4319,3 +4319,50 @@ layer.  Its input is the oracle's l_out-2 and its reference is the oracle's l_ou
 45-block run, so no new oracle work is needed and the comparison is apples-to-apples by construction.  That single run
 would exercise BOTH branches of the loop that have never executed, and it is the last thing standing between this port
 and a 45-block run.
+
+THE ROUTED PATH ACCEPTS THE PACK'S REAL TYPES, AND ITS BLOB GEOMETRY MATCHES THE PACK'S TO THE BYTE
+
+The pack's native_experts.txt is fully specified - "layer gu_type d_type offset blob_bytes gate_off up_off down_off
+[shard] (n_expert 288, total 86406856704)" - and its very first data line is a surprise worth recording:
+
+    3  16 18 0 7536640 2365811904 2999168192 1434086592  GLM-5.3-Flash-UD-IQ1_S-00002-of-00003.gguf
+    4  19 18 2170552320 6488064 ...
+
+Layer 3's experts are gu_type 16 (IQ2_XXS) and d_type 18 (IQ3_XXS); layer 4 is 19 (IQ1_S) and 18.  Those are NOT the
+types this port's own dequantizers handle - dequant_q5_K (13), dequant_q6_K (14) and dequant_q8_0 (8) are what the
+BIND-TIME path uses for the dense tensors, and none of them covers an IQ type.  The routed path is not that path: it is
+ggml-cpu's, and native_fmt consults ggml's own type traits.  So the question was whether it accepts what the pack
+carries, and the answer is measured:
+
+    native_experts_available: yes
+    layer 3 (16,18)        OK  gu_act 15 d_act 15  bytes 7536640  act_bytes 4672  h_bytes 2336  gu_row 1056  d_row 784
+    layer 4 (19,18)        OK  gu_act 15 d_act 15  bytes 6488064  act_bytes 4672  h_bytes 2336  gu_row 800   d_row 784
+    for reference (13,14)  OK  gu_act 15 d_act 15  bytes 18415616
+    the pack declares blob_bytes 7,536,640 for layer 3
+
+TWO THINGS THIS ESTABLISHES, and the second is the one that matters:
+
+  * the native path ACCEPTS all three of the pack's real types, so the routed expert path is not blocked on quantizer
+    work.  gu_act and d_act are 15 = Q8_K, the vector-dot type both need, and act_bytes 4672 / h_bytes 2336 fit inside
+    the pool buffers - which are sized 4096*40/32+64 = 5184 and 2048*40/32+64 = 2624 BY THE BUILD FLAGS this branch
+    already uses (-DSTRATA_MODEL_H=4096 -DSTRATA_MODEL_FF=2048).  That is the second independent confirmation that
+    those two flags are right, after the fixtures;
+  * native_fmt's own `bytes` EQUALS the pack's declared blob_bytes - 7,536,640 for layer 3 and 6,488,064 for layer 4,
+    both exact.  The descriptor the engine computes and the geometry the pack declares AGREE TO THE BYTE on two
+    independent layers, which means an expert blob will be read at the correct stride.  A mismatch there would not have
+    looked like an error: it would have produced smoothly wrong expert outputs and been hunted as a numerical bug,
+    which is exactly the class of failure this port has spent the session learning to catch before it costs a day.
+
+ALSO RECORDED, because it cost a failed link here and will cost another: libstrata_kernels_cpu.a needs ggml's static
+libraries, and they are at
+
+    build-glm5/ggml/src/libggml-cpu.a   and   build-glm5/ggml/src/libggml-base.a
+
+NOT under build-glm5/_deps (nothing is there).  The probe linked with
+`libstrata_kernels_cpu.a libggml-cpu.a libggml-base.a -lpthread -lm`, and that is the line the block-3 gate and the
+chain target will need.
+
+STATE: the routed expert path's plumbing is now validated against the pack's real geometry, the dense half of block 3 is
+fixtures on disk with its shapes confirmed, and the oracle's l_out-2 / l_out-3 give that block's input and reference.
+What remains is the block-3 gate itself - the tool that binds those 21 tensors, opens FileExpertSource, fills moe_fmt and
+blob_fn, and calls glm_trunk_forward - which would be the first execution of the is_mla AND routed branches.
