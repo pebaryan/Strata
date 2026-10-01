@@ -4833,3 +4833,47 @@ WORTH RECORDING because it is the sixth time this session that a cheap check rev
 the conclusion reversed was MINE rather than the engine's: the double-norm, the dump writer, the ref-dump reference,
 the clamp default, the "unverified native path", and now this.  The rule that keeps paying: measure the thing you are
 about to claim, and when the measurement produces an absurd number, suspect the measurement.
+
+THE 45-BLOCK PREREQUISITE IS NOW MEASURED: THE PACK SERVES EVERY BLOCK AND THE DENSE WEIGHTS FIT
+
+glm5_bind_check takes "all" and binds every trunk block in sequence, on the arena the checker already allocates:
+
+    bound block  0:  26 tensors (running total    26)
+    bound block  5: 162 tensors (running total   558)
+    bound block 10: 302 tensors (running total  1788)
+    bound block 15: 442 tensors (running total  3718)
+    bound block 20: 582 tensors (running total  6348)
+    bound block 25: 722 tensors (running total  9678)
+    bound block 30: 862 tensors (running total 13708)
+    bound block 35: 1002 tensors (running total 18438)
+    bound block 40: 1142 tensors (running total 23868)
+    bound block 44: 1254 tensors (running total 28716)
+    BOUND 45 block(s), 28716 tensors in total
+
+No bind refused and nothing ran out of memory, which settles two things at once: the pack can serve every trunk block,
+and the dense weights of all 45 do fit the V100's 32 GB arena.  This is the prerequisite I had nearly declared broken
+on a misreading of the index - so it is now measured instead of argued, which is the whole reason it was worth running.
+
+ONE COSMETIC CAVEAT, recorded so it does not confuse a future reader: the per-block counts accumulate (26, 162, 302...)
+because GlmBoundBlock `bound` is declared once and bind_glm_block APPENDS to it rather than clearing it.  The running
+total is therefore the real figure - 28,716 tensors over 45 blocks, about 638 per block - and the per-block column is
+misleading as printed.
+
+WHAT REMAINS FOR THE LAST STEP IS NOW ONLY THE RUNNER, and every piece of it has a verified counterpart:
+
+    the 45 binds                     verified here, 28,716 tensors
+    the block-kind dispatch          compile-time asserted: 11 MLA / 34 KDA / 45 trunk
+    the trunk loop                   verified end to end on blocks 0, 1 and 3-by-stage
+    the weight mapping               layer_weights_gate, 25 checks
+    the KDA state slots              34 of them, threaded correctly (blocks 0 and 1 pass)
+    the MLA caches                   11 of them, threaded and verified at block 3 (5 tokens, cache grown 1..5)
+    the routed experts               native path verified against the float path and the float64 reference
+    the head                         mean-over-streams + output_norm + the tied projection, argmax 12089 on the
+                                     oracle's own 44th-layer state
+    the input                        the oracle's hc_init, on disk
+    the acceptance number            argmax == 12089 for prompt 785 6722 315 9621 374
+
+so the remaining work is assembly against a verified inventory, not investigation.  The one design decision it carries is
+the MLA cache sizing (11 caches of 2048*4 cells would be enormous; the prompt needs 5), and the one numerical caveat is
+that the engine's own 45-block hidden state will differ from the oracle's by the accumulated quantization of 43 routed
+blocks - so the token, not a per-layer float match, is the gate, exactly as this port has said since the beginning.

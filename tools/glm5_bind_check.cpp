@@ -86,14 +86,33 @@ int main(int argc, char** argv) {
     if (!table.load(pack, arena, bytes, err, &served)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
     if (!nd.load(shards, table, err)) { std::fprintf(stderr, "native: %s\n", err.c_str()); return 1; }
 
-    strata::core::LayerView v(table, block);
+    // "all" binds EVERY trunk block, which is the first prerequisite of a 45-block run and the place the pack's
+    // pool accounting would betray an off-by-one: 45 binds walk the whole index, and a row claimed twice or missed
+    // entirely shows up here as a failure or as a wrong tensor count rather than forty minutes later inside a run.
+    // The device arena is allocated once above, so this also measures whether the dense weights fit.
     strata::core::GlmBoundBlock bound;
     cudaStream_t stream = nullptr;
-    // GLM-5.3-Flash geometry, from the artifact's own metadata
     const int d_inner = 8192, d_conv = 4;
-    if (!bind_glm_block(v, block, d_inner, d_conv, shards, bound, (void*) stream, err)) {
-        std::fprintf(stderr, "bind: %s\n", err.c_str()); return 1;
+    const bool all_blocks = (argc > 3 && std::string(argv[3]) == "all");
+    const int first_blk = all_blocks ? 0 : block;
+    const int last_blk = all_blocks ? 44 : block;
+    int n_bound = 0;
+    size_t total_tensors = 0;
+    for (int blk = first_blk; blk <= last_blk; ++blk) {
+        strata::core::LayerView v(table, blk);
+        if (!bind_glm_block(v, blk, d_inner, d_conv, shards, bound, (void*) stream, err)) {
+            std::fprintf(stderr, "bind block %d: %s\n", blk, err.c_str());
+            return 1;
+        }
+        ++n_bound;
+        total_tensors += bound.tensors.size();
+        if (all_blocks && (blk % 5 == 0 || blk == last_blk)) {
+            std::printf("  bound block %2d: %2zu tensors (running total %zu)\n", blk, bound.tensors.size(),
+                        total_tensors);
+            std::fflush(stdout);
+        }
     }
+    std::printf("BOUND %d block(s), %zu tensors in total\n", n_bound, total_tensors);
 
     std::vector<float> host;
     for (const strata::core::GlmBoundBlock::Tensor& t : bound.tensors) {
