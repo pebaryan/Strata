@@ -2317,3 +2317,40 @@ Also worth knowing for whoever resumes: --selftest exists in the oracle (the end
 passing), and STRATA_BAD_CONV_FIXTURE=1 makes the writer emit conv weights in the WRONG order while the expected
 outputs were computed with the right one - the known-bad fixture this port requires a gate to reject.  Wave flagging
 that this exists: the gate has not yet been run against it.
+
+########  kda_gate IS NOW SHOWN TO FAIL ON A KNOWN-BAD FIXTURE - THE PORT'S RULE, SATISFIED  ########
+
+Controlled experiment: two fixture directories, byte-identical except the three w_conv_*.bin files, whose only
+difference is the ordering.  The bad one carries the raw artifact order, which the oracle measured at 90.56% error;
+the good one carries reshape(d_inner, d_conv).T, which it measured at 0.02%.
+
+    KNOWN-BAD (raw conv order)          GOOD (repacked conv order)
+    xn   PASS  7.026e-08                xn   PASS
+    qc   FAIL  9.216e-01                qc   PASS
+    kc   FAIL  9.838e-01                kc   PASS
+    vc   FAIL  1.039e+00                vc   PASS
+    attn FAIL  9.953e-01                attn PASS
+    o    FAIL  7.862e-01                o    PASS  1.895e-06
+    result FAIL 1.018e+00               result PASS
+    KDA GATE: FAIL                      KDA GATE: PASS
+
+TWO PROPERTIES, BOTH NOW DEMONSTRATED RATHER THAN ASSUMED:
+
+  * THE GATE HAS TEETH.  It rejects a fixture whose conv weights are in the wrong order, by a factor of about one -
+    a complete disagreement, matching the reference's own 90.56% for that ordering.  Until now kda_gate had never
+    been shown to fail on anything, which meant its PASSes were worth less than they looked.
+
+  * THE FAILURE IS LOCALIZED CORRECTLY.  xn still passes at 7.026e-08 on the bad fixture, which is exactly right:
+    the conv ordering cannot affect a stage computed before the convolution.  A gate that failed everywhere would
+    have been telling us nothing about where the fault was.
+
+The control matters as much as the test: the two directories differ ONLY in those three files, so the verdict change
+is attributable to the conv ordering and to nothing else.
+
+This also retroactively strengthens block 0's verification.  Its 12/12 PASS now carries a demonstrated capability to
+have failed - the difference between "the gate said PASS" and "the gate would have said FAIL if the weights were
+permuted".
+
+FIXTURES: /home/peb/moredata/glm5-kda-l0-t1 (good, 12/12 PASS) and /home/peb/moredata/glm5-kda-badconv (the same
+files with the three conv weight arrays transposed, expected FAIL).  Both are small and both are kept, so the
+known-bad case is permanent rather than something to reconstruct.
