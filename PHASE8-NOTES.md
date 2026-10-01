@@ -134,3 +134,30 @@ the dumper's read does.  After that, the provenance column makes every dump self
 nonzero device offset is only trustworthy if it came through the copy path.
 
 
+
+## Part 4: the CPU-forced read is also falsified - the last suspect is the interpretation
+
+The fork is patched (STRATA_DUMP_FILTER forces matched intermediates onto the CPU backend, reusing the
+same ggml_backend_sched_set_tensor_backend pattern the file already applies to "norm"/"l_last").  It
+works: hc_init's provenance moved from CUDA0 to CUDA_Host.  The values did not move at all:
+
+    hc_init (CUDA0)                  stream 0 vs 1 = 4.091e+00
+    hc_init (CUDA_Host, CPU-computed) stream 0 vs 1 = 4.091e+00   <- bit-identical
+    input read back (inp_embd)        max|d| against the pattern = 0.000e+00 (exact)
+
+Hypotheses now dead, in order of burial: callback fires pre-compute (source), mixed evaluations (source),
+the inp_embd placeholder (real, but not the cause), non-contiguous views (real, not the cause), the read
+API on device tensors (a real symptom, but not the cause), scheduler liveness under per-node evaluation
+(falsified by --only), and now tensor PLACEMENT (falsified by the CPU force).
+
+What remains, and it is a different kind of suspect: the assumption that this tensor IS what the source
+says it is.  hc_init is repeat_4d(reshape_3d(inp)) - a broadcast, so its four hc slices are identical BY
+CONSTRUCTION for any input, any backend, any read that addresses the right bytes.  The input reads back
+exactly.  The read of this tensor is stable under every variation I can make from outside.  So either the
+bytes are not this tensor's, or this tensor is not a broadcast.
+
+Next test, and it is cheap: stop inferring from the source and measure the tensor itself.  Ask for a
+tensor whose value is a KNOWN FUNCTION OF THE KNOWN INPUT and nothing else, and for hc_init ask the
+runtime for its shape AND its memory offset together in the same run, then check whether a read at
+t.data - off (i.e. the buffer base) is what another named tensor holds.  If the buffer base holds a
+neighbour, the read is losing the offset for host buffers too and the fix belongs in the dumper's read.
