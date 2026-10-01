@@ -3239,3 +3239,34 @@ GLM BINDING, stated accurately: glm_bind.cpp does not bind by tensor-name string
 generated table via glm_block_rows(block) (glm_bind.cpp:94).  So a grep for MLA tensor NAMES in it returns zero and
 means nothing; what matters is whether its per-block binding routine handles the MLA and MoE rows, which is the next
 thing to read rather than infer.
+
+CORRECTION TO MY OWN GAP LIST: MLA AND MOE BINDING IS NOT MISSING
+
+I wrote that "MlaWeights is not filled anywhere; only the KDA site has a binding path".  Reading glm_bind.cpp rather
+than inferring from a grep, that is wrong in a way worth recording:
+
+    bind_glm_block(LayerView, block, d_inner, d_conv, shards, out, stream, err)   glm_bind.cpp:82
+        const GlmTensorRow* rows = glm_block_rows(block);
+        for (int i = 0; i < n_rows; ++i) { ... }        <- EVERY row of that block, generically
+
+It does not classify rows by kind and does not care about tensor names beyond the one special case it documents
+(ssm_conv1d_{q,k,v}'s (d_inner,1,d_conv) layout, which it repacks).  So it binds an MLA block's attn_q_a / attn_q_b /
+attn_kv_a_mqa / attn_k_b / attn_v_b and a routed block's ffn_gate_inp / exp_probs_b / ffn_*_shexp exactly as it binds
+a KDA block's ssm_* - the table carries the rows, and the binder walks the table.  GlmBoundBlock::find(name) then
+looks any of them up by bare name.
+
+Phase 9.1 already demonstrated this empirically, which I should have re-read before writing the gap list: the binding
+check reported 13/14 for blocks 3, 4 and 44 - block 3 being MLA + MoE, block 4 KDA + MoE - with the single difference
+everywhere being ffn_gate_inp's documented BF16 policy.  So MLA and MoE blocks bind today.
+
+WHAT IS ACTUALLY MISSING, restated:
+
+  1. the loop over trunk blocks 0..44 that dispatches on glm_attention_is_mla / glm_ffn_is_dense   (needs writing)
+  2. per-kind packing of the BOUND tensors into KdaWeights / MlaWeights / MoeWeights               (needs writing)
+  3. the routed-expert source: eight {gate,up,down} triples per token from native_experts.txt      (the real work)
+  4. the MLA latent cache persisting across tokens, and the KDA state already threaded             (small)
+  5. the head - final norm, lm_head, greedy argmax - and the pack's tokenizer for decode           (needs writing)
+
+Items 1, 2, 4 and 5 are assembly over code that exists and is gated.  Item 3 is the one with genuine unknowns, and the
+inventory says it is narrower than it looked: the router, the selection bias and the shared expert are all ordinary
+per-block tensors that already bind, so the streamed pack only has to supply the eight selected experts' gate/up/down.
