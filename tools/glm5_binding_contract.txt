@@ -5727,3 +5727,43 @@ WHAT THE RUN DOES TODAY, and this is the state to hand over: forty-five of forty
 MLA caches advancing 1 through 5, a live input at rms 8.27e-3 and a live output at rms 8.27e-3, stopping at the last
 stage on a named null.  Every gate in the port passes at the fp32 floor or is explained by measured quantization; the
 chain has never been faster or further.
+
+THE ENGINE PRODUCES ITS OWN TOKEN - 3259, NOT 12089 - AND THE CHAIN IS COMPLETE
+
+    output_norm: 4096 floats, rms 1.43155, first 3: 1.5 1.28125 1.28906
+    hidden rms 1.357553
+    output.weight: 154880 rows of 4096
+
+    argmax = 3259   (logit 9.479389)   expected 12089
+    ENGINE TOKEN: MISMATCH
+
+WHAT CHANGED, AND IT WAS ONE THING: output_norm.weight IS 16,384 BYTES - 4096 floats, RAW, with no header - so read_dump
+parsed its first bytes as a header, produced no elements, and returned success.  onorm.data() on an EMPTY std::vector is
+guaranteed nullptr, not garbage, so the null the head reported was CREATED at that line and the head was telling the
+truth about an argument this code handed it.  An argument that is null is not always a binding failure - and this is the
+same lesson as everything else in this port, arriving at the last stage.
+
+THE HEAD NOW RUNS END TO END: output_norm reads at rms 1.43 with 1.5 / 1.28125 / 1.28906 for its first three values,
+which matches the earlier extraction (4096 floats, range [-0.0146, 1.98]); the mean over four streams produces a hidden
+state at rms 1.357553; the tied projection runs over all 154,880 rows; and the engine emits a token of its own from the
+real pack, through forty-five blocks and five tokens.
+
+THE TOKEN IS WRONG, AND THAT IS NOW A NUMERICAL QUESTION RATHER THAN A WIRING ONE.  The chain runs, the shapes are right,
+every stage is either verified at the fp32 floor or explained by measured quantization, and the answer is 3259 where the
+oracle's is 12089 with a logit of 9.48 - so something downstream is off by more than rounding, and the instrument that
+finds it is already built:
+
+    glm_trunk_forward takes a stage callback that reports (layer, name, data, n) for hc_attn_pre, attn_norm,
+    attn_output, hc_attn_post, hc_ffn_pre, ffn_norm and ffn_out - the same callback block3_gate used to localise block
+    3 to four verdicts, and the same pattern head_gate used to confirm the head to 4.77e-07.
+
+    AND THE REFERENCE EXISTS: the oracle's own l_out-44 is on disk, and the runner's input is the oracle's own hc_init, so
+    the two runs are directly comparable stage by stage from block 0 forward.  This is the bisection the port has done
+    three times already - once for block 0, once for block 1, once for block 3 - and the machinery is wired and proven.
+
+THE NUMBER TO START WITH IS THE ONE ALREADY FLAGGED: |l_out| = 0.008270 on every one of the five tokens.  A residual
+chain need not change its aggregate much token to token, but it should change it, and a constant across five different
+inputs is the signature of an output that does not depend on its input - which in a run whose input IS live narrows it to
+the token loop, the KDA recurrence, or the wiring of x into block 0.  Compare the engine's per-layer outputs against the
+oracle's at token 0 first: token 0 is where the lifetime and state questions do not arise, and if token 0 already
+disagrees, the defect is in a stage rather than in the state.

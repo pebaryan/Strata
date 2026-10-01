@@ -525,7 +525,33 @@ int main(int argc, char** argv) {
     // ---- the head: the mean over the four streams, then output_norm, then the tied projection
     std::vector<float> onorm;
     int ne_n[4] = {0, 0, 0, 0};
-    if (!read_dump(wnorm_path, onorm, ne_n)) { std::fprintf(stderr, "cannot read %s\n", wnorm_path.c_str()); return 1; }
+    // ---- output_norm: read it, and REFUSE rather than pass an empty vector on.
+    //
+    // This is the whole of the head's null.  onorm.data() on an EMPTY std::vector is guaranteed to be nullptr - not
+    // garbage, nullptr - so when read_dump parsed this file and produced no elements, the null the head reported was
+    // created right here, one line earlier, and the head was telling the truth about an argument this code handed it.
+    // The lesson is the same one this port keeps relearning: an argument that is null is not always a binding failure.
+    bool have_norm = read_dump(wnorm_path, onorm, ne_n) && (int) onorm.size() == N_EMBD;
+    if (!have_norm) {
+        onorm.assign((size_t) N_EMBD, 0.0f);
+        std::FILE* f = std::fopen(wnorm_path.c_str(), "rb");
+        if (f != nullptr) {
+            const size_t got = std::fread(onorm.data(), sizeof(float), (size_t) N_EMBD, f);
+            std::fclose(f);
+            have_norm = (got == (size_t) N_EMBD);
+        }
+    }
+    if (!have_norm) {
+        std::fprintf(stderr, "output_norm: %s is neither a dump with %d elements nor %d raw floats\n",
+                     wnorm_path.c_str(), N_EMBD, N_EMBD);
+        return 1;
+    }
+    {
+        double s2 = 0.0;
+        for (float v : onorm) s2 += (double) v * v;
+        std::printf("output_norm: %zu floats, rms %.6g, first 3: %.6g %.6g %.6g\n", onorm.size(),
+                    std::sqrt(s2 / (double) onorm.size()), onorm[0], onorm[1], onorm[2]);
+    }
     std::vector<float> hidden((size_t) N_EMBD, 0.0f);
     if (!C::glm::glm_stage_head_mean_norm(l_out.data(), HC, N_EMBD, onorm.data(), hidden.data(), err)) {
         std::fprintf(stderr, "head: %s\n", err.c_str());
