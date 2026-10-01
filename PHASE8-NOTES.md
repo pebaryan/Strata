@@ -407,3 +407,31 @@ claim about which operator is wrong is inference, not measurement.
 Also recorded from this run: clamp activity over 1890 calls was exp_up 1, shexp_up 10, everything else 0 -
 consistent with the earlier note that the swiglu clamp barely fires on real data even though it is a
 required term.
+
+## Part 13: the front end is CORRECT and the first error is the KDA RECURRENCE
+
+With the double-norm removed, the same block-0 chain that had been failing now reads:
+
+    hc_init         0.000e+00   r +1.0000   AGREES
+    hc_attn_pre-0   1.760e-05   r +1.0000   close
+    attn_norm-0     1.121e-04   r +1.0000   close
+    kda_gate-0      4.373e-02   r +1.0000   close      (was 56%: the double-norm, now 0.88%)
+    kda_beta-0      6.887e-04   r +1.0000   close      (was 12%, now 0.07%)
+    attn_output-0   2.187e-02   r +0.5267   DIVERGES   <-- the recurrence
+    l_out-0         6.960e-02   r +0.4130   DIVERGES
+
+So the fix in part 12 is vindicated on direct evidence (the gate and beta both drop to r +1.0000 and under
+1%), and the FIRST genuine error is the KDA recurrence itself: attn = (S @ q) * scale, with S updated by
+the delta rule.  The front end (conv1d+silu projections, the decay gate, beta, the L2 norms) is verified
+against the reference; the state update or the read is not.
+
+This also says something important about the KDA parity gate that passes 3/3: its fixtures were produced
+from the same understanding of the recurrence as the kernel, so a formula error agrees with itself and the
+gate cannot see it.  The authority for this operator is llama.cpp's ggml_compute_forward_kda in
+ggml/src/ggml-cpu/ops.cpp (kda = (neg0 == S_v); decay S[i][j] *= exp(g[i]); delta = (v - S k) * beta;
+S += delta (x) k; read AFTER the update, scale = 1/sqrt(S_v)).  Re-derive the oracle from THAT text, line
+by line, and compare each term against the reference dump - do not re-derive it from our own kernel.
+
+Suspects in order, all inside the recurrence: the decay's axis (per head i, not per channel j), whether the
+read happens before or after the update, the scale (1/sqrt(head_dim) = 1/sqrt(128)), and the placement of
+beta.  attn_output-0 is the pre-norm, pre-wo output, so the gated norm and wo are NOT yet implicated.
