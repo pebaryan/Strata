@@ -5265,3 +5265,41 @@ metadata, then a pointer and a size the MLA kernel's expectation can be checked 
 THE CHECK THAT SETTLES IT, and it needs no guess: the MLA parity fixture is the only verified statement of what
 mla_forward expects for wk_b and wv_b - its own gate matches to 0.000e+00 - so read the fixture's shape for those two
 tensors and compare it against what the fetch now hands over.  That is a comparison of two files, not an experiment.
+
+SETTLED, AND MY LAST COMMIT WAS WRONG: THE FETCHED TENSORS ARE Q8_0 BLOCKS, NOT FLOATS
+
+The comparison that settles it, run against the artifact and the fixture rather than reasoned about:
+
+    fixture:   wk_b (64, 512, 256) = (N_HEAD, KV_LORA, HEAD_DIM)
+               wv_b (64, 256, 512) = (N_HEAD, HEAD_DIM, KV_LORA)
+    artifact:  blk.3.attn_k_b.weight  type=8  shape=[256,512,64]  nbytes=8912896  dims=3
+               blk.3.attn_v_b.weight  type=8  shape=[512,256,64]  nbytes=8912896  dims=3
+
+TWO CONCLUSIONS, and the second one invalidates what I did in the previous commit:
+
+ 1. THE SHAPES AGREE, WITH NO TRANSPOSE NEEDED.  [256, 512, 64] is ggml's ne order (ne0 fastest) and reversing it
+    gives exactly the fixture's (N_HEAD, KV_LORA, HEAD_DIM), so the raw storage order flattened ne0-fastest IS the
+    array the fixture feeds mla_forward.  attn_v_b matches the same way.  So the layout question - which I had listed as
+    the prime suspect - is answered: it is right.
+
+ 2. THE ELEMENT SIZE IS THE BUG, AND THE ARITHMETIC IS EXACT.  64 * 512 * 256 = 8,388,608 elements, which as floats is
+    33,554,432 bytes - but the artifact declares 8,912,896.  Q8_0 is 34 bytes per 32 values, so 8,388,608 / 32 * 34 =
+    262,144 * 34 = 8,912,896, exactly the declared size.  THE TENSOR TYPE IS 8: these are Q8_0 BLOCKS and tensor_data()
+    hands back the blocks, not floats.
+
+    SO MY LAST COMMIT WAS WRONG.  It kept the host pointer (which is right - the blocks live in the artifact's own
+    mapping and the consumer is a CPU kernel) but recorded quantized = false and native_type = 0, which says a block
+    buffer is floats.  mla_forward then read Q8_0 blocks as floats: eight-byte pairs of scale and packed bytes
+    interpreted as three float registers, walking off the end of the buffer.  That is the SIGSEGV in mla_forward, and
+    it is mine, not the engine's.
+
+    AND THE OLD CODE WAS WRONG DIFFERENTLY, which is why it never faulted and never worked: it sized the copy as
+    ne0 * ne1 * 4 = 256 * 512 * 4 = 524,288 bytes - fourteen times SHORT of 8,912,896, and two dimensions of a
+    three-dimensional tensor - then marked it quantized with the sentinel type -1.  The staging refused it before any
+    kernel saw it, which is the only reason the port did not hit this earlier.
+
+THE FIX, and it is small: keep the host pointer, set quantized = true, set native_type to the artifact's own type (8),
+and carry the FULL element count across all three dimensions - 8,388,608, not ne0 * ne1 - so the staging's dequantizer
+produces the right number of values.  Which means the bound Tensor needs either a third dimension or the total count
+recorded, since its ne0/ne1 pair cannot express a 3-D tensor; that is the same four-byte-shaped gap the native_type
+field closed one commit ago, and it is the last thing standing between the trunk and layer 3.
