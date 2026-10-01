@@ -248,7 +248,15 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                                  (unsigned long long) tensor.shape[0] * (unsigned long long) tensor.shape[1] / 32 * 34);
                 }
                 void* allocation = nullptr;
-                auto status = cudaMalloc(&allocation, bytes);
+                // MANAGED, NOT cudaMalloc, and this is the last of the port's device-vs-host defects.  A bound block
+                // feeds CPU kernels and CUDA kernels from the SAME pointers - hc_pre, rms_norm, kda_forward and
+                // mla_forward read what the GPU matmuls also read - and only managed memory is readable from both.
+                // With a private device allocation a CPU kernel's first dereference is a SIGSEGV, which is what the
+                // engine's 45-block run has been doing since it reached layer 3: seven of the eight MlaWeights
+                // pointers came back 0x7fe9... while the one the runner had dequantized itself was 0x5623..., and
+                // since the managed ARENA was demonstrably host-readable and these still faulted, they were provably
+                // not in the arena.  The same reasoning the arena's own comment already records, one allocation down.
+                auto status = cudaMallocManaged(&allocation, bytes, cudaMemAttachGlobal);
                 DevicePtr data(allocation);
                 if (status == cudaSuccess)
                     status = cudaMemcpy(data.get(), gguf.tensor_data(tensor), bytes, cudaMemcpyHostToDevice);
@@ -262,7 +270,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         }
         if (pending.empty()) { err = "native dense: no supported GDN/QSA matrices in supplied shards"; return false; }
         void* allocation = nullptr;
-        const auto status = cudaMalloc(&allocation, strata::kernels::native_q8_1_bytes(max_in));
+        // managed for the same reason: this scratch is written by the GPU quantizer and read by whatever consumes
+        // the result, and the port has already been bitten once by assuming which side of the bus a consumer is on.
+        const auto status = cudaMallocManaged(&allocation, strata::kernels::native_q8_1_bytes(max_in));
         DevicePtr scratch(allocation);
         if (status != cudaSuccess) { err = std::string("native dense scratch: ") + cudaGetErrorString(status); return false; }
         // All checks and allocations finish before publishing any reference.

@@ -5466,3 +5466,32 @@ component that passes its own gate while the wiring around it is wrong.  The MLA
 ordinary host memory; the binder's gates never ask a CPU kernel to read a bound tensor; and the pointer that decides is
 made one layer down in the projection, where no gate was looking.  Each fix moved the crash one kernel further and left
 one more allocation site to check, and this is the last site.
+
+THE MANAGED FIX WORKS: LAYER 3 PASSES, THE RUN ADVANCES TO LAYER 4, AND THE ERROR IS NAMED
+
+    native_dense.cpp:259   cudaMallocManaged(&allocation, bytes, cudaMemAttachGlobal)   <- was cudaMalloc
+    native_dense.cpp:275   the q8_1 scratch, managed for the same reason
+
+    trunk failed at token 0: glm_trunk_forward: layer 4 KDA: glm_stage_kda: null argument
+
+THE FIRST MLA AND ROUTED BLOCK NOW EXECUTES IN THE ENGINE'S OWN RUN FROM THE REAL PACK.  Blocks 0, 1 and 2 were already
+running; layer 3 - the MLA, the one that has been the subject of every finding since the routed path was first gated -
+now completes, and the trunk proceeds to layer 4 and stops on a NULL ARGUMENT reported by name.
+
+That the failure is now "null argument" rather than a segfault is the sixth time in this port that fixing one thing moved
+the boundary exactly one step, and the sequence has been monotone: unexecutable, then blocks 0..2, then layer 3, now
+layer 4.  It is also the first failure this session that names a LAYER AND AN ARGUMENT rather than a kernel, which is the
+error-reporting discipline paying off - the trunk was written to return "layer N <stage>: <reason>" precisely so a
+failure would name a block, and it does.
+
+WHY THE MANAGED FIX WAS RIGHT AND WHY THE ARGUMENT FOR IT WAS DECISIVE RATHER THAN PLAUSIBLE: the native projection
+uploaded every GGUF-native tensor to a private cudaMalloc, and the trunk's kernels are CPU-side.  The eight MlaWeights
+pointers showed seven 0x7fe9... against one 0x5623..., and since the ARENA was already managed and demonstrably
+host-readable, a fault in those seven proved they were not in the arena - a private allocation, one layer below the
+binder, where no gate was looking.  The fix is the same sentence the arena's own comment already carried.
+
+WHAT REMAINS: layer 4's KDA receives a NULL argument.  The KDA weights come through glm_fill_layer_weights like every
+other layer's, so this is most likely one tensor the pack names differently than the mapping expects on a KDA layer, or
+one that glm_fill_layer_weights leaves unset when a name is absent - which is exactly the kind of thing the next
+diagnostic answers, and it is the same diagnostic that just worked: print the KdaWeights fields for layer 4 by name, the
+way the eight MlaWeights pointers were printed for layer 3.  That diagnostic found the last defect in one run.
