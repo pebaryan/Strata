@@ -2453,3 +2453,30 @@ the block computes the right answer from the real hidden state.
 FIXTURES: glm5-kda-l0-t1 (block 0, 12/12), glm5-kda-l1-oracle (block 1, 12/12), glm5-kda-l2-oracle (block 2, 12/12),
 glm5-kda-l0-t5 (block 0 at T=5), glm5-kda-badconv (known-bad, must FAIL).  Tools: split_raw_fixture.py,
 make_kda_fixture.py (superseded - keep for reference, prefer the oracle's writer).
+
+########  BLOCK 4 PASSES 12/12 ACROSS A BLOCK-KIND BOUNDARY  ########
+
+    result 2.783e-06   xn 8.791e-08   qc 1.074e-06   kc 1.073e-06   vc 2.555e-06
+    g 6.950e-07   beta 7.876e-07   q 1.360e-06   k 1.529e-06   v 2.555e-06
+    attn 2.415e-06   o 2.023e-06                        KDA GATE: PASS
+
+Blocks 0, 1, 2 and 4 now pass every stage the gate compares - four blocks, including one beyond
+leading_dense_block_count=3, so the KDA path is verified across the boundary where the block kind changes from
+dense to MoE.  Block 3 is of a different attention kind (MLA) and is not covered by this gate at all.
+
+The splitter's aggregate check reported the SAME total, 551273496 bytes, for blocks 1, 2 and 4, and passed for all
+three.  Since the table is measured rather than derived and the check requires the sizes to consume the file
+exactly, that identical figure is positive evidence the KDA geometry is uniform across the model - and if any block
+had differed, the check would have refused rather than produced a misaligned read.  That is the property the
+hand-rolled fixtures never had.
+
+METHOD, now settled and worth reusing verbatim for any further block:
+    glm5_kda_reference.py --gguf GGUF --layer N --tokens T --raw-fixture RAW
+    split_raw_fixture.py RAW OUTDIR
+    kda_gate OUTDIR T
+Three commands, no hand-rolled conversion, and both tools verify their inputs on the way.  Blocks 0-2 cost one
+investigation each to establish and block 4 cost one command.
+
+SCOPE, unchanged: the KDA stage on these blocks' real weights, at T=1.  The FFN and hyper-connection stages are
+verified for block 0 only, and the chain is not verified at all - the gate's inputs come from the oracle's seed, not
+from block N-1's output.
