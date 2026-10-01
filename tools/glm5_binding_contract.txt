@@ -2354,3 +2354,36 @@ permuted".
 FIXTURES: /home/peb/moredata/glm5-kda-l0-t1 (good, 12/12 PASS) and /home/peb/moredata/glm5-kda-badconv (the same
 files with the three conv weight arrays transposed, expected FAIL).  Both are small and both are kept, so the
 known-bad case is permanent rather than something to reconstruct.
+
+########  THE ORACLE'S RAW FIXTURE: EXACT LAYOUT, AND WHY IT CANNOT BE INCONSISTENT  ########
+
+glm5_kda_reference.py --raw-fixture FILE writes ONE binary file:
+
+    struct.pack("<6i", N_EMBD, NH, HD, D_CONV, tokens, layer)          # 24-byte little-endian header
+    then 17 float32 arrays:
+        attn_norm, wq, wk, wv, conv_q, conv_k, conv_v, ssm_a, dt_bias,
+        ssm_f_a, ssm_f_b, ssm_beta, ssm_g_a, ssm_g_b, o_norm, wo, x
+    then 11 float32 arrays:
+        qc, kc, vc, g, beta, q, k, v, attn, o, result
+
+THE PROPERTY THAT MAKES THIS THE RIGHT FIXTURE SOURCE: the weights it writes are the very arrays the model loader
+handed to kda_block, and the intermediates are that same call's return.  Nothing is recomputed, reordered or
+re-derived on the way out, so a raw fixture is self-consistent BY CONSTRUCTION - it cannot exhibit the defect block
+1's directory has, where inter_qc is not what the fixture's own xn, wq and conv_q imply.  Every hand-rolled
+conversion step disappears if the gate consumes this.
+
+STRATA_BAD_CONV_FIXTURE=1 makes the writer emit the conv weights in the wrong order while the expected outputs were
+still computed with the right one - the known-bad case, built into the reference rather than reconstructed by hand.
+Its comment says why the flip has to live in the writer and not the loader: "wrong against wrong ... and the gate
+would pass - which is exactly how the original defect survived every gate."
+
+HOW TO CONSUME IT WITHOUT TOUCHING kda_gate: split the raw file into the 29-file directory layout the gate already
+reads.  All array sizes follow from the header and the known shapes - attn_norm 4096, wq/wk/wv 8192x4096,
+conv_q/k/v 4x8192, ssm_a and dt_bias 64 and 128 respectively (measure which, do not assume), ssm_f_a/g_a 128,
+ssm_f_b/g_b 8192, ssm_beta 64, o_norm 128, wo 4096x8192, x tokensx4096, qc/kc/vc/o tokensx8192, g/q/k/v/attn
+tokensx8192, beta tokensx64, result tokensx4096.  A splitter should ASSERT that the sizes it assigns consume the
+file exactly - that turns the one remaining unknown (dt_bias's length) into a check rather than a guess, and a
+mismatch is a hard error rather than a silently shifted read.
+
+THEN: build block 1's fixture from the oracle's raw output, run kda_gate, and the question of whether block 1's
+kernel path is correct gets answered by data that cannot be self-inconsistent.  That is the next action.
