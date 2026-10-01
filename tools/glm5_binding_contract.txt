@@ -2284,3 +2284,36 @@ STATE, unchanged and honest: the engine is exonerated on block 1 (its qc matches
 digits, and the fixture disagrees with its own arithmetic).  Block 0 is verified 12/12.  Block 1 remains UNVERIFIED
 - not because the engine fails, but because its fixture does not imply its own outputs, and no gate over it can
 support any conclusion either way.
+
+THE CONV CONVENTION IS CONFIRMED CORRECT, BY THE ORACLE'S OWN MEASUREMENT
+
+    def _conv(m, name):
+        """The (d_conv, d_inner) conv array the kernel indexes as conv_w[k*d_inner + ch].
+        The artifact stores (d_inner, 1, d_conv) with d_conv FASTEST, so this is reshape(d_inner, d_conv).T.
+        reshape(d_conv, d_inner) instead interleaves four channels' taps: measured on block 0 it takes
+            reshape(d_inner,d_conv).T -> attn_output-0 corr +1.00000,  0.02% error
+            reshape(d_conv,d_inner)   -> attn_output-0 corr +0.52073, 90.56% error"""
+
+That is byte-for-byte the transform make_kda_fixture.py applies, and the oracle quantified the alternative it rejects
+at 90.56% error.  So the conv weights in every fixture are in the convention the kernel indexes, and the whole
+conv-order hypothesis for block 1 is closed - by the reference's own arithmetic rather than by an argument.
+
+WHAT IS NOW FULLY PINNED for the block-1 failure:
+    xn        matches to 1.177e-07 (compared directly)
+    matvec    a plain row-major dot product, identical to xn @ w.T
+    conv1d    same correlation, same causal direction, same zero state, same silu
+    conv_w    the same array on both sides, in the convention _conv documents
+    geometry  d_conv=4, d_inner=8192, set explicitly in the gate
+    engine    its qc matches the fixture's to FOUR SIGNIFICANT DIGITS of relative error
+And yet the fixture's inter_qc does not follow from that fixture's own xn, wq and conv_q, while block 0's does.
+
+WHERE THAT LEAVES IT, and it is a fixture-provenance question rather than an engine question: the oracle exposes
+--raw-fixture, and it writes ONE file, not the 29-file directory kda_gate reads.  So the directory has a different
+provenance than assumed, and the right next step is to establish what produced it - or to bypass the question by
+having kda_gate consume the oracle's own single-file raw fixture, which removes every hand-rolled conversion step
+from the loop.  That is a smaller and more decisive move than more archaeology on the directory's 29 files.
+
+Also worth knowing for whoever resumes: --selftest exists in the oracle (the end-to-end check already recorded as
+passing), and STRATA_BAD_CONV_FIXTURE=1 makes the writer emit conv weights in the WRONG order while the expected
+outputs were computed with the right one - the known-bad fixture this port requires a gate to reject.  Wave flagging
+that this exists: the gate has not yet been run against it.
