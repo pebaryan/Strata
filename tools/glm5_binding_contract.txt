@@ -4929,3 +4929,48 @@ its own gate while the WIRING around it was wrong - the KDA normalised twice, th
 stage never tested through the quantized path, the gate asking a 2-bit path to match float64.  So the runner should
 compare INTERMEDIATES, not just the token: the stage callback already exists (GlmStageFn), costs nothing when unused,
 and turns "the token is wrong" into "layer 17's FFN output is off".
+
+THE ENGINE'S OWN 45-BLOCK RUNNER EXISTS, ASSEMBLES EVERYTHING, AND CRASHES IN hc_pre
+
+tools/glm45_run.cpp (+ a CMake target) is the port's last step.  It builds the whole chain from the pack: 3 shards,
+served_names, pool_bytes, arena, table.load, NativeDense, 45 binds, glm_fill_layer_weights per layer, expert_layout_load
+BEFORE FileExpertSource::open, native_fmt per routed layer from the pack's own gu/d types, explicit clamps, 34 KDA state
+slots, 11 MLA caches of 5 cells, the oracle's hc_init as input, the token loop OUTER with the state carried across it,
+the stage callback wired from the start, and the head (mean over streams, output_norm, the tied projection) ending in
+an argmax.  It compiles and runs:
+
+    shards: 3
+    arena 0.12 GB, 645 tensors served from the GGUF
+    bound and mapped 45 blocks
+    state: 34 KDA slots (136 MB), 11 MLA caches (5 cells each)
+    input: hc_init ne=[4096,4,5,1], 81920 floats
+    <SIGSEGV>
+
+TWO DEFECTS WERE FOUND AND FIXED ON THE WAY, both of which only a real pack could expose:
+
+  1. glm_fill_layer_weights REFUSED every MLA layer of a real pack.  Its indexer check was written when the callers were
+     fixtures, which never carry indexer tensors; the pack always does, so the check made all eleven MLA layers
+     unmappable.  Now tolerated and reported once: this model's selection is all-tokens below 8192 positions, so the
+     tensors are legitimately unused, and mla_forward has no fields for them for the same reason.
+  2. The runner's arena was cudaMalloc.  Changed to cudaMallocManaged - and it did NOT fix the crash, which is itself
+     informative: the binder is evidently not serving those tensors out of the arena.
+
+THE CRASH, localized by gdb rather than by guessing:
+
+    #0 strata::kernels::glm::hc_pre(float const*, float const*, float const*, float const*, int, float*, HcMix*, int)
+    #1 strata::core::glm::glm_stage_hc_norm(...)
+    #2 strata::core::glm::glm_trunk_forward(...)
+    #3 main
+
+THE LEADING HYPOTHESIS, and the diagnostic that would settle it in one run: the bound hc/norm weights are not readable
+from the host.  Every previous caller of glm_trunk_forward - trunk_gate, block3_gate, head_gate - fed it FIXTURE arrays
+in ordinary host memory, so this never came up; the pack path puts the bound tensors somewhere the host cannot
+dereference, and hc_pre is a CPU kernel.  The next measurement is to print w.hc_attn_fn / w.hc_attn_base /
+w.hc_attn_scale in the runner and compare each against the arena's address range: inside the arena, and the arena
+should be managed (which the last run made it, without effect, so the pointer is probably NOT in the arena at all);
+outside it, the binder allocated privately and that allocation is the thing to inspect.
+
+WHY THIS IS WORTH RECORDING IN THIS MUCH DETAIL: the crash is the FIRST execution of the engine's own trunk, it happened
+after every piece passed its own gate, and it is the fifth instance of this session's recurring failure - a component
+that is correct in isolation while the wiring around it is not.  The difference here is that the wiring is exactly what
+building this tool was meant to test, so the tool is doing its job on the first run.

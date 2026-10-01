@@ -964,3 +964,14 @@ add_executable(block3_gate tools/block3_gate.cpp src/core/glm_trunk.cpp src/core
                    src/kernels/cuda/quantize_act.cu)
 target_include_directories(block3_gate PRIVATE /include)
 target_link_libraries(block3_gate PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
+
+# glm45_run (branch glm5next-port): THE PORT'S LAST STEP.  The engine's own 45-block trunk, from the pack,
+# ending in a token.  The acceptance test is argmax == 12089, not a per-layer float match, because the
+# engine accumulates the quantization of 43 routed blocks (~5% of rms worst element, measured).
+add_executable(glm45_run tools/glm45_run.cpp src/core/glm_trunk.cpp src/core/glm_layer.cpp
+               src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_bind.cpp
+               src/core/native_dense.cpp src/core/expert_source.cpp src/core/expert_cache.cpp
+               src/core/remote_experts.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
+               src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu)
+target_include_directories(glm45_run PRIVATE /include)
+target_link_libraries(glm45_run PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)

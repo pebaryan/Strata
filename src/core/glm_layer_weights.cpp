@@ -19,6 +19,9 @@
 namespace strata::core::glm {
 namespace {
 
+/// One report per process: the indexer's presence is a per-layer fact with a single explanation.
+static bool g_indexer_reported = false;
+
 /// The tensor names, in one place, spelled exactly as the generated table spells them.  Two of them do not follow the
 /// `name.weight` pattern and are the ones that have cost this port time before: `ssm_a` carries no suffix, and
 /// `ssm_dt.bias` is a bias.
@@ -121,12 +124,18 @@ bool glm_fill_layer_weights(const GlmBoundBlock& b, int layer, const kernels::gl
         out.mla = &mla_storage;
         out.kda = nullptr;
         // The indexer's twelve tensors (indexer.proj, indexer.k_norm.*, indexer_compressor_*, indexer.attn_{q_b,k})
-        // have no field in MlaWeights.  Reported rather than silently dropped: if a long prompt ever needs them, this
-        // is the line that says so.
-        if (opt(b, "indexer.proj.weight") && !kGlmAppliesIndexer) {
-            err = "glm_fill_layer_weights: layer " + std::to_string(layer) +
-                  " has indexer tensors, which this build does not apply (mla_forward has no indexer fields)";
-            return false;
+        // have no field in MlaWeights.  TOLERATED, not refused.  Refusing was right when a fixture could omit them
+        // and wrong the moment a real PACK was mapped: the pack always carries them, so this check made every one of
+        // the model's eleven MLA layers unmappable - which is exactly how it surfaced, on the engine's first attempt
+        // to build its own trunk.  They are legitimately unused here, because this model's selection is all-tokens
+        // below 8192 positions (mla_forward has no indexer fields for the same reason).  Still REPORTED - once, since
+        // it is a per-layer fact - because a prompt long enough to need the indexer would have to start here.
+        if (opt(b, "indexer.proj.weight") && !kGlmAppliesIndexer && !g_indexer_reported) {
+            std::fprintf(stderr,
+                         "glm_fill_layer_weights: the pack carries indexer tensors (first seen at layer %d); this "
+                         "build does not apply them - all-tokens selection below 8192 positions\n",
+                         layer);
+            g_indexer_reported = true;
         }
     } else {
         kernels::glm::KdaWeights& k = kda_storage;
