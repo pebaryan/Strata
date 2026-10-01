@@ -3434,3 +3434,32 @@ provenance.  Every one was caught by an assertion or a tool that refused to run,
 round instead of a day is that the fixture was verified before the code ran on it.  A native MoE stage written at the
 tail of this session would have neither the room to build that fixture nor the room to debug it, and the pattern of
 this entire session says the error would be a plausible number rather than a crash.
+
+THE STREAMED-EXPERT MoE STAGE EXISTS, IN ITS OWN TRANSLATION UNIT
+
+    src/core/glm_moe_native.cpp          + include/strata/core/glm_moe_native.hpp
+    T strata::core::glm::glm_stage_moe_native(...)      verified by compiling the TU standalone and nm'ing the object
+
+It implements exactly the determined sequence: moe_route for ids and weights, native_quant_act once per token,
+then per selected expert blob -> native_gu_rows -> native_quant_h -> native_down_rows filling UNWEIGHTED parts, then
+the combine applying the weights once, then the shared expert added UNWEIGHTED with its own geometry and clamp - both
+caller-supplied rather than assumed, because the shared expert's width is not the routed experts'.
+
+TWO DESIGN POINTS IT ENFORCES IN CODE, not just in a comment:
+
+  * it refuses when fmt.n_embd / fmt.n_ff disagree with the geometry, because the native path documented that a blob
+    of the wrong width is REFUSED rather than mis-indexed - better to say so than to compute;
+  * `blob_fn(ctx, layer, expert)` is a FUNCTION POINTER rather than an ExpertSource&, so a gate can supply a fixture
+    buffer and the stage never needs a pack to be testable.  ExpertSource::blob is what a chain passes in production.
+
+WHY IT IS IN A SEPARATE TU: linking the CPU library into a host-only binary drags ggml and its backends in, and every
+stage gate in this port is host-only and should stay so.  glm_layer.cpp - which the binding checker compiles - is now
+free of the native path again and builds without it.  The chain target will link both.
+
+One compile error on the way, of the familiar kind: I wrote g.n_ff where MoeGeometry's field is `ff` (NativeFmt really
+does have n_ff, which is why it was easy to mix them).  That is the fourth guessed identifier this session -
+n_heads/head_dim, MoE_dense, input_norm, and now n_ff - and the fourth caught by the compiler rather than by a test,
+because a missing member cannot be silent.
+
+STILL TO DO on the plan: the trunk loop over blocks 0..44, the MLA latent cache, and the head (final norm, lm_head,
+greedy argmax, tokenizer decode) - then the gate, argmax == 12089.
