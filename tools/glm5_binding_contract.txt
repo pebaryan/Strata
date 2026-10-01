@@ -1676,3 +1676,35 @@ HcMix that hc_pre already produces (which the stage-1 block in the driver alread
 today, host-side, the same way hc_pre was: run the engine's hc_post and the oracle's on the same inputs and compare.
 That is the next link in the block chain, and after it the ffn stage (leading dense below block 3, moe_forward
 above) - which is what stands between this port and a second block in the chain.
+
+hc_post IS TERM-FOR-TERM IDENTICAL TO THE ORACLE - AND THAT REDIRECTS THE REMAINING RISK
+
+engine  glm_hc.cpp:112   for dst: dst_row[e] = mix.post[dst] * site_out[e];
+                                  for src: dst_row[e] += mix.comb[dst][src] * residual[src][e];
+oracle  glm5_hc_reference.py:127  for dst: acc = post[dst] * cur
+                                          for src: acc = acc + comb[dst,src] * residual[src]
+
+Same structure AND the same accumulation order - the post term first, then the comb sum in src order - which is the
+part that determines whether two float implementations agree to the last place rather than merely to a tolerance.
+hc_post is ten lines of host code with no weights and no state; a gate over it would be a formality, and it is
+still owed for the record rather than left as an inspection (an inspection is not evidence, it is a reading of the
+same two texts that produced the claim - exactly the trap this file has recorded twice already).
+
+WHERE THE REMAINING RISK ACTUALLY IS, and it is not in the hyper-connection path.  Both hc functions are simple,
+host-side, and now one is verified by execution and the other is identical to the reference by construction.  The
+substantive unverified part of block 0 is the FFN STAGE, which is where this model's arithmetic is genuinely
+unusual:
+
+    leading dense blocks below block 3        a plain SwiGLU
+    block 3 and above                        MoE: sigmoid gating, a selection-only bias, top-8 of 288,
+                                             weights /= max(sum, 6.103515625e-05), weights *= 2.5, and a
+                                             PARALLEL-SiLU shared expert added UNWEIGHTED
+    swiglu_clamp_exp / _shexp 10.0            clamping on the expert activations
+
+Those are the constants and the conventions that a plausible-looking implementation gets subtly wrong (the MoE
+semantics list above came from the phase-7 oracle work precisely because they are not guessable).  So the next gate
+worth building is the ffn stage against tools/glm5_moe_reference.py's path, not a formality over hc_post - and
+after that, a second block in the chain.
+
+STATE: five gates green, all committed, nothing half-built.  glm5_bind_check, kda_gate, kda_binding_check.py,
+q5k_parity, fixtures glm5-kda-l0-t1 / glm5-kda-l0-t5 / glm5-q5k-parity.
