@@ -55,4 +55,38 @@ bool glm_stage_hc_post(const float* site_out, const float* residual, const kerne
 bool glm_stage_ffn(const float* xn, const float* wg, const float* wu, const float* wd,
                    const kernels::glm::MoeGeometry& g, float* out, float clamp_limit, std::string& err);
 
+/// One block's weights, as plain pointers.  Deliberately NOT the binding layer's structures: every gate in this port
+/// drives code with plain arrays loaded from fixture files, and a loop that takes plain pointers can be driven by
+/// exactly those arrays - so the chain is testable stage by stage against the dump without a bound artifact, and
+/// glm_layer.cpp stays independent of the loader.
+struct GlmBlockWeights {
+    // the attention site's hyper-connection front end
+    const float* hc_attn_fn    = nullptr;
+    const float* hc_attn_base  = nullptr;
+    const float* hc_attn_scale = nullptr;
+    const float* attn_norm     = nullptr;
+    // the attention itself (a KDA block; the sixteen weight arrays are already grouped)
+    const kernels::glm::KdaWeights*  kda      = nullptr;
+    const kernels::glm::KdaGeometry* kda_geom = nullptr;
+    // the FFN site's front end
+    const float* hc_ffn_fn    = nullptr;
+    const float* hc_ffn_base  = nullptr;
+    const float* hc_ffn_scale = nullptr;
+    const float* ffn_norm     = nullptr;
+    // the feed-forward, plus its geometry (ff = 12288 dense vs 2048 routed) and clamp
+    const float* ffn_gate = nullptr;
+    const float* ffn_up   = nullptr;
+    const float* ffn_down = nullptr;
+    const kernels::glm::MoeGeometry* ffn_geom = nullptr;
+    float clamp_limit = 10.0f;      ///< swiglu_clamp_shexp for a leading dense block
+};
+
+/// One whole block: hc_pre+norm -> attention -> hc_post -> hc_pre+norm -> FFN -> hc_post.
+///
+/// `x` is the block input as HC streams ([HC][n_embd]) and `l_out` the output in the same shape, which is the next
+/// block's input.  `state` is the attention's recurrent S matrix and must be zeroed for a fresh sequence.  Buffers
+/// are allocated internally; nothing is carried between calls except what the caller passes.
+bool glm_block_forward(const float* x, int tokens, const GlmBlockWeights& w, float hc_rms_eps,
+                       float* l_out, float* state, void* stream, std::string& err);
+
 }  // namespace strata::core::glm

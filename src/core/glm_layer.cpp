@@ -3,6 +3,7 @@
 #include "strata/core/glm_layer.hpp"
 
 #include <cmath>
+#include <vector>
 
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/glm_kda.hpp"
@@ -102,6 +103,78 @@ bool glm_stage_ffn(const float* xn, const float* wg, const float* wu, const floa
         return false;
     }
     kernels::glm::expert_ffn(wg, wu, wd, g, xn, out, clamp_limit);
+    return true;
+}
+
+/// One whole block, in the order the reference uses and the dump's per-block stage names confirm:
+///
+///     hc_pre -> attn_norm -> attention -> hc_post -> hc_pre -> ffn_norm -> FFN -> hc_post
+///
+/// The shape alternates, and that is the part worth being careful about because both are float*: the attention and
+/// FFN outputs are one vector per token ([n_embd]), while everything between the sites is HC rows ([HC][n_embd]).
+/// hc_post is what converts back, and hc_pre is what consumes it.
+bool glm_block_forward(const float* x, int tokens, const GlmBlockWeights& w, float hc_rms_eps,
+                       float* l_out, float* state, void* stream, std::string& err) {
+    if (!x || !l_out || !state || !w.hc_attn_fn || !w.hc_attn_base || !w.hc_attn_scale || !w.attn_norm ||
+        !w.kda || !w.kda_geom || !w.hc_ffn_fn || !w.hc_ffn_base || !w.hc_ffn_scale || !w.ffn_norm ||
+        !w.ffn_gate || !w.ffn_up || !w.ffn_down || !w.ffn_geom) {
+        err = "glm_block_forward: null argument (every weight pointer must be set)";
+        return false;
+    }
+    const int ne = w.kda_geom->n_embd;
+    if (tokens <= 0 || ne <= 0) {
+        err = "glm_block_forward: tokens and n_embd must be positive";
+        return false;
+    }
+    const size_t hc = (size_t) kernels::glm::HC;
+
+    // 1-3: the attention site.  hc_pre mixes the streams down and records its mix; the norm is applied in place, so
+    // what comes back is attn_norm-N and the attention takes it directly; hc_post recombines using the same mix.
+    std::vector<float> layer_in((size_t) tokens * ne), attn_out((size_t) tokens * ne);
+    std::vector<float> mid((size_t) tokens * hc * ne);
+    std::vector<kernels::glm::HcMix> mix_attn((size_t) tokens);
+    for (int t = 0; t < tokens; ++t) {
+        if (!glm_stage_hc_norm(x + (size_t) t * hc * ne, ne, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale,
+                               w.attn_norm, layer_in.data() + (size_t) t * ne, &mix_attn[(size_t) t],
+                               hc_rms_eps, stream, err)) {
+            err = "glm_block_forward: attention site: " + err;
+            return false;
+        }
+        if (!glm_stage_kda(layer_in.data() + (size_t) t * ne, *w.kda, *w.kda_geom, 1,
+                           attn_out.data() + (size_t) t * ne, state, err)) {
+            err = "glm_block_forward: attention call: " + err;
+            return false;
+        }
+        if (!glm_stage_hc_post(attn_out.data() + (size_t) t * ne, x + (size_t) t * hc * ne,
+                               mix_attn[(size_t) t], ne, mid.data() + (size_t) t * hc * ne, err)) {
+            err = "glm_block_forward: attention site hc_post: " + err;
+            return false;
+        }
+    }
+
+    // 4-6: the FFN site, the same shape of sequence against the FFN's own weights.
+    std::vector<float> ffn_in((size_t) tokens * ne), ffn_out((size_t) tokens * ne);
+    std::vector<kernels::glm::HcMix> mix_ffn((size_t) tokens);
+    kernels::glm::MoeGeometry fg = *w.ffn_geom;
+    fg.n_embd = ne;
+    for (int t = 0; t < tokens; ++t) {
+        if (!glm_stage_hc_norm(mid.data() + (size_t) t * hc * ne, ne, w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale,
+                               w.ffn_norm, ffn_in.data() + (size_t) t * ne, &mix_ffn[(size_t) t],
+                               hc_rms_eps, stream, err)) {
+            err = "glm_block_forward: FFN site: " + err;
+            return false;
+        }
+        if (!glm_stage_ffn(ffn_in.data() + (size_t) t * ne, w.ffn_gate, w.ffn_up, w.ffn_down, fg,
+                           ffn_out.data() + (size_t) t * ne, w.clamp_limit, err)) {
+            err = "glm_block_forward: FFN call: " + err;
+            return false;
+        }
+        if (!glm_stage_hc_post(ffn_out.data() + (size_t) t * ne, mid.data() + (size_t) t * hc * ne,
+                               mix_ffn[(size_t) t], ne, l_out + (size_t) t * hc * ne, err)) {
+            err = "glm_block_forward: FFN site hc_post: " + err;
+            return false;
+        }
+    }
     return true;
 }
 

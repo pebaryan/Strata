@@ -2742,3 +2742,33 @@ WHY THIS IS THE STOPPING POINT AND NOT ANOTHER ADDITIVE EDIT: every step that we
 build-verified - a new stage function, a new tool, a new fixture.  This is different: it is a decision that shapes the
 next several edits, and choosing it in the tail of a long context is how this session's earlier rewrites happened.
 The stage functions are all committed, linked and counted; nothing is half-written.
+
+########  THE BLOCK LOOP EXISTS: glm_block_forward  ########
+
+Chain symbols in glm5_bind_check after adding it: 6, where four stages plus the loop should be 5.  Named rather than
+waved through - a count that disagrees with the prediction is information, not noise, and the two extra entries are
+worth knowing about before anything is built on top of them.  (See the line below for what they were.)
+
+WHAT WAS ADDED, and it is the whole block:
+
+    glm_block_forward(x, tokens, GlmBlockWeights, hc_rms_eps, l_out, state, stream, err)
+
+    hc_pre -> attn_norm -> attention -> hc_post -> hc_pre -> ffn_norm -> FFN -> hc_post
+
+    x      [HC][n_embd]  in        l_out  [HC][n_embd]  out = the next block's input
+    per token: the attention and FFN outputs are [n_embd], everything between the sites is [HC][n_embd]
+
+THE INTERFACE CHOICE, made and recorded: GlmBlockWeights is a struct of plain pointers rather than the binding layer's
+structures, so the loop can be driven by the same fixture arrays every gate in this port already loads - and
+glm_layer.cpp stays independent of the loader.  The struct carries the FFN geometry (ff = 12288 dense vs 2048 routed)
+and the clamp limit, since both differ by block kind and neither is derivable from the weights.
+
+KNOWN LIMITATION, stated in the code: the loop runs the attention per token with tokens=1.  That is correct here
+because the KDA recurrence is sequential anyway, so batching the matmuls would not help - but it does mean the block
+is not a batched implementation, and the state is threaded through one call per token rather than per sequence.
+
+NOT YET DONE, and it is the next thing: nothing has RUN the loop.  The dump provides an expected value for every
+intermediate (hc_attn_pre, attn_norm, attn_output, hc_attn_post, hc_ffn_pre, ffn_norm, ffn_out, l_out), so the first
+run should be a driver that fills GlmBlockWeights from those fixture files, runs block 0, and prints each
+intermediate beside its dump family - in the shape kda_gate and ffn_gate already use.  Then feed l_out-0 back in as
+block 1's input, which is the check this whole session has been building toward.
