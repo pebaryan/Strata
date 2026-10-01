@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "strata/core/glm_bind.hpp"
-#include "strata/core/glm5_block0_gen.hpp"
+#include "strata/core/glm5_blocks_gen.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/kernels/quantize_act.hpp"
 
@@ -76,8 +76,11 @@ static float* repack_conv(const float* src, int d_inner, int d_conv) {
 bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv, GlmBoundBlock& out,
                     void* stream, std::string& err) {
     const std::string prefix = "blk." + std::to_string(block) + ".";
-    for (int i = 0; i < kGlmBlock0Count; ++i) {
-        const GlmBlock0Tensor& t = kGlmBlock0[i];
+    const int n_rows = glm_block_row_count(block);
+    if (!n_rows) { err = "glm_bind: no tensor table for block " + std::to_string(block); return false; }
+    const GlmTensorRow* rows = glm_block_rows(block);
+    for (int i = 0; i < n_rows; ++i) {
+        const GlmTensorRow& t = rows[i];
         const std::string full = t.name;
         const std::string suffix = full.substr(prefix.size());
         const WeightRef* w = v.get(suffix.c_str());
@@ -101,6 +104,14 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv, GlmB
             } else {
                 got.ptr = p;
             }
+        } else if (!w->native_data && w->bytes == 0) {
+            // Marked natively served but not uploaded: NativeDense skips 3-D tensors (glm5next's MLA k_b/v_b,
+            // whose blocks the MMVQ upload path cannot take), so their row exists and their data does not.
+            // The binding has to fetch these from the GGUF itself, in the layout the MLA kernel wants - that
+            // is the remaining half of 9.1 rather than something to paper over.
+            err = "glm_bind: " + full + " is marked native but has no data (3-D tensor; the binding must "
+                  "fetch it from the GGUF itself)";
+            return false;
         } else if (w->native_data) {
             // Served straight from the GGUF, which is the orientation the verified oracle works in, so this
             // must NOT be transposed.  Transposing it - which an earlier version of this file did - is trap 7
