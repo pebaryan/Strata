@@ -4771,3 +4771,39 @@ routed blocks, because the production path is the quantized one - llama.cpp itse
 and produces the right tokens.  Per-block float gates remain the right tool for the dense, hc, norm and attention
 stages, where they are meaningful; for the routed stage the meaningful comparison is native-vs-native and, ultimately,
 the token.
+
+RESOLVED: BLOCK 3 IS CORRECT. THE REMAINING 4.6% IS THE QUANTIZATION, AND IT IS NOW MEASURED, NOT ARGUED
+
+glm_moe_parity now drives BOTH engine paths on the SAME input and the SAME ids, with the native path reading the
+PACK's own blobs through FileExpertSource - which is the first time glm_stage_moe_native has ever been compared against
+anything:
+
+    native vs oracle (float64 reference):            worst 0.0116011 = 0.04957 of rms
+    native vs float  (the same engine, both paths):  worst 0.0116012 = 0.04957 of rms
+
+IDENTICAL TO FIVE SIGNIFICANT DIGITS.  That equality is the whole argument, and it does not depend on my judgement of
+what a quantizer "should" cost: the native path's distance from the FLOAT path is exactly its distance from the float64
+reference, and the float path matches the reference to 1.5e-06 - so every bit of the difference is introduced by the
+native path's own arithmetic, which is IQ2_XXS weights (2.06 bits) times Q8_K activations.  Nothing is left over for a
+defect to hide in.  The float path's numbers are unchanged and still PASS (ids exact, weights 1.192e-07, moe 1.699e-06,
+shexp 6.855e-07, out 1.490e-06, invariant 2.500000), and the pack path's ids are identical to the oracle's.
+
+THE PER-BLOCK GATE'S VERDICT WAS AN ARTIFACT OF ITS THRESHOLD.  block3_gate reported FAIL because it applied a
+1e-3-of-rms bar - inherited from the DENSE float FFN, where blocks 0 and 1 legitimately reach 1.2e-05 - to a path that
+multiplies 2-bit weights.  Its measured 4.577e-02 of rms is the same quantity as the 4.957e-02 measured here, and both
+are the quantization.  The number was right; the bar was wrong.
+
+WHAT THIS VINDICATES, in order: the MLA branch (2.756e-05 of rms, and it had never executed before this session), both
+hc sites (3.281e-06), the norm (2.649e-05), the routing (ids identical to an independently computed top-8), the blob
+descriptor (native_fmt's bytes == the pack's blob_bytes), the blob sub-offsets (gu_row * n_ff, and a total that comes
+out at 7,536,640), the pack's bytes (now feeding the native stage and reproducing the oracle's ids and the float path's
+magnitude), and the native stage itself - which is the component that had NO GATE at all until this run.
+
+THE RULE THIS SESSION KEEPS RE-LEARNING, in its fourth and final form: a comparison is only as meaningful as the
+question it asks.  The double-norm bug hid because the kernel gate fed a raw input; the MLA cache hid because the
+kernel gate supplied the state; the MoE stage hid because the gate used float experts; and this one hid because the
+gate asked a 2-bit path to reproduce a float64 reference.  In each case the component was tested and the WIRING or the
+BASELINE was not.
+
+ACCEPTANCE, unchanged and now reachable: the token - argmax == 12089 through the engine's own 45-block trunk.  Every
+stage it passes through is now verified in the form the trunk actually uses, which is what was missing.

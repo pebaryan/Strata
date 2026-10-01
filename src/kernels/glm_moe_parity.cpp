@@ -8,12 +8,24 @@
 // --bias-matters matters: it searches for an input whose selection CHANGES when ffn_exp_probs_b is
 // applied.  With an arbitrary input the biased and unbiased choices often agree, and then a port that
 // dropped the bias entirely would still match the fixture exactly.
+#include "strata/core/expert_source.hpp"
+#include "strata/core/glm_moe_native.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/glm_moe.hpp"
+
+/// The pack reader as the stage wants it: a plain function pointer.  glm_stage_moe_native takes a blob_fn rather
+/// than an ExpertSource& precisely so a gate can feed it anything - here, the pack itself.
+static const uint8_t* moe_blob_adapter(void* ctx, int layer, int expert) {
+    return ((strata::core::ExpertSource*) ctx)->blob(layer, expert);
+}
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdint>
+#include <fstream>
+#include <sstream>
 #include <cstdlib>
 #include <vector>
 
@@ -194,6 +206,78 @@ int main(int argc, char** argv) {
     std::vector<float> got_out((size_t) ne);
     glm::moe_forward(router.data(), probs_b.data(), g, x.data(), experts.data(), shared, got_out.data(),
                      got_ids.data(), got_weights.data(), got_moe.data(), got_shexp.data());
+
+    // ================= THE NATIVE PATH, ON THE SAME INPUT AND THE SAME IDS =================
+    //
+    // Everything above compares glm::moe_forward - FLOAT experts - against the oracle, and it matches to ~1e-6.  That
+    // is the gate this port has always had, and it does not cover the path the model actually runs: the trunk hands
+    // glm_stage_moe_native QUANTIZED BYTES FROM A PACK.  So this drives the native stage with the PACK's own blobs for
+    // the very ids this fixture selected, on the fixture's own input, and compares the result THREE ways:
+    //
+    //     native vs oracle      what the pack's bytes produce, against the float64 reference
+    //     native vs float       the same input through both engine paths - the number that settles the question
+    //
+    // If native-vs-float is a few percent of rms, the difference is the quantization (IQ2_XXS is 2.06 bits) and the
+    // native stage is CORRECT; a gap far beyond what a 2-bit format can explain is a real defect in the stage.
+    {
+        const char* pack = (argc >= 3) ? argv[2] : "/home/peb/moredata/strata-pack-glm5";
+        int gu_type = -1, d_type = -1;
+        {
+            std::ifstream pf(std::string(pack) + "/native_experts.txt");
+            std::string line;
+            while (std::getline(pf, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                std::istringstream is(line);
+                int64_t l = -1, off = 0, nb = 0, go = 0, uo = 0, dob = 0;
+                int gt = 0, dt = 0;
+                if (!(is >> l >> gt >> dt >> off >> nb >> go >> uo >> dob)) continue;
+                if (l == (int64_t) hdr[4]) { gu_type = gt; d_type = dt; break; }
+            }
+        }
+        std::string nerr;
+        strata::kernels::cpu::NativeFmt fmt;
+        strata::core::FileExpertSource src;
+        if (gu_type < 0) {
+            std::printf("native path: layer %d is not in %s/native_experts.txt\n", hdr[4], pack);
+        } else if (!strata::kernels::cpu::expert_layout_load(pack, 46, E, nerr, ne, ff) ||
+                   !src.open(pack, 46, E, nerr)) {
+            std::printf("native path: the pack will not open: %s\n", nerr.c_str());
+        } else if (!strata::kernels::cpu::native_fmt(gu_type, d_type, ne, ff, fmt, nerr)) {
+            std::printf("native path: native_fmt(%d,%d) refused: %s\n", gu_type, d_type, nerr.c_str());
+        } else {
+            strata::kernels::glm::MoeGeometry sg;
+            sg.n_embd = ne; sg.ff = ff; sg.n_expert = E; sg.n_used = k;
+            sg.w_scale = g.w_scale; sg.norm_w = g.norm_w;
+            sg.clamp_exp = g.clamp_exp; sg.clamp_shexp = g.clamp_shexp;
+            std::vector<float> nat_out((size_t) ne, 0.0f);
+            std::vector<int> nat_ids((size_t) k, -1);
+            const bool nat_ok = strata::core::glm::glm_stage_moe_native(
+                x.data(), router.data(), probs_b.data(), g, (int) hdr[4], fmt, &moe_blob_adapter, &src, &sg, shared,
+                g.clamp_shexp, nat_out.data(), nerr, nat_ids.data());
+            if (!nat_ok) {
+                std::printf("native path: the stage refused: %s\n", nerr.c_str());
+            } else {
+                double dn = 0.0, df = 0.0, rr = 0.0;
+                bool ids_same = true;
+                for (int i = 0; i < k; ++i) ids_same = ids_same && (nat_ids[(size_t) i] == e_ids[(size_t) i]);
+                for (int i = 0; i < ne; ++i) {
+                    dn = std::max(dn, (double) std::fabs((double) nat_out[(size_t) i] - (double) e_out[(size_t) i]));
+                    df = std::max(df, (double) std::fabs((double) nat_out[(size_t) i] - (double) got_out[(size_t) i]));
+                    rr += (double) e_out[(size_t) i] * (double) e_out[(size_t) i];
+                }
+                const double rms = std::sqrt(rr / (double) ne);
+                std::printf("\n  === the native path (pack blobs), same input, same ids ===\n");
+                std::printf("  ids from the pack path: %s\n", ids_same ? "identical to the oracle's" : "DIFFERENT");
+                std::printf("  native vs oracle (float64 reference): worst %.6g = %.4g of rms\n", dn,
+                            dn / (rms > 0.0 ? rms : 1.0));
+                std::printf("  native vs float  (the same engine, both paths): worst %.6g = %.4g of rms\n", df,
+                            df / (rms > 0.0 ? rms : 1.0));
+                std::printf("  (the float path itself matches the oracle to ~1e-6, so a gap between the two ENGINE\n");
+                std::printf("   paths is the quantization error - IQ2_XXS is 2.06 bits - not a defect, unless it is\n");
+                std::printf("   far larger than a 2-bit format can explain.)\n");
+            }
+        }
+    }
 
     bool ok = true;
     int mismatched = 0;

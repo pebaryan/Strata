@@ -216,7 +216,10 @@ target_link_libraries(ffn_gate PRIVATE strata_core strata_kernels CUDA::cudart)
 
 # MoE parity (branch glm5next-port): the router (sigmoid gating, the selection-only bias, top-8 of 288,
 # normalize-then-scale) and the expert/shared-expert FFNs, against tools/glm5_moe_reference.py.
-add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp)
+add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp
+                   src/core/glm_moe_native.cpp src/core/expert_source.cpp src/core/expert_cache.cpp
+                   src/core/remote_experts.cpp src/kernels/cuda/quantize_act.cu)
+target_link_libraries(glm_moe_parity PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
 target_include_directories(glm_moe_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_moe_parity PRIVATE -O2)
 
