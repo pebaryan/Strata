@@ -52,6 +52,8 @@ def main() -> int:
                     help="how many trunk blocks (default: block_count - nextn_predict_layers, i.e. the "
                          "artifact's own trunk length)")
     ap.add_argument("--vocab", type=int, default=154880)
+    ap.add_argument("--dump", help="also write per-block l_out-N tensors here, so the trunk can be "
+                                    "bisected against the reference block by block")
     ap.add_argument("--save-hidden", help="write the post-trunk hidden state (last token, post "
                                           "output_norm) to this .npy so a head fix need not re-run the "
                                           "whole trunk")
@@ -86,6 +88,10 @@ def main() -> int:
     inpL = np.repeat(emb, HC_STREAMS, axis=0).reshape(len(toks), HC_STREAMS, N_EMBD).transpose(2, 1, 0)
 
     latents: dict[int, list[np.ndarray]] = {}      # MLA layers: the per-token latent cache
+
+    dump = pathlib.Path(a.dump) if getattr(a, "dump", None) else None
+    if dump is not None:
+        dump.mkdir(parents=True, exist_ok=True)
 
     for il in range(blocks):
         p = f"blk.{il}."
@@ -134,6 +140,8 @@ def main() -> int:
             ffn = np.stack(outs).T
 
         inpL = DRV.hc_post_3d(ffn, residual, post, comb)
+        if dump is not None:
+            DRV.write_tensor(dump, f"l_out-{il}", inpL)
         print(f"  block {il:2d} ({'MLA' if is_mla else 'KDA'}, "
               f"{'dense' if il < DENSE_LEAD else 'MoE'}) done; |l_out| {np.linalg.norm(inpL):.4f}",
               flush=True)
