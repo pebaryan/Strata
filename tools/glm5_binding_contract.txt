@@ -1814,3 +1814,24 @@ scales is also SIGNED here (int8_t) where Q5_K's are unsigned-packed 6-bit value
 NEXT: the fixture (raw blocks + the oracle's values for blk.0.ffn_down.weight), then the same parity gate that made
 dequant_q5_K bit-exact, then the guard widened to {8, 13, 14}.  q5k_parity.cpp needs one small generalisation - its
 block size is hardcoded at 176 - before it can be pointed at a 210-byte tensor.
+
+########  STEP 2 OF THE Q6_K ROUND DONE: dequant_q6_K IS BIT-EXACT TOO  ########
+
+    Q5_K  33,554,432 elements   worst absolute difference 0.000e+00   BIT-EXACT
+    Q6_K  50,331,648 elements   worst absolute difference 0.000e+00   BIT-EXACT
+
+Both over real artifact tensors (blk.0.attn_q.weight and blk.0.ffn_down.weight), both against the oracle's own
+dequantization, both exact rather than within tolerance.  The Q5_K path was also re-run after generalising the tool
+and is unchanged, so the generalisation did not disturb what it already proved.
+
+The symmetric range on ffn_down (-0.117432 / +0.117432) made min/max a weak discriminator, which is worth
+remembering: for that tensor the stats would have passed a kernel with systematically wrong scales, and only the
+elementwise comparison could tell.  A gate that reports statistics where it could report elements is a gate that
+can be satisfied by the wrong answer.
+
+THE TOOL IS NOW GENERAL: q5k_parity takes a block size and an input filename, dispatching to the right kernel and
+refusing any block size with no dequantizer, so a third type needs an argument rather than another copy of it.
+
+STATE: types 8 (Q8_0), 13 (Q5_K) and 14 (Q6_K) all have dequantizers, and both K-quants are proven bit-exact against
+the oracle.  The bind-time guard covers {8, 13} and needs one more case for 14 - which is what ffn_down is - after
+which every tensor of the leading dense FFN can be bound as floats and the ffn gate itself can be built.

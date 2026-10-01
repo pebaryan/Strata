@@ -25,8 +25,13 @@
 
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "/home/peb/moredata/glm5-q5k-parity";
+    // Block geometry and input name are arguments: 176 bytes is Q5_K, 210 is Q6_K.  Generalised rather than
+    // duplicated so that the second K-quant gets the same gate as the first, and so a future type needs an
+    // argument rather than another copy of this file.
+    const int block_bytes = argc > 2 ? std::atoi(argv[2]) : 176;
+    const std::string in_name = argc > 3 ? argv[3] : "raw_q5k_blocks.bin";
 
-    const std::string in_path = dir + "/raw_q5k_blocks.bin";
+    const std::string in_path = dir + "/" + in_name;
     FILE* f = std::fopen(in_path.c_str(), "rb");
     if (!f) { std::fprintf(stderr, "cannot open %s\n", in_path.c_str()); return 1; }
     std::fseek(f, 0, SEEK_END);
@@ -40,13 +45,13 @@ int main(int argc, char** argv) {
     }
     std::fclose(f);
 
-    const int64_t n_blocks = (int64_t) nbytes / 176;
+    const int64_t n_blocks = (int64_t) nbytes / block_bytes;
     const int64_t n = n_blocks * 256;
     std::printf("q5k parity: %lld raw blocks (%ld bytes) -> %lld elements\n",
                 (long long) n_blocks, nbytes, (long long) n);
-    if (n_blocks * 176 != (int64_t) nbytes) {
-        std::fprintf(stderr, "the block bytes are not a multiple of 176: this is a geometry failure, not a value "
-                             "failure\n");
+    if (n_blocks * block_bytes != (int64_t) nbytes) {
+        std::fprintf(stderr, "the file size is not a multiple of %d: this is a geometry failure, not a value "
+                             "failure\n", block_bytes);
         return 1;
     }
 
@@ -65,7 +70,14 @@ int main(int argc, char** argv) {
     }
 
     // The kernel reads device memory; a null stream means it synchronises internally.
-    strata::kernels::dequant_q5_K(d_blocks, d_out, n, nullptr);
+    if (block_bytes == 176) {
+        strata::kernels::dequant_q5_K(d_blocks, d_out, n, nullptr);
+    } else if (block_bytes == 210) {
+        strata::kernels::dequant_q6_K(d_blocks, d_out, n, nullptr);
+    } else {
+        std::fprintf(stderr, "no dequantizer for a %d-byte block\n", block_bytes);
+        return 1;
+    }
     e = cudaDeviceSynchronize();
     if (e != cudaSuccess) {
         std::fprintf(stderr, "dequant_q5_K: %s\n", cudaGetErrorString(e));
