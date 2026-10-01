@@ -95,3 +95,22 @@
   5. KDA state's FIRST index is the KEY axis: pred and the read sum over i, the update is k[i]*delta[j].  The
      other convention agrees at the first token and diverges from the second (it cost a phase).
   6. attention.head_count_kv is an ARRAY: it is the per-layer MLA(1)/KDA(0) table, not a head count.
+
+## THE LOADER API TO BIND AGAINST (read from the engine, not guessed)
+
+  WeightRef / the view:      const WeightRef* w = v.get("blk.0.<name>");
+                             include/strata/core/weights.hpp:48 - fields data, quantized(), code_bits,
+                             code_bias, group_elems, codebook_iq4nl, has_offset, act_kind
+  F32 tensors (ttype 0):     const float* p = (const float*) w->data;        <- the 12 in dense.bin
+  Q8_0 tensors (ttype 8):    the 14 native ones.  Dequantize into a buffer:
+                               #include <strata/kernels/quantize_act.hpp>
+                               void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream);
+                             For a matmul instead of a dense copy, the s_gemv route carries the attributes:
+                               sform_of(*w, form, name, err);  plane_ptrs(*w, name, planes, err);
+                               gemv_quantized(w, planes, form, x80, xq8k, y, n_in, n_out, name, stream, err);
+                             (all three used by src/core/layer.cpp for the Qwen4Exp path)
+  The transforms are STILL on the caller: conv_{q,k,v} -> reshape(d_inner, d_conv).T, and the pack records
+  matrices (in, out) while the verified oracle works in the GGUF's (out, in) orientation.
+
+  So glm_bind.cpp is: a loop over kGlmBlock0[] (include/strata/core/glm5_block0_gen.hpp), v.get(name),
+  the two branches above, then the three documented transforms.  No layout reasoning left in the C++.
