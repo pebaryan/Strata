@@ -19,13 +19,14 @@ which the two conventions agree on.
 
 Usage:  glm5_bisect.py [chain of tensor names]
 """
+import os
 import pathlib
 import sys
 
 import numpy as np
 
-REF = pathlib.Path("/home/peb/moredata/glm5-ref-dump5")
-PORT = pathlib.Path("/home/peb/moredata/glm5-port-dump")
+REF = pathlib.Path(os.environ.get("STRATA_REF_DUMP", "/home/peb/moredata/glm5-ref-dump5"))
+PORT = pathlib.Path(os.environ.get("STRATA_PORT_DUMP", "/home/peb/moredata/glm5-port-dump"))
 
 # the block-0 chain, in graph order; l_out-0 is the block's output
 CHAIN = ["hc_init", "hc_attn_pre-0", "attn_norm-0", "attn_output-0", "hc_attn_post-0",
@@ -50,6 +51,7 @@ def main() -> int:
             meta[f[0]] = tuple(int(x) for x in f[1:5])
 
     chain = sys.argv[1:] or CHAIN
+    print(f"port dump: {PORT}\nref dump : {REF}")
     print(f"{'tensor':<16} {'ne':<18} {'max|d| flat':>12} {'max|d| ggml':>12} {'r':>8}  verdict")
     first = None
     for n in chain:
