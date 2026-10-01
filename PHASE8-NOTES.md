@@ -577,3 +577,37 @@ Standing rule, now with four retractions behind it: a hypothesis about THIS oper
 after the quantity being compared has been established by construction.  Parts 14, 16 and 9 were each
 killed by one cheap measurement; the pattern is that source-reading and shape-reasoning both feel like
 evidence and neither is.
+
+## Part 18: attn_output-0 IS the recurrence output; the error is in q/k/v, not the recurrence's form
+
+Measured, in this order:
+
+1. WHICH INTERMEDIATE IS IT.  Correlating every oracle intermediate against the reference's attn_output-0:
+   attn +0.52075 (best), v/vc +0.20, o +0.243, q -0.005, k +0.003, g -0.002.  So attn_output-0 IS the raw
+   recurrence output.  Parts 14 and 16 were both wrong; the original annotation was right.
+
+2. THE GATE AND BETA DO NOT MATTER.  Running the recurrence with the reference's own dumped gate and beta,
+   in all four combinations, gives corr +0.52073..+0.52075 and 90.56% - identical to four decimals.  The
+   gate's 0.88% error and beta's 0.07% are irrelevant to this discrepancy.
+
+3. THE RECURRENCE'S FORM IS NOT THE DOMINANT ERROR.  Sixteen variants (decay in {exp(g), exp(-g), g, none}
+   x read {after, before} x scale {1/sqrt(hd), 1}): the best is still the current formulation (exp(g),
+   after, 1/sqrt(hd)) at +0.52073/90.56%.  Decisive detail: REMOVING THE DECAY ENTIRELY gives +0.49962 -
+   almost the same.  The decay, the read order and the scale are all secondary; nothing in the recurrence's
+   form explains a 90% magnitude error.
+
+4. THE FRONT END IS NOT A SILU/L2 PERMUTATION.  Six variants (silu on v or not, L2 on q/k or q/k/v or q
+   only, no silu) land between +0.34 and +0.54, worst errors 86-225%.
+
+CONCLUSION: ~90% magnitude error with a +0.52 correlation, insensitive to the gate, the decay, the read order
+and the scale, means the INPUTS q/k/v are wrong and wrong in a way that none of the six placements explains.
+So the next thing to check is how the oracle OBTAINS them from the artifact: attn_q/attn_k/attn_v.weight are
+Q8_0 (the pack's index shows type 8 for them), and the oracle dequantizes them through its own Model.tensor
+path - the same path the parity gates validated against fixtures the oracle itself generated.  Verify the
+oracle's dequantization of one of those matrices against an independent reader (gguf-py's own dequantizer),
+the same way the pack's bytes were checked against the GGUF earlier.  If that dequantization is wrong, the
+gate could never have seen it.
+
+Standing rule, now with five falsified hypotheses behind it this phase: measure which quantity a dumped
+tensor actually is BEFORE reasoning about it (done here, and it cleared two wrong conclusions), and prefer a
+bounded variant grid with an unambiguous pass criterion (+1.0 correlation) over further source-reading.
