@@ -181,3 +181,30 @@ glm5_pack.py converts routers to BF16 by design (and refuses to run unless the F
 BF16-representable, which they are).  So every F32 tensor the engine binds matches the verified oracle, after
 that one documented conversion.  The 14 natively-served Q8_0 tensors are read straight from the GGUF's own
 blocks and are covered by the block chain (9.2) rather than by float statistics.
+
+## 9.2 PREREQUISITE - the kernel interface the block chain calls
+
+    glm_hc.hpp       void hc_pre(const float* x, const float* fn, const float* base, const float* scale,
+                                 int n_embd, ...);
+                     void hc_post(const float* site_out, const float* residual, const HcMix& mix,
+                                  int n_embd, float* out, ...);
+                     void hc_mean(const float* x, int n_embd, float* out);
+    glm_kda.hpp      void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x,
+                                      int tokens, float* out, ...);
+    glm_mla.hpp      void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x,
+                                      int n_cache, const float* cache, ...);
+    glm_indexer.hpp  void idx_cache_row(const IdxWeights& w, const IdxGeometry& g, const float* x,
+                                        float* row_out);
+    glm_moe.hpp      void moe_route(const float* router, const float* probs_b, const MoeGeometry& g,
+                                    const float* x, ...);
+                     void expert_ffn(const float* wg, const float* wu, const float* wd,
+                                     const MoeGeometry& g, const float* x, ...);
+                     void moe_forward(const float* router, const float* probs_b, const MoeGeometry& g,
+                                      const float* x, ...);
+
+Block chain to implement, per the reference's tensor names:
+    inp -> hc_pre(hc_init) -> attn_norm -> kda_forward | mla_forward -> hc_post(hc_attn_post)
+        -> hc_pre(hc_ffn_pre) -> ffn (leading dense for blocks < 3, moe_forward otherwise) -> hc_post
+Open items the chain must settle, all measured during phase 8: the KDA recurrence for T>1 once cost a full
+debugging cycle (state carry; invisible at T=1 where the state is zero), and the swiglu clamp of 10.0 applies
+to the shared expert AND the leading dense FFN.
