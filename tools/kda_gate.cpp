@@ -104,16 +104,22 @@ int main(int argc, char** argv) {
     std::vector<float> state((size_t) nh * hd * hd, 0.f);                         // fresh state: the S matrix
 
     std::vector<float> mg(tok_nh_hd), mbeta((size_t) tokens * nh), mq(tok_nh_hd), mk(tok_nh_hd),
-                       mv(tok_nh_hd), mattn(tok_nh_hd), mo((size_t) tokens * d_inner);
+                       mv(tok_nh_hd), mattn(tok_nh_hd), mo((size_t) tokens * d_inner),
+                       mxn((size_t) tokens * n_embd), mqc(tok_nh_hd), mkc(tok_nh_hd), mvc(tok_nh_hd);
     strata::kernels::glm::KdaIntermediates mid;
     mid.g = mg.data(); mid.beta = mbeta.data(); mid.q = mq.data(); mid.k = mk.data();
     mid.v = mv.data(); mid.attn = mattn.data(); mid.o = mo.data();
+    mid.xn = mxn.data(); mid.qc = mqc.data(); mid.kc = mkc.data(); mid.vc = mvc.data();
 
     strata::kernels::glm::kda_forward(w, g, x.data(), tokens, out.data(), state.data(), &mid);
 
     std::printf("kda gate: %s, %d token(s), weights and input from the oracle's fixture\n", dir.c_str(), tokens);
     int failures = 0;
     failures += report("result", out,   dir, "result.bin");
+    failures += report("xn",     mxn,   dir, "inter_xn.bin");
+    failures += report("qc",     mqc,   dir, "inter_qc.bin");
+    failures += report("kc",     mkc,   dir, "inter_kc.bin");
+    failures += report("vc",     mvc,   dir, "inter_vc.bin");
     failures += report("g",      mg,    dir, "inter_g.bin");
     failures += report("beta",   mbeta, dir, "inter_beta.bin");
     failures += report("q",      mq,    dir, "inter_q.bin");

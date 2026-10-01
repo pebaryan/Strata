@@ -2104,3 +2104,41 @@ the engine's q and k are printed by kda_gate, and if the engine normalizes corre
 must have sum of squares 1.  Compute that from the fixture's engine-side output.  A unit-norm q with a wrong
 direction localizes the fault to qc; a NON-unit q localizes it to l2_norm itself, which would be a cleaner bug and a
 much shorter investigation.  That is one print, not a new build.
+
+########  BLOCK 1 PINPOINTED: THE FAULT IS THE CONV/SILU STEP, AND IT LOOKS LIKE A SCALE  ########
+
+Adding the four previously-skipped stages to kda_gate's table (they were never missing from the engine - the struct
+already had xn, qc, kc and vc; the gate simply never printed them) resolves the bracket to a single operation:
+
+    BLOCK 1                                  BLOCK 0 (regression)
+    xn   PASS  1.177e-07                     xn   PASS
+    qc   FAIL  8.540e+00    <- first failure qc   PASS
+    kc   FAIL  4.408e+00                     kc   PASS
+    vc   FAIL  4.731e+01                     vc   PASS
+    g    PASS    beta PASS                   g, beta PASS
+    q,k,v,attn,o FAIL                        q,k,v,attn,o PASS  -> 12/12 PASS
+
+So xn is correct on block 1 and qc - the very next stage, and the first thing computed from xn - is wrong.  The
+fault is exactly  xn @ w.T -> conv1d -> SiLU,  with nothing else in the bracket.  Block 0 passing all twelve stages
+including the four new ones is what makes this a data-dependent fault rather than a broken kernel.
+
+THE SCALE IS THE SIGNAL.  Everything feeding that step has been excluded by check: xn (xn PASSES), the weights and
+their conv repack (the block-0 self-test reproduced all 16 w_*.bin at 0.000e+00), the geometry (both blocks
+(8192, 1, 4)), the binding (not on this path), and the kernel in general (12/12 on block 0).
+
+What is NOT excluded, and it is the obvious next thing to look at: the fixture's weights for BLOCK 1.  The self-test
+proved the builder's weight path is correct by reproducing block 0's fixture exactly - but it has never verified
+block 1's weights, because there is no second known-good fixture to compare against.  If block 1's attn_q or
+ssm_conv1d_* dequantize differently, both the engine and the oracle would be reading the same wrong numbers...
+
+...except that kda_gate hands the FIXTURE'S weights to the engine, and the fixture's intermediates come from the
+oracle reading those same arrays.  So a wrong weight file would move both sides together and could NOT produce a
+disagreement.  Which is worth stating because it eliminates the whole family.
+
+The engine's qc maxes at 0.0636 while rel 8.54 against the oracle's scale implies the oracle's values are about an
+order of magnitude larger - a scale relationship rather than a direction error.
+
+NEXT MEASUREMENT, one line and no new build: report() prints only the ENGINE's statistics.  Print the reference's
+min/max/sum beside them.  The ratio would then be visible directly instead of inferred from rel, and a clean factor
+would name the cause - 1/sqrt(hd), a missing conv normalisation, or a g/beta-shaped scaling are the candidates that
+fit an order of magnitude on a step that is a matmul followed by a convolution.
