@@ -19,6 +19,8 @@
 
 #include "strata/kernels/glm_hc.hpp"
 
+#include "strata/core/glm_block_kinds.hpp"   // glm_attention_is_mla / glm_ffn_is_dense, compile-time asserted
+
 namespace strata::core::glm {
 
 /// One block's hyper-connection front end.

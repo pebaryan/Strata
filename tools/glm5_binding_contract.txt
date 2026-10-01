@@ -3179,3 +3179,23 @@ WHAT "RUN THE WHOLE CHAIN" STILL NEEDS, precisely, so the next step is a list an
      port's target is a number, not an impression.
 
 Item 2 is the one with real unknowns; the rest are assembly over kernels that already have gates.
+
+########  BLOCK-KIND DISPATCH: MEASURED, AND IT CORRECTS AN EARLIER BELIEF  ########
+
+    glm5next.attention.head_count_kv, 46 values:
+        0 0 0 1  0 0 0 1  0 0 0 1  0 0 0 1  0 0 0 1  0 0 0 1  0 0 0 1  0 0 0 1  0 0 0 1  0 0 0 1  0 0 0 1  0 1
+    glm5next.leading_dense_block_count = 3
+    corroborated by the generated table: 43 ffn_gate_inp (router) rows, 3 dense ffn_gate rows, 48 MLA projections
+
+MLA is not "block 3".  It is every fourth layer starting at 3 PLUS the final layer - layers 3, 7, 11, 15, 19, 23, 27,
+31, 35, 39, 43 and 45 - so TWELVE of the forty-six, with thirty-four KDA.  An earlier note in this port recorded
+"block 3 is MLA", which is true only of the first occurrence; a loop written from that note would have run thirty-three
+MLA layers down the KDA path and produced plausible, wrong numbers, which is the failure mode this port has spent the
+most time on.
+
+That rule now lives in include/strata/core/glm_block_kinds.hpp as glm_attention_is_mla(layer) and
+glm_ffn_is_dense(layer), with the counts ASSERTED AT COMPILE TIME (12 MLA, 34 KDA, all 46 covered).  If the table and
+the artifact ever disagree the build fails, rather than the loop dispatching silently - the same rule the rest of this
+port follows, applied to a table that is easy to mistype and impossible to verify by eye.
+
+So the loop's dispatch input is now known and checked, and the remaining question for item 1 is only the wiring.
