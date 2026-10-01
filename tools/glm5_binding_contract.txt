@@ -1860,3 +1860,40 @@ WHAT IS NOW IN PLACE FOR THE FFN GATE - all four prerequisites, none of them the
 REMAINING FOR THE GATE: a fixture (an input vector plus the oracle's dense_forward output for it) and a tool that
 calls the engine's dense FFN and compares.  That is the next build, and it is the first thing in this port that
 exercises a second stage of a block rather than a second aspect of the first.
+
+########  THE FFN FIXTURE, AND THE ONE THING THE GATE MUST PROVE ABOUT ITSELF  ########
+
+FIXTURE /home/peb/moredata/glm5-ffn-l0, built from the oracle:
+
+    input.bin    4096 floats, the dump's attn_norm-0 - i.e. the output of the stage-1 path the driver already
+                 verifies, so the input is a real activation rather than a synthetic vector
+    result.bin   4096 floats, the oracle's dense_forward(m, 0, x)
+    raw_gate.bin / raw_up.bin     34,603,008 B = 196,608 x 176  (Q5_K)
+    raw_down.bin                  41,287,680 B = 196,608 x 210  (Q6_K)
+    weights: gate (12288,4096)  up (12288,4096)  down (4096,12288)
+
+CAUGHT BEFORE IT BECAME A FALSE GREEN: the first fixture used the KDA gate's result vector as the input, and its
+scale is ~1e-6, so the FFN output came out at min -1.2e-05 / max +1.5e-05 after a 12288-wide SwiGLU.  A gate whose
+expected output is that small can be satisfied by a fair amount of wrong arithmetic - the same class of problem as
+ffn_down's symmetric min/max, and the same lesson: an expected value with no dynamic range is not evidence.  Rebuilt
+with attn_norm-0 (input rms 0.0809, output rms 0.0114, ~1400x larger), and the fixture now prints input and output
+rms so the comparison's discriminating power is visible rather than assumed.
+
+WHAT THE TOOL MUST FILL, all of it now known rather than guessed:
+
+    MoeGeometry g;  g.n_embd = 4096;  g.ff = 12288;      // ff is 12288 for a leading dense block, NOT 2048
+    expert_ffn(wg, wu, wd, g, x, out, /*clamp_limit=*/10.0f);
+
+clamp_exp and clamp_shexp are BOTH 10.0 on block 0, so the value is unambiguous - but the separate argument is what
+makes it explicit, and the engine's own header warns why that matters: "with a limit of 10 it is invisible until a
+pre-activation exceeds 10, so a caller that forgets it will still pass most tests."  Which is this gate's real
+obligation:
+
+  THE GATE MUST ASSERT THAT ITS FIXTURE EXERCISES THE CLAMP.  Compute wg @ x in the tool and count how many entries
+  exceed +10.  If that count is zero, the clamps are inert on this input, the gate would pass with clamp_limit set
+  to 0, and it would be reporting on arithmetic it never touched.  The count belongs in the output.  This is the
+  same rule as the stage-1 gate's ("a gate must assert its fixture actually exercises the term it tests"), applied
+  to the first stage where a constant can silently do nothing.
+
+Also worth knowing: the reference dump carries attn_norm-0 through attn_norm-44, i.e. a real activation for every
+block, so future per-block gates do not need to synthesise inputs.
