@@ -511,3 +511,30 @@ Also worth stating plainly: this is the fourth hypothesis this phase that measur
 not "read more source" but "before comparing two tensors, establish by construction that they are the same
 quantity" - the guard that worked for rms_norm and for the gate, and the one nobody has run for
 attn_output-0.
+
+## Part 16: we have been comparing the WRONG TENSOR - attn_output-0 is not the recurrence output
+
+The reference's attn_output-0 has ne = (128, 64, 5) = [hd, nh, T]: a PER-HEAD tensor.  A post-wo value would
+be [4096, 5], so attn_output-0 sits AFTER the within-head RMS norm and AFTER the sigmoid gate, but BEFORE
+wo.  glm5_block_driver.py dumps kmid["attn"], the raw recurrence output, pre-norm and pre-gate, and calls it
+attn_output-0.  Those are different quantities, and the docstring asserting otherwise was our annotation,
+not evidence.
+
+That single mismatch explains every observation that has been confusing this phase: the right magnitude (the
+norm and gate are monotone-ish scalings), a partial correlation of about +0.52, and COMPLETE INSENSITIVITY
+to changing the recurrence - including the axis swap in part 14, which measured identically because the
+compared tensor is not the recurrence's output at all.
+
+Correct next comparison: the oracle's `o` - rms_norm(attn) over the head dim, then the sigmoid gate, before
+wo - reshaped to (hd, nh, T) and written as attn_output-N.  One line in the driver:
+
+    write_tensor(dump, f"attn_output-{il}", np.transpose(o.reshape(T, NH, HD), (2, 1, 0)))
+
+Then: match means the recurrence, the within-head norm and the gate are all correct and the error lives in
+wo or later (l_out-0 is the unambiguous block output and it diverges, so something after this point is
+still wrong); mismatch means the bug is inside the norm/gate or the recurrence.
+
+THE RULE this phase keeps re-teaching, now four times over: before comparing two tensors, establish by
+construction that they are the same quantity - the same guard that worked for rms_norm (verified to 6e-08)
+and for the gate (verified to 0.88%).  A tensor's SHAPE is the cheapest such evidence and it was sitting in
+the manifest the whole time: [hd, nh, T] cannot be a post-wo tensor.
