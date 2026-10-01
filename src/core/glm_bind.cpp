@@ -222,6 +222,7 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
                 got.ptr = host_f;
             }
             got.quantized = false;
+            got.native_type = 0;
             got.ne0 = t.ne0;                 // the artifact's orientation, NOT swapped
             got.ne1 = t.ne1;
             out.tensors.push_back(got);
@@ -252,6 +253,7 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             out.owned.push_back(dev3);
             got.ptr = dev3;
             got.quantized = true;
+            got.native_type = (int) w->native_type;
             out.tensors.push_back(got);
             continue;
         } else if (w->native_data) {
@@ -259,7 +261,8 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             // must NOT be transposed.  Transposing it - which an earlier version of this file did - is trap 7
             // misapplied: trap 7 is about the PACK's dense.bin rows, not the GGUF's own tensors.
             got.ptr = (const float*) w->native_data;
-            got.quantized = true;             // the GGUF's own blocks: NOT floats, do not read as floats
+            got.quantized = true;
+            got.native_type = (int) w->native_type;             // the GGUF's own blocks: NOT floats, do not read as floats
             got.ne0 = t.ne1;
             got.ne1 = t.ne0;
         } else {

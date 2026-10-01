@@ -10,8 +10,13 @@
 namespace strata::core {
 
 struct GlmBoundBlock {
+    /// `native_type` is the artifact's ggml type for a quantized tensor (0 for floats).  It is carried here because a
+    /// caller that has to DEQUANTIZE one cannot decide how from the bound block alone - the type lived only on the
+    /// WeightRef the binder was holding, so a per-layer streamer (which must not dequantize all forty-five layers at
+    /// once: 20-30 GB of host floats, measured as an OOM kill) had no way to dispatch.  Recording it costs four bytes
+    /// and removes the only reason that streamer would have had to re-query the weight table per layer.
     struct Tensor { std::string name; const float* ptr = nullptr; int ne0 = 0; int ne1 = 0;
-                    bool quantized = false; };   ///< native GGUF blocks, not floats
+                    bool quantized = false; int native_type = 0; };   ///< native GGUF blocks, not floats
     std::vector<Tensor> tensors;
     std::vector<float*> owned;
     std::vector<void*> host_stage;
