@@ -215,7 +215,10 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
                     return false;
                 }
                 cudaFree(dev_f);
-                out.owned.push_back(host_f);
+                // host_stage, NOT owned: `owned` is released with cudaFree, so a malloc'd host pointer there would be
+                // freed by the wrong allocator the moment a GlmBoundBlock is destroyed.  The struct already carries a
+                // host_stage vector for exactly this, which is what a binder expecting host-side weights would use.
+                out.host_stage.push_back(host_f);
                 got.ptr = host_f;
             }
             got.quantized = false;

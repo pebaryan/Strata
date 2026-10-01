@@ -5124,3 +5124,45 @@ And the earlier note in glm_bind.cpp (lines 143-148) about widening this branch 
 about the swap orientation of a native attention matrix, still stands as something to check when the per-layer path is
 written: the count comes from the plan row while the bytes are the native tensor's, and for a swapped matrix those need
 not agree.
+
+THE INFRASTRUCTURE FOR HOST-SIDE WEIGHTS ALREADY EXISTS IN THE BINDER - IT JUST ISN'T USED
+
+Three things found by reading rather than guessing, all of which shorten the remaining work:
+
+ 1. THE CORRECTION TO MY OWN FIX.  GlmBoundBlock carries TWO ownership vectors and they are released by DIFFERENT
+    allocators:
+
+        GlmBoundBlock::~GlmBoundBlock() {
+            for (float* p : owned)      if (p) cudaFree(p);
+            for (void*  p : host_stage) if (p) free(p);
+        }
+
+    My host copy went into `owned`, where the destructor would have cudaFree'd a malloc'd pointer - the wrong
+    allocator on the wrong heap.  It now goes into `host_stage`, which is what the vector exists for, and the fix is
+    correct rather than merely working.
+
+ 2. A HOST-STAGING HELPER ALREADY EXISTS:
+
+        /// Dequantize a quantized tensor to device, then transpose (in,out) -> (out,in).
+        /// The transpose is done on the host once per layer: this runs at bind time, not per token.
+        static bool dequant_transposed(const WeightRef& w, int ne0, int ne1, void* stream, float** out_dev,
+                                       void** out_host, std::string& err)
+
+    It produces BOTH a device copy and a HOST copy, it already handles the transposition the native attention
+    matrices need, and its own comment says "once per layer" - which is the same granularity the streaming design
+    needs.  So the pieces for host-side weights are not new work; they are present and unused, because the branch
+    that needed them was written for a GPU consumer.
+
+ 3. WHAT A BOUND TENSOR DOES *NOT* CARRY:
+
+        struct Tensor { std::string name; const float* ptr; int ne0; int ne1; bool quantized; };
+
+    There is no native type on a bound tensor - only whether it is quantized - so a per-layer streamer cannot decide
+    HOW to dequantize from the bound block alone.  The type lives on the WeightRef (w->native_type, which the binder
+    already dispatches on) and would have to be re-queried from the table, or carried onto Tensor.  Either is a small
+    change, but it is the first thing the streamer needs and it is not there today.
+
+SO THE REMAINING WORK IS SMALLER THAN THE LAST ENTRY IMPLIED: a per-layer provider that, for each layer, calls the
+existing dequant_transposed (or its unscrambled sibling) for the CPU-consumed tensors, staging them in host_stage and
+repointing the bound block before glm_fill_layer_weights runs - with the type carried along so the dispatch can happen.
+The OOM finding still stands: this must happen one layer at a time, because all forty-five at once is 20-30 GB.
