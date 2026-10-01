@@ -1708,3 +1708,57 @@ after that, a second block in the chain.
 
 STATE: five gates green, all committed, nothing half-built.  glm5_bind_check, kda_gate, kda_binding_check.py,
 q5k_parity, fixtures glm5-kda-l0-t1 / glm5-kda-l0-t5 / glm5-q5k-parity.
+
+################################################################
+## STEP 1 for the ffn gate: dequantize_row_q6_K (type 14, 210-byte blocks, 256 elements)
+## Needed because blk.0.ffn_down.weight is type 14, not the Q5_K that attn_q/k/v use.  ffn_gate and
+## ffn_up ARE Q5_K and already covered by dequant_q5_K.  Captured verbatim, same as the Q5_K source.
+################################################################
+--- block_q6_K: uint8_t ql[QK_K/2]; uint8_t qh[QK_K/4]; int8_t scales[QK_K/16]; ggml_half d;  (210 bytes)
+void dequantize_row_q6_K(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_K == 0);
+    const int64_t nb = k / QK_K;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        const uint8_t * GGML_RESTRICT ql = x[i].ql;
+        const uint8_t * GGML_RESTRICT qh = x[i].qh;
+        const int8_t  * GGML_RESTRICT sc = x[i].scales;
+
+        for (int n = 0; n < QK_K; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l/16;
+                const int8_t q1 = (int8_t)((ql[l +  0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                const int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                const int8_t q3 = (int8_t)((ql[l +  0]  >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                const int8_t q4 = (int8_t)((ql[l + 32]  >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l +  0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
+            }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+
+THE FFN GATE'S PREREQUISITE, IDENTIFIED BEFORE STARTING IT
+
+Reading both implementations before building anything turned up the ordering that matters:
+
+  oracle  tools/glm5_moe_reference.py:123   swiglu_ffn(wg, wu, wd, x, limit, tag)
+                            :204            dense_forward(m, layer, x)        <- the leading dense FFN
+  engine  include/strata/kernels/glm_moe.hpp:32-33  the GATE clamp is ONE-SIDED (from above only), and the leading
+                                           dense FFN uses swiglu_clamp_SHEXP, not the routed experts' limit
+  block 0 blk.0.ffn_gate 4096x12288 (Q5_K)  ffn_up 4096x12288 (Q5_K)  ffn_down 12288x4096 (TYPE 14)  ffn_norm
+
+So a dense SwiGLU with a 12288-wide intermediate, TWO clamp subtleties that a plausible implementation gets wrong,
+and - the part worth catching now rather than after writing the gate - ffn_down is Q6_K, which this engine still has
+no dequantizer for.  The recipe is now known-good from the Q5_K round and is four steps: transcribe (source captured
+above), gate BIT-EXACT against the oracle's own dequantization of blk.0.ffn_down.weight (the same independent
+reference, not llama.cpp's C), widen the guard to {8, 13, 14}, then build the ffn gate itself.
+
+Worth noting what this says about the plan: the ffn gate cannot be built before the Q6_K dequantizer, and that
+dependency was invisible until the two ffn implementations were read.  Reading both sides before writing either is
+what surfaced it - and it is the same move that located the real risk last round.
