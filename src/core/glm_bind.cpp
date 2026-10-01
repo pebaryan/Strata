@@ -117,7 +117,8 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             } else {
                 got.ptr = p;
             }
-        } else if (std::getenv("STRATA_HC_DEQUANT") && w->native_type == 8 &&
+        } else if (std::getenv("STRATA_HC_DEQUANT") &&
+                   (w->native_type == 8 || w->native_type == 13) &&
                    ((full.size() >= 10 && full.compare(full.size() - 10, 10, "_fn.weight") == 0) ||
                     (std::getenv("STRATA_DEQUANT_ALL_Q8_0")))) {
             // The hc function matrices (hc_attn_fn / hc_ffn_fn) are consumed as FLOATS by hc_pre, which reads
@@ -154,7 +155,19 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             // is about this dequant and not about something that happened before it - cudaGetLastError() is
             // sticky, which is exactly how a downstream failure gets misattributed to this step.
             (void) cudaGetLastError();
-            strata::kernels::dequant_q8_0((const uint8_t*) w->native_data, dev_f, n, stream);
+            // Dispatch by TYPE, and only for types a dequantizer implements.  Type 8 is Q8_0 (34-byte blocks,
+            // 32 elements) and type 13 is Q5_K (176-byte blocks, 256 elements) - the type this artifact uses for
+            // attn_q/k/v, attn_output, ffn_gate and ffn_up.  dequant_q5_K was gated BIT-EXACT against the oracle
+            // over a 134 MB tensor before being wired in here.
+            if (w->native_type == 8) {
+                strata::kernels::dequant_q8_0((const uint8_t*) w->native_data, dev_f, n, stream);
+            } else if (w->native_type == 13) {
+                strata::kernels::dequant_q5_K((const uint8_t*) w->native_data, dev_f, n, stream);
+            } else {
+                err = std::string("glm_bind: no dequantizer for type ") + std::to_string(w->native_type) +
+                      " (" + full + ")";
+                return false;
+            }
             if (stream) cudaStreamSynchronize((cudaStream_t) stream);
             // INSTRUMENTATION: name the step rather than theorise.  If a tensor's dequant is what poisons the
             // context, the error is already set here - and reporting it per tensor says WHICH tensor and at which

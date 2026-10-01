@@ -1558,3 +1558,31 @@ condition change.  That is safe for the same reason the type guard was: each deq
 type it implements, and this one has now been proven bit-exact rather than merely compiled.  Then
 tools/kda_binding_check.py should report 13 PASS and zero quantized, and kda_gate can be re-run with the engine's
 own bound weights instead of the oracle's fixture files - the last gate before the chain continues past attention.
+
+########  STEP 3 DONE: THE KDA BINDING IS COMPLETE - 13 PASS, 0 FAIL, 0 QUANTIZED  ########
+
+Guard widened to {8, 13} with a dispatch on type (and a hard error for any type with no dequantizer, so an
+unhandled type fails loudly instead of being read as the wrong block size - which is precisely the bug that cost
+this session its first half):
+
+    attn_norm 3.2e-09   ssm_f_a  8.6e-10   o_norm 3.2e-10
+    conv_q    1.0e-11   ssm_f_b  8.2e-10   wo     8.5e-10   <- via Q5_K, was "quantized" before
+    conv_k    1.1e-11   ssm_beta 3.0e-10
+    conv_v    1.6e-09   ssm_g_a  1.0e-09
+    ssm_a     1.3e-08   ssm_g_b  3.9e-11
+    dt_bias   4.4e-09
+    -> 13 PASS, 0 FAIL, 0 quantized        run exit 0, dequant errors 0
+
+wq/wk/wv are not among those thirteen because the checker's table never listed them - they were the ones that could
+not be compared, so they were left out and not put back.  They ARE now covered, by a stronger check than min/max:
+the parity run dequantized blk.0.attn_q.weight through the newly bound path and the engine's values matched the
+oracle EXACTLY, element for element, over all 33,554,432 of them.  Since attn_q IS wq (confirmed earlier by
+min/max against the w_wq fixture), wq is verified exactly, and wk/wv flowed through the identical code path with the
+same kernel.  Adding the three keys to the checker's table would make it report sixteen in one command, and that is
+worth doing before the table is trusted as a complete inventory rather than an inventory of what used to be
+checkable.
+
+STEP 4, the last one: run kda_gate on the ENGINE'S OWN bound weights instead of the oracle's fixture files.  The
+fixture files exist because the weights could not be bound as floats; that reason is now gone.  That is the gate
+which proves the wiring end to end rather than kernel and binding separately, and after it the chain can continue
+past the attention call.
