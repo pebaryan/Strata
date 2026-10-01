@@ -9,12 +9,17 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <algorithm>
+#include <sstream>
+#include <fstream>
 #include <set>
 #include <cstdlib>
 #include <string>
 #include <vector>
 
 #include "strata/core/glm_bind.hpp"
+#include "strata/core/glm_layer.hpp"
 #include "strata/core/native_dense.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/weights.hpp"
@@ -31,6 +36,7 @@ int main(int argc, char** argv) {
     const std::string pack = argv[1];
     const std::string shard = argc > 2 ? argv[2] : "";
     const int block = argc > 3 ? std::atoi(argv[3]) : 0;
+    const char* refdump = argc > 4 ? argv[4] : nullptr;
     std::string err;
 
     strata::core::WeightTable table;
@@ -115,5 +121,95 @@ int main(int argc, char** argv) {
                     t.ne0, t.ne1, n, mn, mx, sum, (unsigned long long) fnv1a(host));
     }
     cudaFree(arena);
-    return 0;
+    
+    // ---- chain stage 1: hc_pre -> rms_norm, on the REFERENCE's own hc_init -----------------------
+    // Judged against hc_attn_pre-N / attn_norm-N rather than only end to end, so an error is localised
+    // to a stage instead of to "the model".
+    if (refdump) {
+        auto tensor_by_name = [&](const char* n) -> const float* {
+            for (const auto& t : bound.tensors) if (t.name == n) return t.ptr;
+            return nullptr;
+        };
+        const std::string tsv = std::string(refdump) + "/dump.tsv";
+        std::ifstream mf(tsv);
+        if (!mf) { std::fprintf(stderr, "stage1: cannot read %s\n", tsv.c_str()); return 1; }
+        std::string file, line;
+        std::vector<float> hc_init;
+        int ne0 = 0, ne1 = 0, ne2 = 0, ne3 = 0;
+        while (std::getline(mf, line)) {
+            std::vector<std::string> c; std::stringstream ss(line); std::string f;
+            while (std::getline(ss, f, '\t')) c.push_back(f);
+            if (c.size() < 8 || c[0] != "hc_init") continue;
+            ne0 = std::atoi(c[1].c_str()); ne1 = std::atoi(c[2].c_str());
+            ne2 = std::atoi(c[3].c_str()); ne3 = std::atoi(c[4].c_str());
+            file = c[7];
+        }
+        if (file.empty()) { std::fprintf(stderr, "stage1: no hc_init in %s\n", tsv.c_str()); return 1; }
+        std::ifstream bf(std::string(refdump) + "/" + file, std::ios::binary);
+        hc_init.resize((size_t) ne0 * ne1 * ne2 * ne3);
+        bf.read((char*) hc_init.data(), (std::streamsize) (hc_init.size() * sizeof(float)));
+        std::fprintf(stderr, "stage1: hc_init ne=%d,%d,%d,%d\n", ne0, ne1, ne2, ne3);
+
+        // ggml order is ne0 fastest.  Element (embd, hc, tok) of [ne0,ne1,ne2,ne3] = [embd,hc,tok] sits at
+        // embd + ne0*hc + ne0*ne1*tok - the reshape lesson from phase 8 - so token 0's [HC][n_embd] streams
+        // are the first ne0*ne1 floats.
+        for (const char* n : {"hc_attn_fn.weight", "hc_attn_base.weight", "hc_attn_scale.weight",
+                              "attn_norm.weight"}) {
+            const float* q = nullptr; bool quant = false; int d0 = 0, d1 = 0;
+            for (const auto& t : bound.tensors)
+                if (t.name == n) { q = t.ptr; quant = t.quantized; d0 = t.ne0; d1 = t.ne1; }
+            std::fprintf(stderr, "  arg %-22s ptr=%p quantized=%d ne=%d,%d\n", n, (const void*) q, (int) quant,
+                         d0, d1);
+        }
+        std::vector<float> layer_in(ne0);
+        std::string serr;
+        // hc_pre is HOST code - std::vector, std::sqrt, std::getenv, no CUDA anywhere in it - so every pointer
+        // it receives must be host-accessible.  The bound weights live in the device arena (and the
+        // dequantized hc_fn in a device buffer), which is exactly what the original segfault was: a DEVICE
+        // pointer dereferenced as host memory.  Copy them across first.
+        auto host_copy = [&](const char* n, size_t count, std::vector<float>& dst) -> bool {
+            const float* q = nullptr; int d0 = 0, d1 = 0;
+            for (const auto& t : bound.tensors) if (t.name == n) { q = t.ptr; d0 = t.ne0; d1 = t.ne1; }
+            if (!q) { std::fprintf(stderr, "stage1: %s not bound\n", n); return false; }
+            const size_t want = count ? count : (size_t) d0 * (size_t) (d1 > 0 ? d1 : 1);
+            dst.resize(want);
+            // Ask CUDA what the pointer IS rather than assuming: the dequantized hc_fn lives in a cudaMalloc
+            // buffer, while the F32 arena weights are host-accessible in this build - a blanket
+            // DeviceToHost copy fails with "invalid argument" on the latter, and blanket memcpy would
+            // segfault on the former.
+            cudaPointerAttributes attr{};
+            const bool is_device = (cudaPointerGetAttributes(&attr, q) == cudaSuccess &&
+                                    attr.type == cudaMemoryTypeDevice);
+            cudaGetLastError();   // clear the "invalid argument" a host pointer raises
+            if (is_device) {
+                if (cudaMemcpy(dst.data(), q, want * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                    std::fprintf(stderr, "stage1: copy %s failed: %s\n", n, cudaGetErrorString(cudaGetLastError()));
+                    return false;
+                }
+            } else {
+                std::memcpy(dst.data(), q, want * sizeof(float));
+            }
+            std::fprintf(stderr, "  %-22s %s\n", n, is_device ? "device -> host" : "host (used directly)");
+            return true;
+        };
+        std::vector<float> h_fn, h_base, h_scale, h_norm;
+        if (!host_copy("hc_attn_fn.weight", 0, h_fn) || !host_copy("hc_attn_base.weight", 0, h_base) ||
+            !host_copy("hc_attn_scale.weight", 0, h_scale) || !host_copy("attn_norm.weight", 0, h_norm))
+            return 1;
+        std::fprintf(stderr, "stage1: host copies fn=%zu base=%zu scale=%zu norm=%zu\n", h_fn.size(),
+                     h_base.size(), h_scale.size(), h_norm.size());
+        strata::kernels::glm::HcMix mix;
+        if (!strata::core::glm::glm_stage_hc_norm(hc_init.data(), ne0, h_fn.data(), h_base.data(),
+                                                 h_scale.data(), h_norm.data(), layer_in.data(), &mix, 1e-5f,
+                                                 (void*) stream, serr)) {
+            std::fprintf(stderr, "stage1: call FAILED: %s\n", serr.c_str()); return 1;
+        }
+        std::fprintf(stderr, "stage1: call returned\n");
+        double mn = 1e30, mx = -1e30, sm = 0;
+        for (float v : layer_in) { mn = std::min(mn, (double) v); mx = std::max(mx, (double) v); sm += v; }
+        std::printf("blk.%d.attn_norm.weight\tne=%d,0\tn=%zu\t%.9g\t%.9g\t%.9g\t0\n", block, ne0,
+                    layer_in.size(), mn, mx, sm);
+    }
+
+return 0;
 }

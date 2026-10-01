@@ -237,3 +237,23 @@ reference is `ggml_rms_norm` then a plain multiply.
 
 So chain stage 1 is fully specified end to end: hc_pre -> rms_norm_weighted -> hc_post, with every argument,
 weight, layout and comparator in hand and written down.  Nothing to measure before writing it.
+
+## 9.2 STAGE 1 - WHERE IT STANDS, AND THE ONE THING TO READ NEXT
+
+The stage itself is written and compiled (src/core/glm_layer.cpp); the fight has been over how to hand it
+pointers, and that has narrowed to one fact worth reading rather than guessing:
+
+  * hc_pre is HOST code.  No CUDA in it at all - std::vector, std::sqrt, std::getenv (glm_hc.cpp:58-96).
+  * hc_attn_fn is now dequantized (9ac5c58) and lives in a cudaMalloc buffer: `cudaPointerGetAttributes`
+    reports it as device, and a DeviceToHost copy of it WORKS.
+  * hc_attn_base / hc_attn_scale / attn_norm come from the weight arena.  For those:
+      - cudaMemcpy(DeviceToHost) fails "invalid argument", and
+      - cudaPointerGetAttributes does not report them as device, and
+      - a plain memcpy from the same pointer SEGFAULTS.
+    A pointer that fails all three is not a pointer whose kind should be inferred by trial.
+
+NEXT ACTION, and it is a read rather than an experiment: find how the engine's OWN host code reads arena
+weights.  src/core/layer.cpp uses WeightRef::data with sform_of / plane_ptrs, and those helpers are the
+engine's stated convention for "this WeightRef's bytes, as host code may touch them".  Whatever they do -
+managed memory, a host-mapped arena, or a device->host staging step - is what stage 1 must do too.  Do not
+guess between memcpy and DeviceToHost again; three measurements have already ruled out both by trial.
