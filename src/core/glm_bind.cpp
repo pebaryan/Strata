@@ -142,6 +142,12 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             // came back as "cudaMalloc failed".
             strata::kernels::dequant_q8_0((const uint8_t*) w->native_data, dev_f, n, stream);
             if (stream) cudaStreamSynchronize((cudaStream_t) stream);
+            // Discriminating probe: run the kernel, then discard its result.  If the arena still corrupts,
+            // the kernel's write is the cause; if it does not, holding this second allocation is.
+            if (std::getenv("STRATA_HC_DEQUANT_KERNEL_ONLY")) {
+                cudaFree(dev_f);
+                continue;
+            }
             out.owned.push_back(dev_f);
             got.ptr = dev_f;
             got.quantized = false;

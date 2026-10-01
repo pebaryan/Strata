@@ -352,3 +352,26 @@ bookkeeping or the WeightRef for hc_attn_fn being replaced rather than the two c
 
 Still not a reason to guess a fourth variant at runtime: the state that passed 9.1 is the default, and the
 opt-in branch is documented as unverified.
+
+A/B TEST - THE KERNEL IS INNOCENT; HOLDING THE ALLOCATION IS WHAT BREAKS IT
+
+    A: STRATA_HC_DEQUANT=1 STRATA_HC_DEQUANT_KERNEL_ONLY=1   (kernel runs, dev_f freed, nothing stored)
+       exit=1, and blk.0.attn_norm.weight reads back the VERIFIED values: 0.0703125 / 0.157226562 / 420.698242
+    B: STRATA_HC_DEQUANT=1                                    (kernel runs, dev_f pushed to out.owned)
+       exit=139, probe hc_attn_base.weight attr=ok other  (cudaMemoryTypeUnregistered)
+
+So the dequant kernel writes correctly - which the convention read already predicted - and the damage comes from
+RETAINING the buffer.  An independent 1.5 MB allocation cannot make the arena unregistered by existing, so the
+mechanism must be that something downstream frees a pointer it should not: the glb is out.owned, the
+GlmBoundBlock's list of allocations it frees.  The question to answer next is therefore narrow and about
+lifetime, not arithmetic:
+
+    does anything else in the binding push an ARENA pointer (repacked, F32, or a WeightRef data pointer) into
+    out.owned, so that the destructor frees part of the arena - and does adding one more entry change what gets
+    freed where?
+
+That is a read of the branches that populate out.owned plus GlmBoundBlock's destructor, and it is the last step
+between here and a working stage 1.
+
+Default path is unchanged and still the one that passes 9.1's check: the branch is opt-in, documented as
+unverified.
