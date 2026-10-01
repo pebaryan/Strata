@@ -130,11 +130,20 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             if (cudaMalloc(&dev_f, (size_t) n * sizeof(float)) != cudaSuccess) {
                 err = "glm_bind: cudaMalloc failed for " + full; return false;
             }
-            // OPT-IN ONLY (STRATA_HC_DEQUANT): this branch is known to CORRUPT THE ARENA - with it on, the
-            // F32 rows next to it come back cudaMemoryTypeUnregistered and any read faults, while with it off
-            // the same rows read back the verified values.  What hc_pre needs (floats, unswapped) is right;
-            // how this dequant produces them overruns.  Left off the default path so the binding stays at the
-            // state that passed 9.1's 12/12 check.
+            // OPT-IN ONLY (STRATA_HC_DEQUANT).  EARLIER NOTE, NOW RETRACTED: this branch was recorded here as
+            // one that "CORRUPTS THE ARENA", because with the flag on the F32 rows next to it read back
+            // cudaMemoryTypeUnregistered and any read faulted.  That was WRONG, and the real cause is known:
+            // the driver ran this stage block AFTER its own cudaFree(arena), so every arena pointer was a freed
+            // allocation - cudaMemoryTypeUnregistered is what that looks like.  The flag only appeared to be the
+            // cause because it was the only configuration that REACHED the stage at all.  No corruption was ever
+            // demonstrated, and the branch produces exactly what hc_pre needs (floats, unswapped).
+            //
+            // What is still unverified for this branch, and is the next thing to measure rather than assume:
+            // n is taken from the PLAN ROW (t.ne0 * t.ne1), while the bytes being read are the NATIVE tensor's.
+            // For the hc function matrices those agree.  For a swapped native attention matrix they need not, and
+            // widening this branch to attn_q/k/v produced a poisoned context - cudaMalloc failing on a later
+            // tensor with the GPU free - so the count, and what the native blocks actually are, is the thing to
+            // check before widening it again.
             //
             // w->native_data is the artifact's own Q8_0 blocks, already resident on the DEVICE and in the
             // artifact's orientation (NativeDense copies them as they are).  dequant_q8_0 takes device blocks
