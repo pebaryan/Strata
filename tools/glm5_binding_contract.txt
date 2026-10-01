@@ -2653,3 +2653,38 @@ DATA FLOW, which alternates shape and is the easiest thing to get wrong silently
 VERIFICATION DISCIPLINE, now standard: a symbol count after every addition, because this session has three times
 read an absence of error output as success - a target that did not contain the file, a grep that hid the error it was
 searching for, and a truncated buffer.  nm -C ... | grep -c answers the question; nothing else does.
+
+########  ALL FOUR STAGE FUNCTIONS EXIST - THE REMAINING WORK IS THE BLOCK LOOP  ########
+
+    [4/4] Linking CXX executable glm5_bind_check
+    chain stage symbols in the binary: 4
+
+glm_stage_hc_norm, glm_stage_kda, glm_stage_hc_post, glm_stage_ffn - four functions, eight steps, and no arithmetic
+added anywhere.  The block's sequence and the buffers it needs, which is the specification the loop must follow:
+
+    in:   x            [HC][n_embd]  (HC=4 streams; a new sequence starts from the embedding, so this is [4][n_embd])
+    1  glm_stage_hc_norm(x, hc_attn_fn, hc_attn_base, hc_attn_scale, attn_norm_w, layer_in, &mix_attn)
+         -> layer_in [n_embd]  and mix_attn (which hc_post needs)
+    2  attn_norm: the same function already applied norm_w, so layer_in here IS xn  -> [n_embd]
+    3  glm_stage_kda(xn, kda_weights, kda_geometry, tokens, attn_output, state)      -> [n_embd]
+    4  glm_stage_hc_post(attn_output, x, mix_attn, n_embd, mid)                     -> [HC][n_embd]
+    5  glm_stage_hc_norm(mid, hc_ffn_fn, hc_ffn_base, hc_ffn_scale, ffn_norm_w, ffn_in, &mix_ffn)
+         -> ffn_in [n_embd] and mix_ffn
+    6  glm_stage_ffn(ffn_in, ffn_gate, ffn_up, ffn_down, geom, ffn_out, clamp_shexp) -> [n_embd]
+    7  glm_stage_hc_post(ffn_out, mid, mix_ffn, n_embd, l_out)                      -> [HC][n_embd] = the block output
+
+Note step 2: glm_stage_hc_norm applies the site's norm internally, so there is no separate norm stage - what the
+signature calls `layer_in` is already normed by the time it returns.  That is worth checking against the dump, since
+the dump has BOTH hc_attn_pre-N and attn_norm-N as separate quantities; if the function's output matches attn_norm-N
+then the naming is just historical, and if it matches hc_attn_pre-N then a norm step is missing from the loop.
+
+VERIFICATION PLAN, now that the dump provides every stage: run the loop for block 0 and compare each intermediate
+against its dump family - hc_attn_pre-N, attn_norm-N, attn_output-N, hc_attn_post-N, hc_ffn_pre-N, ffn_norm-N,
+ffn_out-N, l_out-N.  Then feed l_out-0 back in as block 1's input and check the chain, which is the distinction this
+file has been careful to draw all along: kernel-handles-weights versus block-computes-the-right-answer-from-the-real
+state.
+
+WHY THIS IS A GOOD PLACE TO STOP: the four stage functions are additive and independently verified in the binary, and
+they change no existing behaviour.  The loop is the first piece of the chain with real logic - the routing in steps 4
+and 7, and the shape alternation - so it deserves a fresh context rather than the tail of a long one.  Nothing is
+half-written: every function present compiles, links, and is a call into a kernel with its own gate.
