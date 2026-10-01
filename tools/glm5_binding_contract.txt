@@ -634,3 +634,34 @@ is not the source that ran" errors that this session's last hour has been fighti
 
 Nothing here affects the port: the binding is verified at 9.1's 12/12, glm_layer.cpp is written and compiling,
 and the kernel interface is recorded.  What is stuck is my own debug harness.
+
+################  ROOT CAUSE FOUND  ################
+
+The stage block runs AFTER the driver frees the arena.
+
+    tools/glm5_bind_check.cpp:122   cudaFree(arena);
+    :124                            (a duplicate line introduced by my own edit)
+    :126                            // ---- chain stage 1 ...      <- the stage code starts HERE
+    :178   return 0;
+
+I inserted the stage block before `return 0;`, which put it after the cleanup.  Every single symptom of the last
+several hours follows from that one placement, and nothing else was ever wrong:
+
+  * the print loop reads every tensor correctly          - it runs BEFORE the free
+  * the first copy after the loop fails                  - the free is literally the next statement
+  * "alive at the end of every iteration, dead after"    - the marker was inside the loop; the free follows it
+  * arena pointers report cudaMemoryTypeUnregistered     - that is exactly what a FREED allocation looks like
+  * hc_attn_fn's buffer copies fine in the same block    - `bound` owns it and destroys it later, so it is
+                                                           still alive while the arena is not
+  * every hypothesis I eliminated (pointer kind, sizing, ordering, the fn copy, duplicate entries, stale cst,
+    and "the source is not what ran") was a symptom of this, not a cause
+  * and the clean regeneration REPRODUCED it             - correctly, because the placement was in the clean
+                                                           source too, not an artifact of my edits
+
+THE FIX, and it is two minutes of work: move the stage block to just BEFORE the first cudaFree(arena) - i.e. right
+after the print loop - and remove the duplicated cudaFree line that my last edit introduced.  Then the same run
+produces stage 1's first number, which is the only thing this session has been trying to reach.
+
+LESSON WORTH KEEPING, and it is the general one: when a readback fails in a block that runs after cleanup, the
+error text describes a FREED allocation ("invalid argument", cudaMemoryTypeUnregistered) rather than a wrong
+pointer.  Check where the block sits in the program's lifetime before investigating what the pointer is.

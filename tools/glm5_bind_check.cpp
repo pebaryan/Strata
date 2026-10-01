@@ -9,8 +9,8 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <algorithm>
+#include <cstring>
 #include <sstream>
 #include <fstream>
 #include <set>
@@ -36,7 +36,6 @@ int main(int argc, char** argv) {
     const std::string pack = argv[1];
     const std::string shard = argc > 2 ? argv[2] : "";
     const int block = argc > 3 ? std::atoi(argv[3]) : 0;
-    const char* refdump = argc > 4 ? argv[4] : nullptr;
     std::string err;
 
     strata::core::WeightTable table;
@@ -106,21 +105,6 @@ int main(int argc, char** argv) {
                         t.ne0, t.ne1, n);
             continue;
         }
-        if (std::getenv("STRATA_SKIP_FN_COPY") && t.name == "hc_attn_fn.weight") {
-            std::fprintf(stderr, "  loopcopy %-22s SKIPPED (order test)\n", t.name.c_str());
-            continue;
-        }
-        std::fprintf(stderr, "  loopcopy %-22s t.ptr=%p n=%zu\n", t.name.c_str(), (const void*) t.ptr, n);
-        if (t.name == "hc_attn_base.weight") {
-            // Same scope, same vector type, same expressions as the stage lambda, immediately after the copy
-            // that just succeeded.  If this fails, the lambda's body differs from its appearance; if it
-            // succeeds, the difference between the loop and the stage is TEMPORAL.
-            std::vector<float> tmp;
-            tmp.resize(n);
-            const cudaError_t st2 = cudaMemcpy(tmp.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
-            std::fprintf(stderr, "  inloop 2nd copy of hc_attn_base: %s\n", cudaGetErrorString(st2));
-            fflush(stderr);
-        }
         host.resize(n);
         const cudaError_t st = cudaMemcpy(host.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
         if (st != cudaSuccess) {
@@ -134,133 +118,61 @@ int main(int argc, char** argv) {
         for (float f : host) { sum += f; if (f < mn) mn = f; if (f > mx) mx = f; }
         std::printf("blk.%d.%s\tne=%d,%d\tn=%zu\t%.9g\t%.9g\t%.9g\t%016llx\n", block, t.name.c_str(),
                     t.ne0, t.ne1, n, mn, mx, sum, (unsigned long long) fnv1a(host));
-        {
-            // BISECTION: a 4-byte copy of the tensor just handled.  The first iteration whose marker
-            // fails is the one whose copy broke the following state.
-            std::vector<float> probe(1);
-            const cudaError_t ps = cudaMemcpy(probe.data(), t.ptr, 4, cudaMemcpyDeviceToHost);
-            std::fprintf(stderr, "  alive after %-24s %s\n", t.name.c_str(), cudaGetErrorString(ps));
-            fflush(stderr);
-        }
     }
     cudaFree(arena);
     
-    // ---- chain stage 1: hc_pre -> rms_norm, on the REFERENCE's own hc_init -----------------------
-    // Judged against hc_attn_pre-N / attn_norm-N rather than only end to end, so an error is localised
-    // to a stage instead of to "the model".
-    // ORDER TEST: a copy of hc_attn_base immediately AFTER the print loop and BEFORE the stage block.  If this
-    // fails, the print loop itself breaks what follows; if it succeeds, the breakage is inside the stage block.
-    {
-        const float* q = nullptr; size_t nn = 0;
-        for (const auto& t : bound.tensors)
-            if (t.name == "hc_attn_base.weight") { q = t.ptr; nn = (size_t) t.ne0 * (size_t) (t.ne1 > 0 ? t.ne1 : 1); }
-        std::vector<float> post;
-        post.resize(nn);
-        const cudaError_t st = cudaMemcpy(post.data(), q, nn * sizeof(float), cudaMemcpyDeviceToHost);
-        std::fprintf(stderr, "  postloop copy of hc_attn_base: %s (q=%p n=%zu)\n", cudaGetErrorString(st),
-                     (const void*) q, nn);
-        fflush(stderr);
-    }
-
-    if (refdump) {
-        auto tensor_by_name = [&](const char* n) -> const float* {
-            for (const auto& t : bound.tensors) if (t.name == n) return t.ptr;
-            return nullptr;
-        };
-        const std::string tsv = std::string(refdump) + "/dump.tsv";
-        std::ifstream mf(tsv);
-        if (!mf) { std::fprintf(stderr, "stage1: cannot read %s\n", tsv.c_str()); return 1; }
-        std::string file, line;
-        std::vector<float> hc_init;
-        int ne0 = 0, ne1 = 0, ne2 = 0, ne3 = 0;
+    cudaFree(arena);
+    
+    // ---- chain stage 1, when a reference dump directory is given as argv[4] --------------------
+    if (argc > 4) {
+        const std::string dir = argv[4];
+        std::ifstream mf(dir + "/dump.tsv");
+        if (!mf) { std::fprintf(stderr, "stage1: cannot open %s/dump.tsv\n", dir.c_str()); return 1; }
+        std::string line, file; int n0 = 0, n1 = 0, n2 = 0, n3 = 0;
         while (std::getline(mf, line)) {
             std::vector<std::string> c; std::stringstream ss(line); std::string f;
             while (std::getline(ss, f, '\t')) c.push_back(f);
             if (c.size() < 8 || c[0] != "hc_init") continue;
-            ne0 = std::atoi(c[1].c_str()); ne1 = std::atoi(c[2].c_str());
-            ne2 = std::atoi(c[3].c_str()); ne3 = std::atoi(c[4].c_str());
-            file = c[7];
+            n0 = std::atoi(c[1].c_str()); n1 = std::atoi(c[2].c_str());
+            n2 = std::atoi(c[3].c_str()); n3 = std::atoi(c[4].c_str()); file = c[7];
         }
-        if (file.empty()) { std::fprintf(stderr, "stage1: no hc_init in %s\n", tsv.c_str()); return 1; }
-        std::ifstream bf(std::string(refdump) + "/" + file, std::ios::binary);
-        hc_init.resize((size_t) ne0 * ne1 * ne2 * ne3);
-        bf.read((char*) hc_init.data(), (std::streamsize) (hc_init.size() * sizeof(float)));
-        std::fprintf(stderr, "stage1: hc_init ne=%d,%d,%d,%d\n", ne0, ne1, ne2, ne3);
-
-        // ggml order is ne0 fastest.  Element (embd, hc, tok) of [ne0,ne1,ne2,ne3] = [embd,hc,tok] sits at
-        // embd + ne0*hc + ne0*ne1*tok - the reshape lesson from phase 8 - so token 0's [HC][n_embd] streams
-        // are the first ne0*ne1 floats.
-        for (const char* n : {"hc_attn_fn.weight", "hc_attn_base.weight", "hc_attn_scale.weight",
-                              "attn_norm.weight"}) {
-            const float* q = nullptr; bool quant = false; int d0 = 0, d1 = 0;
-            for (const auto& t : bound.tensors)
-                if (t.name == n) { q = t.ptr; quant = t.quantized; d0 = t.ne0; d1 = t.ne1; }
-            std::fprintf(stderr, "  arg %-22s ptr=%p quantized=%d ne=%d,%d\n", n, (const void*) q, (int) quant,
-                         d0, d1);
+        if (file.empty()) { std::fprintf(stderr, "stage1: no hc_init in the dump\n"); return 1; }
+        std::vector<float> hc_init((size_t) n0 * n1 * n2 * n3);
+        { std::ifstream bf(dir + "/" + file, std::ios::binary);
+          bf.read((char*) hc_init.data(), (std::streamsize) (hc_init.size() * sizeof(float))); }
+        std::fprintf(stderr, "stage1: hc_init ne=%d,%d,%d,%d from %s\n", n0, n1, n2, n3, file.c_str());
+        std::vector<float> fn, base, scale, norm;
+        {
+            // ORDER TEST in clean code: base first, so if it succeeds the hc_attn_fn copy is the poisoner.
+            std::vector<std::string> want = {"hc_attn_base.weight", "hc_attn_scale.weight",
+                                             "attn_norm.weight", "hc_attn_fn.weight"};
+            std::vector<std::vector<float>*> dst = {&fn, &base, &scale, &norm};
+            for (size_t k = 0; k < want.size(); ++k) {
+                const float* q = nullptr; size_t cnt = 0; bool quant = false;
+                for (const auto& t : bound.tensors)
+                    if (t.name == want[k]) { q = t.ptr; quant = t.quantized;
+                                             cnt = (size_t) t.ne0 * (size_t) (t.ne1 > 0 ? t.ne1 : 1); }
+                if (!q || quant) { std::fprintf(stderr, "stage1: %s unavailable%s\n", want[k].c_str(),
+                                                quant ? " (quantized: needs STRATA_HC_DEQUANT=1)" : ""); return 1; }
+                dst[k]->resize(cnt);
+                const cudaError_t st = cudaMemcpy(dst[k]->data(), q, cnt * sizeof(float),
+                                                  cudaMemcpyDeviceToHost);
+                std::fprintf(stderr, "stage1: %-22s %zu floats: %s\n", want[k].c_str(), cnt,
+                             cudaGetErrorString(st));
+                if (st != cudaSuccess) return 1;
+            }
         }
-        std::vector<float> layer_in(ne0);
-        std::string serr;
-        // hc_pre is HOST code - std::vector, std::sqrt, std::getenv, no CUDA anywhere in it - so every pointer
-        // it receives must be host-accessible.  The bound weights live in the device arena (and the
-        // dequantized hc_fn in a device buffer), which is exactly what the original segfault was: a DEVICE
-        // pointer dereferenced as host memory.  Copy them across first.
-        auto host_copy = [&](const char* n, size_t count, std::vector<float>& dst) -> bool {
-            const float* q = nullptr; int d0 = 0, d1 = 0; bool quant = false;
-            for (const auto& t : bound.tensors)
-                if (t.name == n) { q = t.ptr; d0 = t.ne0; d1 = t.ne1; quant = t.quantized; }
-            if (!q) { std::fprintf(stderr, "stage1: %s not bound\n", n); return false; }
-            if (quant) {
-                // Sizing a QUANTIZED tensor's copy as floats asks CUDA for more bytes than the allocation
-                // holds and it refuses ("invalid argument") - which is what happened here for hc_attn_fn,
-                // whose Q8_0 blocks are 417792 bytes but whose 393216 elements would be 1.5 MB.  Either
-                // dequantize it first (STRATA_HC_DEQUANT=1 makes the binding do exactly that) or refuse
-                // loudly; do not silently ask for the wrong number of bytes.
-                std::fprintf(stderr, "stage1: %s is QUANTIZED - re-run with STRATA_HC_DEQUANT=1 so the binding "
-                                     "dequantizes it, rather than copying %zu floats out of a block buffer\n",
-                             n, (size_t) d0 * (size_t) (d1 > 0 ? d1 : 1));
-                return false;
-            }
-            const size_t want = count ? count : (size_t) d0 * (size_t) (d1 > 0 ? d1 : 1);
-            dst.resize(want);
-            std::fprintf(stderr, "  hostcopy %-22s q=%p ne=%d,%d want=%zu dst=%p\n", n, (const void*) q, d0, d1,
-                         want, (void*) dst.data());
-            fflush(stderr);
-            // The arena is cudaMalloc'd device memory (this driver allocates it that way), and the
-            // dequantized hc_fn sits in a cudaMalloc buffer too, while the loader's own staging buffers are
-            // cudaHostAlloc'd.  Rather than infer which is which - three earlier attempts did, and both
-            // cudaMemcpyDeviceToHost and plain memcpy were wrong for some tensor - use cudaMemcpyDefault,
-            // which resolves the direction under UVA.
-            // Use exactly what the bind print loop uses, because that is PROVEN to work on these same
-            // tensors in the same run: cudaMemcpyDeviceToHost.  cudaPointerGetAttributes does not recognise
-            // this arena as device ("other"), and cudaMemcpyDefault needs those attributes to infer a
-            // direction - so it faults.  The pointer is fine; only Default's inference is not.
-            const cudaError_t cst = cudaMemcpy(dst.data(), q, want * sizeof(float), cudaMemcpyDeviceToHost);
-            if (cst != cudaSuccess) {
-                std::fprintf(stderr, "stage1: copy %s failed: %s\n", n, cudaGetErrorString(cst));
-                return false;
-            }
-            std::fprintf(stderr, "  %-22s copied %zu floats\n", n, want);
-            return true;
-        };
-        std::vector<float> h_fn, h_base, h_scale, h_norm;
-        // ORDER TEST: hc_attn_base FIRST, so if it succeeds here the hc_attn_fn copy is what breaks what
-        // follows - the print loop reads base before fn and never fails.
-        if (!host_copy("hc_attn_base.weight", 0, h_base) || !host_copy("hc_attn_scale.weight", 0, h_scale) ||
-            !host_copy("attn_norm.weight", 0, h_norm) || !host_copy("hc_attn_fn.weight", 0, h_fn))
-            return 1;
-        std::fprintf(stderr, "stage1: host copies fn=%zu base=%zu scale=%zu norm=%zu\n", h_fn.size(),
-                     h_base.size(), h_scale.size(), h_norm.size());
+        std::vector<float> layer_in(n0);
         strata::kernels::glm::HcMix mix;
-        if (!strata::core::glm::glm_stage_hc_norm(hc_init.data(), ne0, h_fn.data(), h_base.data(),
-                                                 h_scale.data(), h_norm.data(), layer_in.data(), &mix, 1e-5f,
+        std::string serr;
+        if (!strata::core::glm::glm_stage_hc_norm(hc_init.data(), n0, fn.data(), base.data(), scale.data(),
+                                                 norm.data(), layer_in.data(), &mix, 1e-5f,
                                                  (void*) stream, serr)) {
-            std::fprintf(stderr, "stage1: call FAILED: %s\n", serr.c_str()); return 1;
+            std::fprintf(stderr, "stage1: %s\n", serr.c_str()); return 1;
         }
-        std::fprintf(stderr, "stage1: call returned\n");
         double mn = 1e30, mx = -1e30, sm = 0;
         for (float v : layer_in) { mn = std::min(mn, (double) v); mx = std::max(mx, (double) v); sm += v; }
-        std::printf("blk.%d.attn_norm.weight\tne=%d,0\tn=%zu\t%.9g\t%.9g\t%.9g\t0\n", block, ne0,
-                    layer_in.size(), mn, mx, sm);
+        std::printf("stage1.attn_norm-0\tne=%d,0\tn=%zu\t%.9g\t%.9g\t%.9g\t0\n", n0, layer_in.size(), mn, mx, sm);
     }
 
 return 0;
