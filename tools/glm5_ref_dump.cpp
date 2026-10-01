@@ -56,6 +56,41 @@ struct Dumper {
 
 Dumper g_d;
 
+/// The host buffer every dumped tensor is copied into.  One context and one buffer, reused: the largest
+/// tensor in this graph is result_output at 154880 fp32 = 620 KB.
+
+static std::vector<uint8_t> g_host_out;
+static ggml_backend_t       g_cpu = nullptr;
+
+static void host_dump_init() {
+    g_cpu = ggml_backend_cpu_init();
+    g_host_out.reserve(8u << 20);
+    if (!g_cpu)
+        std::fprintf(stderr, "warning: no CPU backend; every dump will be SKIPPED-NO-HOST-COPY\n");
+}
+
+/// A HOST copy of `t`'s bytes, taken through the backend copy path.  Null if that is not possible.
+///
+/// The context's tensors are allocated WITH THE CPU BACKEND (ggml_backend_alloc_ctx_tensors), which is
+/// ggml's own pattern - attaching a buffer by hand produced a tensor ggml_backend_tensor_copy could not
+/// write to (it aborted in ggml_backend_tensor_set).
+static const void * host_copy_of(ggml_tensor * t) {
+    if (!g_cpu) return nullptr;
+    const size_t nb = ggml_nbytes(t);
+    if (nb > (8u << 20)) return nullptr;
+    ggml_init_params p = { ggml_tensor_overhead() * 4 + nb + 65536, nullptr, true };
+    ggml_context * c = ggml_init(p);
+    if (!c) return nullptr;
+    ggml_tensor * h = ggml_new_tensor(c, t->type, ggml_n_dims(t), t->ne);
+    ggml_backend_buffer_t b = h ? ggml_backend_alloc_ctx_tensors(c, g_cpu) : nullptr;
+    if (!h || !b) { if (b) ggml_backend_buffer_free(b); ggml_free(c); return nullptr; }
+    ggml_backend_tensor_copy(t, h);
+    g_host_out.assign((const uint8_t *) h->data, (const uint8_t *) h->data + nb);
+    ggml_backend_buffer_free(b);
+    ggml_free(c);
+    return g_host_out.empty() ? nullptr : g_host_out.data();
+}
+
 /// Write one tensor as fp32 with a tiny header (ndim, ne[4], type), naively converted.
 void dump_tensor(ggml_tensor * t) {
     const std::string name(t->name);
@@ -97,15 +132,27 @@ void dump_tensor(ggml_tensor * t) {
 
     const int64_t n = ggml_nelements(t);
     std::vector<float> f((size_t) n, 0.0f);
+
+    // READ THROUGH THE COPY PATH, NOT ggml_backend_tensor_get.  For a device tensor that sits at a
+    // nonzero offset inside its buffer, tensor_get returns a DIFFERENT region of the same buffer -
+    // plausible values, byte-identical run to run, and wrong.  Measured on this model: a host tensor and
+    // a device tensor at offset 0 read correctly, while hc_init (offset 441088) did not, which is what
+    // produced a "broadcast" whose four copies differed.  ggml_backend_tensor_copy is the path llama.cpp
+    // itself uses to bring logits back, so it is the one to trust.
+    const void * src = host_copy_of(t);
+    if (!src) {
+        g_d.manifest << name << "\t" << t->ne[0] << "\t" << t->ne[1] << "\t" << t->ne[2] << "\t" << t->ne[3] << "\t" << prov
+                     << "\t" << ggml_type_name(t->type) << "\tSKIPPED-NO-HOST-COPY\n";
+        return;
+    }
+
     if (t->type == GGML_TYPE_F32) {
-        ggml_backend_tensor_get(t, f.data(), 0, (size_t) n * sizeof(float));
+        std::memcpy(f.data(), src, (size_t) n * sizeof(float));
     } else if (t->type == GGML_TYPE_F16) {
-        std::vector<ggml_fp16_t> h((size_t) n);
-        ggml_backend_tensor_get(t, h.data(), 0, (size_t) n * sizeof(ggml_fp16_t));
+        const ggml_fp16_t * h = (const ggml_fp16_t *) src;
         for (int64_t i = 0; i < n; ++i) f[(size_t) i] = ggml_fp16_to_fp32(h[(size_t) i]);
     } else if (t->type == GGML_TYPE_I32) {
-        std::vector<int32_t> v((size_t) n);
-        ggml_backend_tensor_get(t, v.data(), 0, (size_t) n * sizeof(int32_t));
+        const int32_t * v = (const int32_t *) src;
         for (int64_t i = 0; i < n; ++i) f[(size_t) i] = (float) v[(size_t) i];
     } else {
         return;   // quantized intermediates are not interesting here
@@ -152,6 +199,7 @@ int main(int argc, char ** argv) {
     g_d.manifest.open(g_d.dir + "/dump.tsv", std::ios::out | std::ios::trunc);
 
     llama_backend_init();
+    host_dump_init();          // the CPU buffer every dump is copied into; needs the backend registry up
 
     llama_model_params mparams = llama_model_default_params();
     mparams.n_gpu_layers = 99;
