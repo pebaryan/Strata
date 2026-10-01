@@ -5398,3 +5398,32 @@ not see:
 NEXT, in order: print the MlaIntermediates pointer the trunk is handed for layer 3 against the runner's own cache
 allocation (a two-line diagnostic, the same shape as the arena/pointer diagnostic that found the device-vs-host split),
 and if they differ, that is the defect; if they agree, compare the runner's MlaGeometry against the MLA gate's.
+
+THREE MORE HYPOTHESES RETIRED BY READING, AND THE FIELD NARROWS TO THE EIGHT POINTERS
+
+The layout check retired the layout.  Reading the runner and the trunk retires two more, and both were plausible enough to
+name, which is why they are recorded as retired rather than as not-mentioned:
+
+  * NOT A DANGLING CACHE.  The trunk does `float* cache = state.mla_cache[slot]; const int cells = state.mla_len[slot];`
+    and the runner hands over pointers into its own vectors - `mla_cache[b].assign(TOKENS * KV_LORA, 0.0f);
+    mla_ptrs[b] = mla_cache[b].data();` and then `st.mla_cache = mla_ptrs;` - and those buffers are function-scope locals
+    that nothing resizes afterwards, while `mla_index[3] = 0` lands on a live one.  Valid.
+  * NOT A GEOMETRY DISAGREEMENT.  The runner sets only `P.mla_g.n_embd = N_EMBD` and relies on the defaults for the
+    rest; MlaGeometry's defaults are 4096 / 64 / 256 / 512 / 1536, which IS this artifact's MLA geometry, and
+    glm_mla_parity declares `glm::MlaGeometry g;` with those same defaults - so the runner and the gate agree field for
+    field.  Valid.
+
+WHAT THAT LEAVES: the EIGHT POINTERS inside MlaWeights - wq_a, q_a_norm, wq_b, wk_b, kv_a, kv_a_norm, wv_b, wo.  Every
+one of them is either a staged host buffer, an arena float, or the uploaded Q8_0 blocks, and st.mla_cache, the geometry,
+the cache contents and the layout have all now been checked and found correct - so a pointer in that struct is the one
+thing in the call that has not been looked at, and glm_fill_layer_weights is the only code that could have put a wrong
+value there.
+
+NEXT, AND IT IS THE SAME TWO-LINE DIAGNOSTIC THAT FOUND THE DEVICE-VS-HOST SPLIT: print all eight of layer 3's MlaWeights
+pointers, each labelled, alongside the arena range and the staged list, so a NULL or a foreign address is visible rather
+than inferred.  The pattern has now worked four times in this port and there is no reason to reason about it instead.
+
+A NOTE ON THE RATIO, since this is the end of a long run: four of my own assumptions have been corrected by measurement
+this session, and this round I retired three hypotheses I had stated with confidence - by reading the code rather than by
+another build.  The reading was cheaper and the conclusion is the same.  That is the habit worth keeping: when the next
+finger to point is at a struct field, read what writes it.
