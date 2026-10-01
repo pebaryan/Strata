@@ -1031,3 +1031,56 @@ native_mmvq_weight_bytes gives exactly 34 bytes per 32 elements for case 8.  So 
 and the next measurement is to find which STEP of that dequant faults rather than to reason about it further:
 check cudaGetLastError() immediately after cudaMalloc, after the cudaStreamSynchronize, and after dequant_q8_0
 itself, for attn_q alone - three reads of the error state, no theory.
+
+THE FAULT IS IN attn_q's OWN DEQUANT - NAMED, NOT INFERRED
+
+Instrumented the branch and reproduced, one run:
+
+    dequant: blk.0.attn_q.weight   n=33554432   want=128.0 MB   alloc+dequant: an illegal memory access was encountered
+
+So the very first tensor the widening touches faults inside its own dequant, which fully accounts for the downstream
+cudaMalloc failure on hc_attn_fn (bound seven rows later) - and the order reading predicted exactly this.
+
+The chain of elimination now stands as: element count correct (33554432) - buffer allocation correct (128 MiB) -
+native buffer format correct (Q8_0, 34 bytes/32 elements) - native buffer per-tensor, not shared - run-to-run
+deterministic (10/10) - bind order read from the pack index (attn_q at row 9, hc_attn_fn at row 16).  And the
+kernel itself is clean: dequant_q8_0_kernel indexes with long long, dequant_q8_0 launches grid=8192, threads=128,
+the last read is blocks[1048575*34 .. +34] = 35.6 MB and the last write is x[n-1], both provably inside their
+buffers.
+
+Two suspects remain, and both are cheap to settle next:
+  1. the native blocks buffer for attn_q is smaller than n/32*34 = 35.6 MB, i.e. the upload sized it from a
+     different pair of dims than the plan row gives - the check at native_dense.cpp:231 compares tensor.shape to
+     ref.ne0/ne1, and GLM's attn_q is exactly the tensor whose GGUF shape and pack shape are TRANSPOSED of each
+     other (trap 7), so this is the first place to look;
+  2. the error is STICKY.  cudaGetLastError() returns the last error set by ANY earlier call in the process, and
+     my report sits after cudaStreamSynchronize - so if the native upload or the 128 MiB cudaMalloc had already
+     failed silently, this line would report it here and blame the dequant.  Clearing the error state right
+     before the dequant (cudaGetLastError() once and discard) distinguishes the two in one run.
+
+WHICH TO RUN FIRST: (2), because it is one line and it decides whether the fault is in the dequant at all.
+
+STICKY ERROR RULED OUT - THE FAULT IS THE DEQUANT ITSELF, AND ONE SUSPECT REMAINS
+
+Clearing cudaGetLastError() immediately before the call, then reporting after it:
+
+    dequant: blk.0.attn_q.weight   n=33554432   want=128.0 MB   alloc+dequant: an illegal memory access was encountered
+
+unchanged.  So the error is genuinely produced by this dequant, not inherited from an earlier failed upload or
+allocation.  Every other link in the chain has been checked and holds: n is the right element count, the output
+buffer is the right size, the kernel indexes with long long and launches on grid=8192 so neither its read
+(1,048,576 blocks x 34 bytes = 35.6 MB) nor its write (up to x[n-1]) can leave its own buffers, and the run is
+deterministic.
+
+WHAT IS LEFT: the blocks buffer that native_data points at for attn_q is smaller than the 35.6 MB this dequant
+reads from it.  The reason to look there specifically, and not anywhere else: attn_q is exactly the tensor whose
+GGUF shape and pack shape are TRANSPOSED of one another (trap 7 - the pack's row says 4096x8192, the artifact's
+tensor is 8192x4096), and the loader's upload sizes that buffer from whichever pair of dims it settled on in
+native_dense.cpp:231.  The element count is identical either way, so nothing upstream notices; only a reader that
+walks the blocks by a count derived from the OTHER orientation would run off the end - and the hc function
+matrices, which work, are square-ish in exactly the sense that hides the difference (16384x24 and 24 either way).
+
+NEXT ACT, one line: in native_dense.cpp, print the bytes it allocates for a named tensor together with
+tensor.shape[0]/shape[1] and ref.ne0/ref.ne1, and run for blk.0.attn_q.weight.  That either shows a buffer smaller
+than 35.6 MB, which is the answer, or shows it is the full size - in which case the dequant's own arguments are
+wrong in a way the extents cannot reveal and the reader's stride must be checked against the recorded block layout.

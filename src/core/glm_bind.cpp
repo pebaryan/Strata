@@ -152,6 +152,10 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             // artifact's orientation (NativeDense copies them as they are).  dequant_q8_0 takes device blocks
             // - handing it a host pointer faults and poisons the context, which is how the second call here
             // came back as "cudaMalloc failed".
+            // Clear any error the process set EARLIER (a failed upload, a failed allocation) so the report below
+            // is about this dequant and not about something that happened before it - cudaGetLastError() is
+            // sticky, which is exactly how a downstream failure gets misattributed to this step.
+            (void) cudaGetLastError();
             strata::kernels::dequant_q8_0((const uint8_t*) w->native_data, dev_f, n, stream);
             if (stream) cudaStreamSynchronize((cudaStream_t) stream);
             // INSTRUMENTATION: name the step rather than theorise.  If a tensor's dequant is what poisons the
