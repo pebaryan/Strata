@@ -106,6 +106,10 @@ int main(int argc, char** argv) {
                         t.ne0, t.ne1, n);
             continue;
         }
+        if (std::getenv("STRATA_SKIP_FN_COPY") && t.name == "hc_attn_fn.weight") {
+            std::fprintf(stderr, "  loopcopy %-22s SKIPPED (order test)\n", t.name.c_str());
+            continue;
+        }
         std::fprintf(stderr, "  loopcopy %-22s t.ptr=%p n=%zu\n", t.name.c_str(), (const void*) t.ptr, n);
         if (t.name == "hc_attn_base.weight") {
             // Same scope, same vector type, same expressions as the stage lambda, immediately after the copy

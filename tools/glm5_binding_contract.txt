@@ -539,3 +539,27 @@ in-loop second copy succeeds.  After hc_attn_fn's 393216-float copy, copies stop
 TEST, one line, no new theory: in the print loop, SKIP the hc_attn_fn copy (or do it last) and see whether the
 stage's copies then succeed.  If they do, the hc_attn_fn read is what poisons the context and the remaining
 question is only why a correctly-sized 1.5 MB read does it.
+
+hc_attn_fn EXONERATED - AND THAT LEAVES ONLY ONE CLASS OF EXPLANATION
+
+    STRATA_HC_DEQUANT=1 STRATA_SKIP_FN_COPY=1:  the loop never copies hc_attn_fn
+    result: the stage's copy of hc_attn_base STILL fails "invalid argument"
+
+Within one run: the loop copies hc_attn_base successfully (and a second time, with the stage's exact
+expressions), then the stage fails on the identical call - and between them the only things that execute are
+lambdas' definitions and a 65 KB HOST file read (the reference dump).  No CUDA call at all.  So no CUDA state
+can have changed, and every candidate I have proposed - the fn copy, ordering, the arena, pointer kind, sizing,
+duplicate entries, the destination vector - has been eliminated by measurement.
+
+What is left is that the call does not in fact fail: the failure is in HOW THE RESULT IS READ.  The message comes
+from
+
+    const cudaError_t cst = cudaMemcpy(dst.data(), q, want * sizeof(float), cudaMemcpyDeviceToHost);
+    if (cst != cudaSuccess) { ... cudaGetErrorString(cst) ... }
+
+and if the region that used to hold the probe was replaced imperfectly, cst could be assigned from an earlier
+call rather than from this memcpy - a stale error reported as this one.  That is a two-line read of the lambda in
+tools/glm5_bind_check.cpp: confirm what cst is actually initialised from, and confirm the lambda is still the
+code I think it is after four successive in-place edits to it.  Four edits to the same block is precisely how a
+stale binding like this creeps in, and it is the only remaining explanation that does not require CUDA to behave
+inconsistently with itself.
