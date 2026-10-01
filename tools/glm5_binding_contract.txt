@@ -5088,3 +5088,39 @@ tensor added later - the shape of every defect this port has hit.
 AND THE GENERAL LESSON, which is the sixth instance of the same thing: the engine's binding was written for a caller
 that reads its weights on the GPU, and glm_trunk_forward reads them on the CPU.  Both existed and passed their own
 gates; only running them together exposes that they disagree about where a weight lives.
+
+WIDENING TO ALL FOURTEEN IS THE WRONG SHAPE: IT OOM-KILLS, AND THAT SETTLES HOW THE WEIGHTS MUST BE STAGED
+
+Running with both flags (STRATA_HC_DEQUANT + STRATA_DEQUANT_ALL_Q8_0, so the branch that now copies to host covers every
+Q8_0/Q5_K/Q6_K tensor) does not crash on a bad pointer - it is KILLED, exit code -9, SIGKILL, with no output at all.
+That is the OOM killer, and the arithmetic says why:
+
+    attn_output is 16,384 x 4,096 floats = 268 MB as fp32, times 45 layers = 12.1 GB
+    attn_q_b is 1,536 x 16,384 = 100 MB, times 45 = 4.5 GB
+    and that is two of twelve tensors per layer, on a box with 31 GB of RAM
+
+so dequantizing everything up front needs roughly 20-30 GB of host floats - alongside the quantized originals and the
+device arena.  The quantized pack is 1.2 GB of dense weights; the same weights as floats are more than an order of
+magnitude larger, and the box cannot hold them.
+
+THIS IS THE FINDING, and it is about shape rather than parameters: THE CPU-SIDE TRUNK WANTS FLOATS FOR EVERYTHING IT
+READS, and materialising all of them at once is impossible here.  The engine was designed to stream the EXPERTS (86 GB,
+one blob at a time from an mmap) and it has to stream the dense weights for the same reason - the difference is only in
+the sizes.
+
+AND THE MECHANISM TO DO IT ALREADY EXISTS, which is why this is a small change rather than a redesign:
+glm_trunk_forward calls its weight provider ONCE PER LAYER, with the layer's number, before that layer runs.  So the
+provider is exactly the right place to materialise a layer's float weights on demand and release the previous layer's -
+peak host memory becomes one layer (roughly 1-2 GB) instead of forty-five, and the trunk's ordering guarantees that a
+layer's weights are needed only while that layer runs.
+
+    THE CHANGE: the runner's provider dequantizes that layer's CPU-consumed tensors into host floats when asked for the
+    layer, remembers the previous layer's buffers, and frees them on the next call.  The quantized source stays resident
+    (it is 1.2 GB and it is the artifact), and the floats live for one layer.
+
+Worth recording too: the two-flag run produced NO output whatsoever, not even the first printf - so the kill happened
+before the binding loop finished, which is consistent with the allocations accumulating from the first layer onward.
+And the earlier note in glm_bind.cpp (lines 143-148) about widening this branch producing a "poisoned context", and
+about the swap orientation of a native attention matrix, still stands as something to check when the per-layer path is
+written: the count comes from the plan row while the bytes are the native tensor's, and for a swapped matrix those need
+not agree.
