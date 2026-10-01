@@ -3511,3 +3511,42 @@ WHAT REMAINS, and it is now short:
 Nothing is half-written: every file added this session compiles, and the four stage functions, the two MoE paths and
 the trunk loop each carry their own header contract.  The trunk has NEVER RUN - it has no provider yet - and the
 record says so rather than implying otherwise.
+
+THE PROVIDER'S INPUTS, NOW ALL KNOWN - the name-to-field mapping, so it is mechanical rather than inventive
+
+MlaWeights (glm_mla.hpp:32), eight fields with their shapes:
+    wq_a [q_lora][n_embd]      q_a_norm [q_lora]        wq_b [n_head*head_dim][q_lora]
+    wk_b [n_head][kv_lora][head_dim]                    kv_a [kv_lora][n_embd]   kv_a_norm [kv_lora]
+    wv_b [n_head][head_dim][kv_lora]                    wo [n_embd][n_head*head_dim]
+
+GlmBoundBlock (glm_bind.hpp:12): vector<Tensor> where Tensor = { name, ptr, ne0, ne1 }, plus find(name).
+bind_glm_block(LayerView, block, d_inner, d_conv, gguf_shards, out, stream, err) - and its own comment says
+gguf_shards is needed precisely for the tensors NativeDense marks but cannot upload, "glm5next's 3-D MLA tensors",
+which is the MLA case.
+
+So the mapping from the generated table's rows to the fields, for an MLA layer:
+
+    wq_a       <- "attn_q_a.weight"          q_a_norm <- "attn_q_a_norm.weight"
+    wq_b       <- "attn_q_b.weight"          kv_a     <- "attn_kv_a_mqa.weight"
+    kv_a_norm  <- "attn_kv_a_norm.weight"    wk_b     <- "attn_k_b.weight"
+    wv_b       <- "attn_v_b.weight"          wo       <- "attn_output.weight"
+
+and for a KDA layer the sixteen KdaWeights fields, whose names are the struct's own field names (this file already
+records that the fixture's filenames ARE the struct's field names - dt_bias, o_norm, ssm_a and the rest).
+
+NOTE the one shared name: "attn_output.weight" appears on all 46 blocks and is the output projection for BOTH kinds
+(wo in each struct), so the provider does not have to branch for it.  And the twelve indexer tensors
+(indexer.proj, indexer.k_norm.{weight,bias}, indexer_compressor_{gate,ape}, indexer.attn_{q_b,k}) have NO field in
+MlaWeights, so the indexer is either applied outside mla_forward or not needed below 8192 positions - which is the
+conditional glm_stage_mla already documents.  That is a question to settle before trusting a long prompt, and is
+flagged here rather than assumed.
+
+WHAT THE PROVIDER IS, in full: bind the block with bind_glm_block (which already walks every row generically),
+find() the tensors by the names above, assign them into the struct for the layer's kind, and for a routed layer set
+moe_g / shexp_g from the pack's own widths plus moe_fmt from native_fmt(gu_type, d_type, n_embd, ff) and blob_fn from
+FileExpertSource.  No new arithmetic, no new parsing, and every piece of it already exists and has been read.
+
+STATUS OF "RUN GLM" ON STRATA: the trunk loop, both MoE paths, all seven stages, the dispatch table, the streamed
+expert stage and the loop skeleton all exist and compile.  What is still absent is exactly three things - the provider
+above, a chain target that links strata_kernels_cpu and drives the loop for the prompt, and the head (final norm,
+lm_head, greedy argmax, tokenizer decode) - and then the gate, argmax == 12089.  Nothing has run end to end.
