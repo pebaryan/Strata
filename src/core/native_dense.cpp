@@ -235,6 +235,18 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
                 const auto bytes = strata::kernels::native_mmvq_weight_bytes(
                     tensor.type, (int) ref.ne0, (int) ref.ne1);
+                if (std::getenv("STRATA_NATIVE_TRACE") &&
+                    tensor.name.find("attn_q") != std::string::npos) {
+                    // What was ALLOCATED versus what a Q8_0 reader with the plan row's element count would READ.
+                    std::fprintf(stderr,
+                                 "native upload %s: gguf shape=%llu,%llu  ref=%d,%d  alloc=%llu B  "
+                                 "a q8_0 reader over %llu elems reads %llu B\n",
+                                 tensor.name.c_str(), (unsigned long long) tensor.shape[0],
+                                 (unsigned long long) tensor.shape[1], ref.ne0, ref.ne1,
+                                 (unsigned long long) bytes,
+                                 (unsigned long long) tensor.shape[0] * (unsigned long long) tensor.shape[1],
+                                 (unsigned long long) tensor.shape[0] * (unsigned long long) tensor.shape[1] / 32 * 34);
+                }
                 void* allocation = nullptr;
                 auto status = cudaMalloc(&allocation, bytes);
                 DevicePtr data(allocation);

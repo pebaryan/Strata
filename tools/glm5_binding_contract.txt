@@ -1084,3 +1084,35 @@ NEXT ACT, one line: in native_dense.cpp, print the bytes it allocates for a name
 tensor.shape[0]/shape[1] and ref.ne0/ref.ne1, and run for blk.0.attn_q.weight.  That either shows a buffer smaller
 than 35.6 MB, which is the answer, or shows it is the full size - in which case the dequant's own arguments are
 wrong in a way the extents cannot reveal and the reader's stride must be checked against the recorded block layout.
+
+########  ROOT CAUSE FOUND AND FIXED: THE DEQUANT ASSUMED A BLOCK SIZE  ########
+
+The last link, printed rather than argued - what native_dense.cpp allocates versus what the reader asks for:
+
+    native upload blk.0.attn_q.weight: gguf shape=4096,8192  ref=4096,8192
+        alloc = 23,068,672 B        (= 22 bytes per 32 elements)
+        read  = 35,651,584 B        (= 34 bytes per 32 elements, Q8_0)
+
+The buffer is 12.6 MB smaller than what the dequant reads, so the reader walked off the end - the illegal memory
+access, and through it the poisoned context that made a later cudaMalloc fail on a tensor bound seven rows later.
+The ratio names the cause exactly: 23068672 / 33554432 * 32 = 22, and native_mmvq_weight_bytes gives 22 bytes per
+32 elements only for CASE 6.  blk.0.attn_q.weight is not Q8_0 in this artifact; hc_attn_fn is, which is why one
+worked and the other faulted.  blk.3.attn_q_b.weight shows alloc == read to the byte, confirming the type varies
+per tensor rather than the formula being wrong globally.
+
+THE FIX: gate the branch on the type the dequantizer actually implements.
+
+    } else if (std::getenv("STRATA_HC_DEQUANT") && w->native_type == 8 && ...
+
+Verified both ways: with the widening the run now finishes clean (exit 0, 0 failures, both _fn tensors
+"no error"), and the default path still prints stage 1 = -0.359747499 / 0.424176991 / 3.25002776.
+
+THE GENERAL RULE, and it is the one worth keeping: a dequantizer must be SELECTED BY THE TENSOR'S ACTUAL TYPE,
+never assumed from what the tensor is called or from what the pack's row claims.  And when a buffer-size formula
+and a reader disagree, print BOTH numbers - alloc versus read - because the ratio between them names the cause
+immediately (22 vs 34 bytes per block here), while every argument about extents, layouts, ordering and pointer
+kinds cannot.
+
+CONSEQUENCE FOR THE KDA GATE: attn_q/k/v stay natively quantized for this artifact (types other than 8), so the
+gate still needs either a dequantizer for the type they use or F32 attention weights in its fixture.  What is
+gone is the hazard: widening the branch can no longer poison the context.

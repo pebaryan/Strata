@@ -117,7 +117,7 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             } else {
                 got.ptr = p;
             }
-        } else if (std::getenv("STRATA_HC_DEQUANT") &&
+        } else if (std::getenv("STRATA_HC_DEQUANT") && w->native_type == 8 &&
                    ((full.size() >= 10 && full.compare(full.size() - 10, 10, "_fn.weight") == 0) ||
                     (std::getenv("STRATA_DEQUANT_ATTN_Q") &&
                      full.compare(0, full.find('.'), "blk") == 0 &&
