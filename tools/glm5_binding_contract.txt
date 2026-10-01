@@ -281,3 +281,8 @@ likelihood:
 
 Either way it is a ten-line read of bind_glm_block's F32 branchplus weights.cpp's mapping logic.  Three
 segfaults have been spent inferring it; the next move is to look.
+
+Note on the record: 062962f used `git add -A`, so it also committed the stage-1 driver mode in
+tools/glm5_bind_check.cpp that segfaults.  The branch still builds (the branch's rule is about the build and
+its gates, and no gate runs this driver), but the mode does not pass and should not be read as verified.
+Leaving the record straight rather than amending history: that file's stage-1 path is UNVERIFIED.
