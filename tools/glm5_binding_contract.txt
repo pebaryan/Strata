@@ -4807,3 +4807,29 @@ BASELINE was not.
 
 ACCEPTANCE, unchanged and now reachable: the token - argmax == 12089 through the engine's own 45-block trunk.  Every
 stage it passes through is now verified in the form the trunk actually uses, which is what was missing.
+
+A FALSE BLOCKER, CAUGHT BEFORE IT WAS RECORDED AS ONE
+
+Before building the 45-block runner I questioned whether the pack can serve all 45 blocks, on the grounds that
+dense.bin is 124,025,600 bytes - 0.12 GB - while its index lists 1,283 tensors.  A quick computation over the index
+"proved" that the rows declare 58.54 GB of data against a 0.12 GB pool, a ratio of 507x, and that looked like a real
+blocker worth reporting.
+
+IT WAS MY READING THAT WAS WRONG, and two things say so plainly:
+
+  * tools/glm5_bind_check.cpp:42 states the design outright: "The 14 quantized tensors are served from the GGUF, not
+    from dense.bin: this pack records a shape for them, and pool_bytes/load decide which rows they own from what the
+    table already knows is served natively."  The big quantized matrices never had to fit in the pool - the pool holds
+    what dense.bin actually stores, and the rest is read from the artifact.
+  * The computation itself was nonsense on its face: it reported blk.9.ssm_dt.bias as type 0, ne 32768 x 8192, i.e.
+    1,024 MB for a per-head bias.  A number that absurd means the COLUMN INDICES are wrong, not that the pack is
+    broken - and I was reading columns 6 and 7 as ne0/ne1 when the index has a different layout.
+
+So there is NO blocker: the 45-block bind is feasible as designed, and the last step of this port - the engine's own
+trunk ending in argmax 12089 - is a matter of writing the runner (45 binds, 34 KDA state slots, 11 MLA caches, the
+head's mean-over-streams and output_norm, then the tied projection), not of repairing the pack.
+
+WORTH RECORDING because it is the sixth time this session that a cheap check reversed a conclusion, and the first time
+the conclusion reversed was MINE rather than the engine's: the double-norm, the dump writer, the ref-dump reference,
+the clamp default, the "unverified native path", and now this.  The rule that keeps paying: measure the thing you are
+about to claim, and when the measurement produces an absurd number, suspect the measurement.
