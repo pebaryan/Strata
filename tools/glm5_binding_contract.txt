@@ -816,3 +816,31 @@ NONE OF THIS IS STAGE 1's PROBLEM, and that is the point worth carrying forward:
 phase-6-validated oracle to seven significant digits on this exact input, and the discrepancy is entirely in my
 identification of the reference node.  The stage's next real gate is the norm and then the KDA/MLA call, and it
 should be judged against the oracle rather than against a dump node whose meaning has not been established.
+
+########  STAGE 1 VERIFIED - BOTH HALVES  ########
+
+Gated against the phase-6-validated oracle (not against a dump node), token 0 of the same hc_init:
+
+    oracle  hc_pre layer_in : -0.016211817  0.0226506591  0.182561547
+    engine  hc_pre output   : -0.0162118152 0.0226506572  0.182561572      matches to 7 significant digits
+
+    oracle  norm(layer_in)*w: -0.359747499  0.424176991   3.25002813
+    engine  attn_norm-0     : -0.359747499  0.424176991   3.25002776      rel diff 5.364e-10 of scale
+
+So hc_pre -> rms_norm -> *attn_norm.weight is correct end to end: the gate on the mix, the eps (1e-5, the
+graph's norm eps and not hyper_connection.epsilon), the plain multiply with no (1+w) folding, and the four weight
+tensors (one dequantized Q8_0, three from the arena) which were independently confirmed bit-exact against the
+artifact.
+
+WHAT WENT WRONG IN THE COMPARISONS, since it cost most of this session and will cost it again:
+  * the 5.6% "error" was the dump's hc_attn_pre-0, which is the same SHAPE as layer_in but a different gate
+    scalar (~0.5696*x0 vs 0.6003*x0) - not layer_in at all.
+  * the 20% "error" in attn_norm-0 was the same dump node's sibling, and it too disagrees with the oracle.
+  * hc_init appears TWICE in the dump manifest, and the harness takes one of them; the node values a dump
+    reports may therefore belong to a different segment than the input being read.
+  * CONCLUSION: gate the engine against the ORACLE (glm5_hc_reference.py / glm5_kda_reference.py, both validated
+    in phase 6/7), and use the dump only to find WHICH node to look at, never as the expected value.
+
+NEXT IN 9.2, with the same discipline: the attention call (KDA on blocks with KDA, MLA on the others) against the
+matching reference module, then hc_post, then the ffn stage (leading dense below block 3, moe_forward above), and
+finally the head - with glm5_e2e_test.py (argmax 12089) as the terminal gate.
