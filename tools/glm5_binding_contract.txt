@@ -665,3 +665,33 @@ produces stage 1's first number, which is the only thing this session has been t
 LESSON WORTH KEEPING, and it is the general one: when a readback fails in a block that runs after cleanup, the
 error text describes a FREED allocation ("invalid argument", cudaMemoryTypeUnregistered) rather than a wrong
 pointer.  Check where the block sits in the program's lifetime before investigating what the pointer is.
+
+THE HARNESS IS FIXED, AND THE STAGE'S REMAINING BLOCKER IS A HOST/DEVICE SPLIT
+
+After moving the stage block above cudaFree(arena):
+
+    stage1: hc_attn_fn.weight      393216 floats: no error
+    stage1: hc_attn_base.weight    24 floats:     no error
+    stage1: hc_attn_scale.weight   3 floats:      no error
+    stage1: attn_norm.weight       4096 floats:   no error
+
+Every copy succeeds.  That is the harness working, and it is the thing that was blocking.
+
+Then, inside the stage call:
+
+    rms_norm_weighted: an illegal memory access was encountered
+
+and the reason is a genuinely mixed pipeline, not a bug in either kernel:
+
+    glm_hc.cpp:58         hc_pre is HOST code      - std::vector, std::sqrt, std::getenv, no CUDA at all
+    elementwise.cu:309    rms_norm_weighted is a DEVICE kernel - rms_norm_weighted_kernel<<<grid, ...>>>
+
+glm_stage_hc_norm calls the first with host pointers and the second with the same host pointers, so the device
+kernel dereferences host memory.  The ENGINE'S OWN convention for this part of the graph is host-side (glm_hc.cpp
+is entirely host, and hc_pre is called once per token on a [HC][n_embd] block that is small by construction), so
+the fix is to keep the stage on the host side: do the rms norm in the stage itself, on the host, exactly as the
+reference does - `y = rms_norm(x, eps) * w`, eps 1e-5, no (1+w) folding - rather than reaching for the engine's
+device kernel.  That is a ten-line addition to src/core/glm_layer.cpp and it needs no CUDA at all.
+
+Alternatively the whole stage moves to the device, but that is the larger change and it contradicts how the
+reference splits this work.

@@ -119,11 +119,11 @@ int main(int argc, char** argv) {
         std::printf("blk.%d.%s\tne=%d,%d\tn=%zu\t%.9g\t%.9g\t%.9g\t%016llx\n", block, t.name.c_str(),
                     t.ne0, t.ne1, n, mn, mx, sum, (unsigned long long) fnv1a(host));
     }
-    cudaFree(arena);
-    
-    cudaFree(arena);
-    
-    // ---- chain stage 1, when a reference dump directory is given as argv[4] --------------------
+
+    // ---- chain stage 1: hc_pre -> rms_norm, on the reference's own hc_init (argv[4] = its dump dir) ----
+    // Placed here deliberately, BEFORE the driver's cleanup: this block was previously inserted just before
+    // `return 0;`, i.e. after cudaFree(arena), which made every arena read fail with "invalid argument" /
+    // cudaMemoryTypeUnregistered - the signature of a FREED allocation, not a wrong pointer.
     if (argc > 4) {
         const std::string dir = argv[4];
         std::ifstream mf(dir + "/dump.tsv");
@@ -143,9 +143,8 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "stage1: hc_init ne=%d,%d,%d,%d from %s\n", n0, n1, n2, n3, file.c_str());
         std::vector<float> fn, base, scale, norm;
         {
-            // ORDER TEST in clean code: base first, so if it succeeds the hc_attn_fn copy is the poisoner.
-            std::vector<std::string> want = {"hc_attn_base.weight", "hc_attn_scale.weight",
-                                             "attn_norm.weight", "hc_attn_fn.weight"};
+            std::vector<std::string> want = {"hc_attn_fn.weight", "hc_attn_base.weight",
+                                             "hc_attn_scale.weight", "attn_norm.weight"};
             std::vector<std::vector<float>*> dst = {&fn, &base, &scale, &norm};
             for (size_t k = 0; k < want.size(); ++k) {
                 const float* q = nullptr; size_t cnt = 0; bool quant = false;
@@ -175,5 +174,6 @@ int main(int argc, char** argv) {
         std::printf("stage1.attn_norm-0\tne=%d,0\tn=%zu\t%.9g\t%.9g\t%.9g\t0\n", n0, layer_in.size(), mn, mx, sm);
     }
 
-return 0;
+    cudaFree(arena);
+    return 0;
 }
