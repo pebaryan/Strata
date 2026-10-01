@@ -1614,3 +1614,39 @@ them still passes.
 STEP 4 IS THE ONLY ONE LEFT: run kda_gate on these bound weights instead of the oracle's fixture files.  The
 fixtures existed because the weights could not be bound as floats, and that reason is gone.  That gate proves the
 wiring rather than kernel and binding separately, and after it the chain continues past the attention call.
+
+STEP 4, SPECIFIED SO ITS FIRST MOVE IS MECHANICAL RATHER THAN AN INVESTIGATION
+
+Goal: kda_gate must consume the ENGINE's bound weights instead of the oracle's fixture files, which is the gate that
+proves the wiring rather than kernel and binding separately.
+
+Where the edit goes and why there: glm5_bind_check is the only thing in this port that binds a block, so the export
+has to come from it.  Add a self-contained block guarded by argc - exactly the pattern the stage-1 block uses - so
+the existing path cannot be affected by it:
+
+    if (argc > 5) {                                  // argv[5] = a directory to write the bound weights into
+        for (const auto& t : bound.tensors) {        // NOTE: t.name is BARE - "attn_q.weight", no blk.N. prefix,
+            ...                                      // the prefix is added by the printf, not stored (cost me a miss)
+            cudaMemcpy(host.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
+            write host to <dir>/w_<name>.bin
+        }
+    }
+
+The three traps, all of which have already bitten once in this session and are therefore not hypothetical:
+  * the names are BARE (the earlier MISSING lookup failed because the prefix was assumed to be stored);
+  * the copies must be sized by tensor KIND (quantized tensors are bytes, not floats - the bug that made the first
+    copy after the loop fail);
+  * the block must sit ABOVE any cudaFree(arena) in the driver - placed after it, every arena pointer reads as a
+    freed allocation and reports cudaMemoryTypeUnregistered, which is what cost the first half of this session.
+
+Then kda_gate needs no change at all if the files are named w_<oracle key>.bin as the fixture's are - or, better,
+give it the directory and let it read whatever names the export produces, since matching the oracle's naming is a
+convenience rather than a requirement.  Compare its result against the same fixtures: the values are expected to be
+IDENTICAL, because the binding was just verified 16/16 against those very numbers.  That identity is the point - if
+the bound weights and the fixture agree, then the KDA gate passing on bound weights adds exactly one thing the
+current pair of gates does not: proof that the two halves compose.
+
+STATE AT HANDOFF, all committed on glm5next-port: stage 1 PASS; KDA gate PASS at T=1 and T=5 (8/8 stages each);
+binding 16 PASS 0 FAIL 0 QUANTIZED; Q5_K parity BIT-EXACT over 33,554,432 elements; dequant root cause fixed
+(guard {8,13}, hard error for anything else).  Artifacts: glm5_bind_check, kda_gate, kda_binding_check.py,
+q5k_parity, fixtures glm5-kda-l0-t1 / glm5-kda-l0-t5 / glm5-q5k-parity.  Nothing is half-built.
