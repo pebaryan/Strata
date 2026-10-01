@@ -196,3 +196,31 @@ I had already added) would have caught it - the data was in the manifest the who
 
 The reference dump is usable for per-block bisection.  That is the next step, and it is the one the port
 has been waiting for since phase 8 started.
+
+## Part 6: the bisection - block 0 agrees exactly until the KDA attention
+
+With the axis convention fixed (tools/glm5_bisect.py), the block-0 chain is unambiguous:
+
+    hc_init          0.000e+00   r +1.0000   exact
+    hc_attn_pre-0    1.760e-05   r +1.0000   fp noise - the mHC pre-mix is right
+    attn_norm-0      1.121e-04   r +1.0000   fp noise - the RMS norm is right
+    attn_output-0    2.077e-02   r +0.5136   FIRST DIVERGENCE - the KDA attention
+    hc_attn_post-0   8.497e-02   r +0.4938
+    hc_ffn_pre-0     1.084e-01   r +0.5647
+    ffn_norm-0       9.781e-01   r +0.6024
+    ffn_out-0        5.167e-02   r +0.4657
+    l_out-0          7.126e-02   r +0.4080   everything downstream inherits it
+
+So the embedding, the hyper-connection pre-mix, and the attention norm are correct, and the port's first
+error is the KDA attention itself - in the FIRST block, which is a KDA layer per attention.head_count_kv.
+Correlation +0.51 rather than ~0 says it is partially right: consistent with one wrong term in the KDA
+recurrence or front end (decay g, beta, the conv1d state, the L2 norms, the within-head norm, or wo)
+rather than a structural failure.
+
+The two earlier "everything diverges" reports were flat-comparison artifacts: the port writes numpy
+arrays in ggml AXIS order with C-order strides, the reference writes raw memory order, so the payloads
+must be transposed, not reshaped. Both reports had the right magnitudes and near-zero correlation - which
+is exactly what a genuinely broken port looks like, hence two turns spent on the wrong suspect.
+
+Next: bisect INSIDE the KDA block. hc_attn_pre-0 and attn_norm-0 are known-good inputs, so dump the KDA
+front end (kda_gate-0, kda_beta-0, the conv1d outputs, the q/k/v norms) and find the first wrong term.
