@@ -2040,3 +2040,37 @@ block N-1's output and needs the chain to run.
 THE TEST THAT SETTLES IT: build a block-1 fixture and run kda_gate on it.  If the engine matches the oracle there,
 the builder is good enough for its purpose regardless of block 0's provenance.  That is the next action, and it is
 cheaper than another round of archaeology on a file whose only job is to be the same on both sides.
+
+########  BLOCK 1's KDA GATE FAILS - AND THE PATTERN LOCALISES IT  ########
+
+    g     PASS  1.768e-06        beta  PASS  4.828e-07
+    q     FAIL  2.092e+00        k     FAIL  2.070e+00        v     FAIL  4.731e+01
+    attn  FAIL  7.320e+01        o     FAIL  4.303e+01        result FAIL 3.657e+01
+
+WHY THIS IS USEFUL RATHER THAN DISCOURAGING.  beta = sigmoid(xn @ ssm_beta.T) and g comes from xn through
+ssm_f_*/ssm_g_*/ssm_a, and BOTH PASS.  So xn is correct, which means the INPUT is correct - this settles the
+unresolved input-provenance question from the previous round: whatever the builder chooses, the oracle and the
+engine receive the same array and the path that consumes it agrees.  The input was never the suspect; now it is
+excluded by measurement rather than by argument.
+
+THE DIVERGENCE IS BRACKETED.  It cannot be xn (beta and g pass) and it cannot be the hyper-connection or the
+binding, neither of which is on this path.  q, k and v all fail, and all three are xn @ w + conv1d + silu.  Two of
+them are then l2-normalized, and normalization would hide a pure scale error - yet q and k fail anyway, at the same
+magnitude as each other (2.09 and 2.07), while v, which is NOT normalized, fails far worse (47.3).  A consistent
+reading: the conv1d path produces a wrong DIRECTION, and v additionally shows the magnitude error that l2_norm
+would have removed from q and k.
+
+WHAT IS ALREADY EXCLUDED, each by a check rather than a belief:
+  * the conv weights and their repack - the block-0 self-test reproduced all 16 w_*.bin files at 0.000e+00;
+  * the conv geometry being block-dependent - block 1's ssm_conv1d_* are (8192, 1, 4) exactly as block 0's;
+  * the input - beta and g pass, and both consume xn;
+  * the kernel being broken in general - it passes 8/8 on block 0 at two token counts;
+  * the engine's binding - kda_gate is using the FIXTURE'S weights ("weights and input from the oracle's fixture"),
+    so the binding is not on this path at all.
+
+THE NEXT MEASUREMENT, and it is one small change rather than another investigation: kda_gate compares eight stages
+and skips xn, qc, kc and vc - which are exactly the intermediates between the last thing that passes and the first
+thing that fails.  The fixture already contains all four (inter_xn.bin, inter_qc.bin, inter_kc.bin, inter_vc.bin).
+Adding them to the gate's stage list puts the divergence between two adjacent stages instead of across four, and
+the first comparison that fails names the operation: qc failing means xn @ wq.T + conv + silu, qc passing with q
+failing means l2_norm.  That is the next action, and it is cheaper than any hypothesis.
