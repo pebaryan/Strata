@@ -161,3 +161,23 @@ glm_bind.cpp, therefore, in full:
 9.1's spec is now complete and verified: table generated, values checked (12/12 byte-identical, 14/14
 one uniform orientation rule), API read, signature fixed.  What remains for 9.1 is writing this function, the
 CMake entry, and the pass check against the Python block-0 outputs.
+
+## 9.1 PASS CHECK - CLOSED
+
+    block  0 (KDA+dense):  F32 12 match, 0 mismatch
+    block  1 (KDA+dense):  F32 12 match, 0 mismatch
+    block  3 (MLA+MoE):    F32 13 match, 1 mismatch   [ffn_gate_inp.weight]
+    block  4 (KDA+MoE):    F32 13 match, 1 mismatch   [ffn_gate_inp.weight]
+    block 44:              F32 13 match, 1 mismatch   [ffn_gate_inp.weight]
+
+The one mismatch everywhere is the ROUTER, and it is the packer's documented policy rather than drift -
+verified, not assumed:
+
+    pack row blk.4.ffn_gate_inp.weight: kind=4 (BF16), 1179648 values
+    pack bf16 == oracle f32 rounded to bf16:  True
+    (max difference from the f32 values: 0.000e+00)
+
+glm5_pack.py converts routers to BF16 by design (and refuses to run unless the F32 values are exactly
+BF16-representable, which they are).  So every F32 tensor the engine binds matches the verified oracle, after
+that one documented conversion.  The 14 natively-served Q8_0 tensors are read straight from the GGUF's own
+blocks and are covered by the block chain (9.2) rather than by float statistics.
