@@ -468,6 +468,16 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("input: hc_init ne=[%d,%d,%d,%d], %zu floats\n", ne_in[0], ne_in[1], ne_in[2], ne_in[3], inp.size());
+    // ---- IS THE INPUT ALIVE?  |l_out| came back 0.000000 over a full forty-five-block pass, and a zero input would
+    // produce exactly that, because rms_norm of zeros is zeros/eps and every stage downstream is linear in it.  Printing
+    // the input's magnitude costs one line and decides between "the trunk does not write its output" and "the trunk was
+    // handed nothing" - which are very different bugs and look identical from the outside.
+    {
+        double in_ss = 0.0, in_max = 0.0;
+        for (float v : inp) { in_ss += (double) v * v; if (std::fabs((double) v) > in_max) in_max = std::fabs((double) v); }
+        std::printf("input magnitude: rms %.8g, max |v| %.8g, first 4: %.6g %.6g %.6g %.6g\n",
+                    std::sqrt(in_ss / (double) inp.size()), in_max, inp[0], inp[1], inp[2], inp[3]);
+    }
 
     // ---- run: the TOKEN loop is outer, because the layers are stateful and the state carries across it
     StageCount sc;

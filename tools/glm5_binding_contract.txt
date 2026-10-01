@@ -5626,3 +5626,41 @@ WHAT REMAINS, and it is now a numerical question rather than a wiring one:
     different input to every stage - and the token loop is outer, so this is also the first exercise of the per-layer
     lifetime question in the staging that was recorded two commits ago (a bound block mutated to point at a buffer freed
     on the next provider call).  That defect is real and unaddressed, and it is the obvious candidate here.
+
+TOKEN 0 IS ALIVE, AND THE TOKEN-1 CRASH IS THE LIFETIME DEFECT ALREADY ON RECORD
+
+    input magnitude: rms 0.008270075, max |v| 0.041396141, first 4: -0.000167131 0.000404358 -0.00196195 0.00120354
+      token 0: |l_out| 0.008270, MLA cache depths 1 1 1 1 1 1 1 1 1 1 1
+
+THE INPUT IS REAL - rms 8.27e-3, max 4.14e-2 - and the output comes back at the same rms to seven digits.  So the
+earlier 0.000000 was not the input and not the trunk's plumbing: with the slot fix in place the trunk takes a live input
+through forty-five blocks and produces a live output of the same order of magnitude, which for a chain of residual
+blocks is what one should expect rather than a suspicious coincidence.  The one-line input print settled it in a single
+run, which is the point worth keeping: "the trunk produced zeros" and "the trunk was handed zeros" are very different
+bugs and look identical from outside.
+
+AND THE CRASH AT TOKEN 1 IS THE DEFECT ALREADY RECORDED, with the mechanism now unambiguous:
+
+    the provider stages layer 0's quantized tensors, re-points layer 0's BOUND BLOCK at the staged host buffers, and
+    clears each tensor's `quantized` flag ...
+    ... then, when layer 1 is asked for, frees those buffers.
+
+  At token 0 each layer is visited exactly once, so the freed pointers are never read again and the run completes.  At
+  token 1 layer 0 is visited for the SECOND time: its tensors still point at the buffers freed during token 0, and
+  because the flag was cleared they are not re-staged, so glm_fill_layer_weights faithfully maps dangling pointers into
+  the weight struct and the first kernel to dereference one faults.
+
+  THAT IS THE LIFETIME BUG EXACTLY AS WRITTEN TWO COMMITS AGO, now with a reproduction: token 0 passes, token 1 crashes,
+  and the token loop being outer is precisely what makes the second visit happen.
+
+THE FIX, unchanged from the earlier entry: keep a record per staged tensor - which block, which tensor index, its
+original pointer, its original quantized flag - and restore all three BEFORE freeing on the next provider call, so each
+layer's bound block returns to the state the binder left it in and the next visit re-stages cleanly.  That keeps the
+per-layer lifetime that makes 45 blocks affordable (20-30 GB otherwise, measured as an OOM kill) and removes the aliasing,
+because a freed buffer is no longer referenced by anything.
+
+STATE OF THE PORT AT THIS ENTRY: the engine's own trunk runs forty-five of forty-five blocks from the real pack on a live
+input, with all eleven MLA caches at the right depth.  What stands between that and the token gate is a lifetime, not a
+computation - and the remaining numerical question, whether the seven-digit agreement between input and output rms is
+the residual structure or a pass-through, is answered by running the head next, because argmax is not permutation- or
+scale-invariant the way an rms is.
