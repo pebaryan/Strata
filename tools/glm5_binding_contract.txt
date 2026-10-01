@@ -3022,3 +3022,39 @@ ANALYSIS CAUGHT ONE THING WORTH RECORDING: the first version of this patch assig
 buffer that the attn_norm comparison reads, which would have made stage 1 compare the oracle against itself - a gate
 that cannot fail, and precisely the wrong-against-wrong defect this port spent a session on.  It was changed to a
 separate kda_in buffer.  The check that caught it was following the data one step further than the edit.
+
+HOW TO GET THE TWELVE-INTERMEDIATE COMPARISON ON A REAL INPUT - the exact recipe, so the next step is mechanical
+
+The oracle's own raw-fixture writer (glm5_kda_reference.py, in main() at the --raw-fixture branch) emits, verbatim:
+
+    fh.write(struct.pack("<6i", N_EMBD, NH, HD, D_CONV, tokens, layer))
+    for arr in (w["attn_norm"], w["wq"], w["wk"], w["wv"], w["conv_q"], w["conv_k"], w["conv_v"],
+                w["ssm_a"], w["dt_bias"], w["ssm_f_a"], w["ssm_f_b"], w["ssm_beta"],
+                w["ssm_g_a"], w["ssm_g_b"], w["o_norm"], w["wo"], x):
+        fh.write(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+    for arr in (mid["qc"], mid["kc"], mid["vc"], mid["g"], mid["beta"], mid["q"], mid["k"],
+                mid["v"], mid["attn"], mid["o"], result):
+        fh.write(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+
+with `result, mid = kda_block(w, x, tokens, want_state=True)`, and x shaped (T, D) - token major, because
+conv1d_causal unpacks `T, ch = x.shape` and rejects a flat vector.
+
+So the missing piece is a script that takes the oracle's attn_norm-0.bin token 0 as `x`, calls kda_block on it, and
+writes that raw file; then existing, already-proven tools do the rest unchanged:
+
+    1  oracle stages on this input  ->  raw fixture (the layout above)
+    2  tools/split_raw_fixture.py RAW OUTDIR      (validates that the arrays consume the file exactly)
+    3  ./build-glm5/kda_gate OUTDIR 1             (compares TWELVE intermediates against the oracle's)
+
+and the FIRST intermediate that deviates names the operation at fault: xn, qc, kc, vc, g, beta, q, k, v, attn, o,
+result - where xn is what split_raw_fixture derives as the normed input.
+
+Reuse the splitter rather than reproducing the layout anywhere: it already asserts the byte totals, and this port has
+lost more time to a hand-rolled fixture that did not imply its own outputs than to any other single cause.  The writer
+above is copied verbatim so that the new script differs from the oracle's own writer only in where `x` comes from -
+which is the whole point of the exercise, and the one difference that has to be right.
+
+WHY THIS IS WORTH DOING NEXT AND IS THE LAST THING NEEDED: the kernel now has a demonstrated 1.391x disagreement with
+the oracle on a real activation, while passing twelve of twelve on the oracle's seed.  The twelve-intermediate gate is
+already built, already proven, and already has its failure mode demonstrated; pointing it at this input converts "the
+kernel is wrong by a factor somewhere" into "this operation is wrong", in one run.
