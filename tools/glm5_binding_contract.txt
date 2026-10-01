@@ -2480,3 +2480,27 @@ investigation each to establish and block 4 cost one command.
 SCOPE, unchanged: the KDA stage on these blocks' real weights, at T=1.  The FFN and hyper-connection stages are
 verified for block 0 only, and the chain is not verified at all - the gate's inputs come from the oracle's seed, not
 from block N-1's output.
+
+BLOCK 1 FFN FIXTURE: THE GATE REFUSED IT, AND THE CAUSE IS ONE MEASUREMENT AWAY
+
+    input/result are 8192/4096, expected 4096 each
+
+The gate's size check rejected the fixture instead of gating on it, which is the correct behaviour and the reason the
+check exists.  What is established: result.bin is 4096, and dense_forward asserts x.size == wg.shape[1] internally
+without failing - so the x that was USED was 4096.  Yet input.bin on disk is 8192.  So the file and the value that
+was passed to the oracle did not come from the same expression, which cannot be resolved by reasoning about the
+script and needs one measurement: print x.size, the dump file's byte count, its header ne, and the destination
+file's size, immediately before and after the write.
+
+WHY THIS IS WORTH ONE LINE RATHER THAN A HYPOTHESIS.  Every fixture defect in this session has been a discrepancy
+between what a file holds and what something else assumed it holds - a container header read as data, per-site
+(view) slices taken for packed arrays, sizes derived instead of measured (five of them wrong by up to 4096x), and a
+hand-rolled conversion that produced a fixture whose parts did not imply each other.  Writing the sizes down as the
+file is created is the cheap habit that would have caught all of them at the point of creation, and it is the same
+lesson as the aggregate check in split_raw_fixture.py, which DID catch five wrong sizes before a byte was written.
+Make the FFN fixture builder do the same: assert the byte count it writes equals what it intended.
+
+STATE: blocks 0, 1, 2 and 4 pass the KDA gate 12/12.  Block 0 passes the FFN gate (PASS at the fp32 floor, with the
+clamp verified by a demonstrated failure) and the hc_post gate (2.551e-07).  The block-1 FFN fixture is blocked on
+the size discrepancy above; nothing else about it is in question, and the weights for it dumped at the expected sizes
+(34,603,008 / 34,603,008 / 41,287,680 bytes, matching block 0's exactly).
