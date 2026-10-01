@@ -114,3 +114,21 @@
 
   So glm_bind.cpp is: a loop over kGlmBlock0[] (include/strata/core/glm5_block0_gen.hpp), v.get(name),
   the two branches above, then the three documented transforms.  No layout reasoning left in the C++.
+
+## VERIFICATION OF THIS CONTRACT (run before writing any C++; it passed)
+
+    table rows: 26
+    F32 tensors: 12/12 byte-identical between dense.bin and the verified loader (np.array_equal)
+    quantized tensors: 14/14 recorded by the pack as (in, out) == gguf.T  - one uniform rule
+
+So the binding is fully specified and checked at the data level:
+
+    12 F32 tensors      -> unmodified; dense.bin holds exactly the values the verified oracle uses
+    14 Q8_0 tensors     -> dequant_q8_0, then TRANSPOSE (pack (in,out) vs the oracle's (out,in))
+    3 conv tensors      -> among the F32 twelve, so the transpose is the (d_inner,1,d_conv) fold only:
+                           reshape(d_inner, d_conv).T, NOT a runtime transpose of a quantized blob
+
+The only thing left that is NOT in this file is one engine API detail: the concrete type of the view that
+provides v.get(name) / v.name(name) (used in src/core/layer.cpp but not yet read out here).  Look that up,
+then glm_bind.cpp is a loop over kGlmBlock0[] with the two branches and these transforms - nothing to
+rediscover.  Pass criterion for 9.1 is unchanged: bound layer-0 tensors reproduce the Python block-0 outputs.
