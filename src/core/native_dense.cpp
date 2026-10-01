@@ -26,7 +26,13 @@ static bool glm5_eligible_name(const std::string& name) {
         "ssm_beta.weight", "ssm_f_a.weight", "ssm_f_b.weight", "ssm_g_a.weight", "ssm_g_b.weight",
         "hc_attn_fn.weight", "hc_ffn_fn.weight",
         "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "ffn_gate_inp.weight",
+        // the MLA block's projections.  attn_k_b / attn_v_b are 3-D ([256,512,64]), so the 2-D restriction
+        // below cannot apply to them: they are consumed by the MLA kernel's own layout, not by an MMVQ.
+        "attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_q_a_norm.weight",
+        "attn_kv_a_norm.weight", "attn_k_b.weight", "attn_v_b.weight",
     };
+    // model-level tensors carry no "blk.<n>." prefix at all
+    if (name == "output.weight" || name == "token_embd.weight" || name == "output_norm.weight") return true;
     // strip the "blk.<n>." prefix and compare the remainder: blk.0.attn_q.weight -> attn_q.weight
     const size_t first = name.find('.');
     if (first == std::string::npos) return false;
@@ -37,7 +43,14 @@ static bool glm5_eligible_name(const std::string& name) {
     return false;
 }
 
+/// True when the artifact is glm5next: then ONLY glm5_eligible_name decides what is served natively.
+/// The qwen4exp patterns would otherwise claim GLM's expert tensors (ffn_*_exps.weight), whose geometry is
+/// different and which belong to the expert cache reading the pack's experts.bin, and their block-geometry
+/// check rejects them outright.
+static bool g_glm5_only = false;
+
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
+    if (g_glm5_only) return glm5_eligible_name(tensor.name);
     if (glm5_eligible_name(tensor.name)) return true;
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
@@ -65,10 +78,14 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     try {
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
-            for (const auto& tensor : gguf.tensors())
+            for (const auto& tensor : gguf.tensors()) {
+                // glm5next's MLA tensors are legitimately 3-D; qwen4exp's native set is all 2-D.
+                const bool shape_ok = tensor.shape.size() == 2 ||
+                                      (g_glm5_only && tensor.shape.size() == 3);
                 if (eligible(tensor, include_ple_key) && strata::kernels::native_mmvq_supported(tensor.type) &&
-                    tensor.shape.size() == 2)
+                    shape_ok)
                     out.insert(tensor.name);
+            }
         }
         return true;
     } catch (const std::exception& error) {
@@ -84,6 +101,12 @@ NativeDense::~NativeDense() {
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
                        bool include_ple_key) {
+    // The artifact's OWN metadata decides which naming applies, before anything is served.
+    try {
+        strata::GgufFile first(shards.empty() ? std::string() : shards.front());
+        const strata::MetaValue* a = first.get("general.architecture");
+        g_glm5_only = (a && a->s == "glm5next");
+    } catch (const std::exception&) { g_glm5_only = false; }
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
@@ -163,6 +186,10 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             for (const auto& tensor : gguf.tensors()) {
                 int block_elements = 0, block_bytes = 0;
                 uint64_t elements = 1;
+                // Only tensors this class will actually SERVE need their quant blocks validated.  The
+                // unfiltered loop tripped over glm5next's expert tensors, which NativeDense never serves
+                // (the expert cache reads them from the pack's experts.bin).
+                if (!eligible(tensor, include_ple_key)) continue;
                 if (tensor.shape.empty() || !strata::block_geometry(tensor.type, block_elements, block_bytes) ||
                     tensor.shape[0] % (uint64_t) block_elements != 0) {
                     err = "native dense: invalid block geometry " + tensor.name; return false;

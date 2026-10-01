@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <set>
 #include <cstdlib>
 #include <string>
 #include <vector>
@@ -61,12 +62,21 @@ int main(int argc, char** argv) {
             shards.push_back(shard);
         }
     }
-    if (!nd.load(shards, table, err)) { std::fprintf(stderr, "native: %s\n", err.c_str()); return 1; }
+    // The two loaders depend on each other, and the engine's own mechanism is served_names: it names the
+    // tensors NativeDense will serve from the GGUF, which the table then SKIPS instead of expecting in
+    // dense.bin.  Compute it first, hand it to the table, and only then register the native projection -
+    // otherwise the table has no row to mark native and reports "tensor absent from canonical table".
+    std::set<std::string> served;
+    if (!strata::core::NativeDense::served_names(shards, false, served, err)) {
+        std::fprintf(stderr, "served_names: %s\n", err.c_str()); return 1;
+    }
+    std::fprintf(stderr, "natively served tensors: %zu\n", served.size());
     uint64_t bytes = 0;
-    if (!table.pool_bytes(pack, bytes, err)) { std::fprintf(stderr, "pool_bytes: %s\n", err.c_str()); return 1; }
+    if (!table.pool_bytes(pack, bytes, err, &served)) { std::fprintf(stderr, "pool_bytes: %s\n", err.c_str()); return 1; }
     void* arena = nullptr;
     if (cudaMalloc(&arena, bytes) != cudaSuccess) { std::fprintf(stderr, "arena alloc of %llu failed\n", (unsigned long long) bytes); return 1; }
-    if (!table.load(pack, arena, bytes, err)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    if (!table.load(pack, arena, bytes, err, &served)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
+    if (!nd.load(shards, table, err)) { std::fprintf(stderr, "native: %s\n", err.c_str()); return 1; }
 
     strata::core::LayerView v(table, block);
     strata::core::GlmBoundBlock bound;
