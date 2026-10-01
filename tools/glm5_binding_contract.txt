@@ -2792,3 +2792,36 @@ hc_post -> hc_pre -> ffn_norm -> FFN -> hc_post, with the residual routing, as o
 its four constituent kernels each have passing gates, but the assembly has no test - and the dump supplies an expected
 value for every intermediate, so the first run is a driver that fills GlmBlockWeights from fixture files and prints
 each stage beside its dump family.
+
+########  THE BLOCK FIXTURE IS COMPLETE - EVERY INPUT THE LOOP NEEDS EXISTS ON DISK  ########
+
+    w_hc_attn_fn      393,216 floats   [-0.37885, 0.39847]     w_hc_ffn_fn      393,216   [-0.36141, 0.40429]
+    w_hc_attn_base         24 floats   [-8, 2.6923]            w_hc_ffn_base         24   [-8.2931, 0.13325]
+    w_hc_attn_scale         3 floats   [0.044621, 0.088875]    w_hc_ffn_scale         3   [0.056572, 0.11865]
+    w_attn_norm         4,096 floats   [0.070312, 0.15723]     w_ffn_norm         4,096   [0.028198, 0.15723]
+    x.bin               4 streams x 4096, from hc_init         = 16,384 floats
+
+with the 16 KDA weights in glm5-kda-l0-t1/ and the FFN's three raw block sets in glm5-ffn-l0/, and every expected
+stage readable from glm5-ref-dump5/.  So nothing is missing for a block-0 run except the driver itself.
+
+A FREE CONSISTENCY CHECK IN THE SIZES: hc_*_fn is 393,216 = 4096 x 96, and 96 = 4 streams x 24 = 4 pre + 4 post + 16
+comb - exactly the HcMix{pre[4], post[4], comb[4][4]} the engine's header declares.  The site's mix is a 96-wide
+projection, and the artifact's own tensor size says so independently of the code.
+
+THE SHAPE ASSERTION EARned ITS KEEP IMMEDIATELY, ON A SCRIPT WRITTEN MINUTES EARLIER.  The first attempt read x from
+hc_attn_pre-0.bin, whose header is ne=[4096, 5, 1, 1].  I read ne[1] as a stream count and got 5; the assertion
+refused.  In fact ne[1] is the TOKEN count there and the whole tensor is one stream over five tokens - the normed
+layer input, not the block's stream input.  The correct source is hc_init, ne=[4096, 4, 5, 1]: four streams, five
+tokens.  Both are float*, both are plausible sizes, and nothing downstream would have noticed - the block loop would
+simply have produced a wrong answer whose blame would have fallen on kernel code that is already verified.
+
+That is now the sixth time in this port that a writer and a reader have had to agree about a format and only an
+assertion could tell them apart: a dump container header read as data, per-site (view) slices taken for packed
+arrays, five derived array sizes wrong by up to 4096x, a float64 file read as float32, and now a single-stream array
+taken for the stream set.  The rule that catches all six: assert the shape you expect rather than accepting the one
+you are given.
+
+NEXT AND LAST: the driver.  It fills GlmBlockWeights from glm5-block-l0 (the eight weights), the KDA fixture (the
+sixteen), and the FFN fixture (the three raw block sets, through the two proven dequantizers), reads x.bin, runs
+glm_block_forward for one token, and prints each stage beside its dump family - hc_attn_pre, attn_norm, attn_output,
+hc_attn_post, hc_ffn_pre, ffn_norm, ffn_out, l_out.  Nothing has run the loop yet.
