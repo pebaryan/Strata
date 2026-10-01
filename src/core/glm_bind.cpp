@@ -117,8 +117,11 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             } else {
                 got.ptr = p;
             }
-        } else if (std::getenv("STRATA_HC_DEQUANT") && full.size() >= 10 &&
-                   full.compare(full.size() - 10, 10, "_fn.weight") == 0) {
+        } else if (std::getenv("STRATA_HC_DEQUANT") &&
+                   ((full.size() >= 10 && full.compare(full.size() - 10, 10, "_fn.weight") == 0) ||
+                    (std::getenv("STRATA_DEQUANT_ATTN_Q") &&
+                     full.compare(0, full.find('.'), "blk") == 0 &&
+                     full.find(".attn_q.weight") != std::string::npos))) {
             // The hc function matrices (hc_attn_fn / hc_ffn_fn) are consumed as FLOATS by hc_pre, which reads
             // them as the ggml weight [hc*n_embd, (2+hc)*hc] - see the note in glm_hc.hpp.  Native serving
             // hands over Q8_0 blocks in the swapped orientation the ATTENTION kernels want, which is both the
@@ -151,6 +154,19 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             // came back as "cudaMalloc failed".
             strata::kernels::dequant_q8_0((const uint8_t*) w->native_data, dev_f, n, stream);
             if (stream) cudaStreamSynchronize((cudaStream_t) stream);
+            // INSTRUMENTATION: name the step rather than theorise.  If a tensor's dequant is what poisons the
+            // context, the error is already set here - and reporting it per tensor says WHICH tensor and at which
+            // step, instead of leaving the next allocation to report it indirectly.
+            {
+                const cudaError_t err_after = cudaGetLastError();
+                std::fprintf(stderr, "dequant: %-30s n=%lld want=%.1f MB  alloc+dequant: %s\n",
+                             full.c_str(), (long long) n, (double) n * 4.0 / 1048576.0,
+                             cudaGetErrorString(err_after));
+                if (err_after != cudaSuccess) {
+                    err = std::string("glm_bind: ") + full + ": " + cudaGetErrorString(err_after);
+                    return false;
+                }
+            }
             // Discriminating probe: run the kernel, then discard its result.  If the arena still corrupts,
             // the kernel's write is the cause; if it does not, holding this second allocation is.
             if (std::getenv("STRATA_HC_DEQUANT_KERNEL_ONLY")) {
