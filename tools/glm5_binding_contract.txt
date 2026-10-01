@@ -4494,3 +4494,38 @@ for this block, so the next step is to compare the MLA stage's own output agains
 
 REGRESSION CHECK: the change touched only the MLA path, so the KDA blocks do not call it - but the two verified gates
 were re-run rather than assumed, and both are unchanged.
+
+BLOCK 3'S REMAINING 6%: THE FIRST TWO CANDIDATES ARE ELIMINATED BY READING, NOT BY GUESSING
+
+After the MLA-cache fix the block sits at worst 0.00354951 = 6.1% of rms, against the 1.2e-05 the KDA blocks reach.
+Two specific explanations were tested and both are dead:
+
+  1. THE ATTEND ORDER IS RIGHT.  The suspicion was that mla_forward attends over the passed cache BEFORE writing the
+     current token's latent, which would make the loop's `cells + 1` pass a stale entry.  Reading glm_mla.cpp:
+         line 71  rms_norm_inplace(kv.data(), kv_lora, w.kv_a_norm);
+         line 72  if (want.kv) std::copy(kv.begin(), kv.end(), want.kv);      <- written FIRST
+         line 79  for (int h = 0; h < n_head; ++h) { ... }                    <- attention AFTER
+     so the latent is in the cache before the attention reads it, and the 1-entry-cache invariant in the parity gate
+     agrees: a cache of one holds that token's latent, which is the convention the loop now satisfies.
+
+  2. THE MoE GEOMETRY IS RIGHT, INCLUDING THE SCALE.  MoeGeometry's defaults are n_embd 4096, n_expert 288, n_used 8,
+     ff 2048, w_scale 2.5f, norm_w true, clamp 10 - and 2.5 is exactly what glm_moe_parity printed from the artifact
+     ("scale 2.5"), so the combine weights are scaled as the model requires and the gate sets the rest explicitly.
+     SwiGLU clamp 10 is the documented value for every layer of this model.
+
+WHAT IS LEFT, with the search narrowed rather than guessed at.  The block's four parts are hc_pre -> MLA -> hc_post ->
+hc_pre -> routed MoE -> hc_post, and of those: the hc sites are verified in blocks 0 and 1, the MLA kernel is bit-exact,
+the routed kernel is verified with its clamp proven wired, and the pack geometry matches native_fmt to the byte.  The
+remaining candidates are therefore the things that only exist in the ASSEMBLY of an MLA + routed block:
+
+  * whether the loop's MLA cache is per LAYER as the oracle's is (its `latents: dict[int, list[np.ndarray]]` is keyed
+    by layer), or whether the gate's single cache slot is being reused in a way that mixes two layers' latents.  The
+    gate has ONE slot and first_layer = 3 runs ONE layer, so this should not bite here - but it is the next thing to
+    check rather than assume;
+  * whether gl_stage_moe_native is given the same expert ids the oracle routed to.  The oracle's MoE fixture gate
+    compared ids exactly for layer 3 (45,25,117,180,98,55,9,88) but with the ORACLE's own input; the block feeds it the
+    block's normed input, so a router disagreement would show up here and nowhere else.
+
+THE NEXT MEASUREMENT is to have the runner dump block 3's per-stage intermediates (it already dumps l_out-N; adding
+attn_output and ffn_out for one layer is a few lines) and compare the engine's attention-site and FFN outputs against
+them separately.  That splits 6% into "before the FFN" or "the FFN" in a single run instead of by argument.
