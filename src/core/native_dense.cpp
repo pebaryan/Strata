@@ -21,26 +21,16 @@ namespace {
 /// A glm5next name is eligible when it is one of these and, as before, the quant type has a native MMVQ
 /// kernel and the tensor is 2-D; the caller applies those two conditions.
 static bool glm5_eligible_name(const std::string& name) {
-    static const char* kGlm5[] = {
-        "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
-        "ssm_beta.weight", "ssm_f_a.weight", "ssm_f_b.weight", "ssm_g_a.weight", "ssm_g_b.weight",
-        "hc_attn_fn.weight", "hc_ffn_fn.weight",
-        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "ffn_gate_inp.weight",
-        // the MLA block's projections.  attn_k_b / attn_v_b are 3-D ([256,512,64]), so the 2-D restriction
-        // below cannot apply to them: they are consumed by the MLA kernel's own layout, not by an MMVQ.
-        "attn_q_a.weight", "attn_q_b.weight", "attn_kv_a_mqa.weight", "attn_q_a_norm.weight",
-        "attn_kv_a_norm.weight", "attn_k_b.weight", "attn_v_b.weight",
-    };
-    // model-level tensors carry no "blk.<n>." prefix at all
-    if (name == "output.weight" || name == "token_embd.weight" || name == "output_norm.weight") return true;
-    // strip the "blk.<n>." prefix and compare the remainder: blk.0.attn_q.weight -> attn_q.weight
-    const size_t first = name.find('.');
-    if (first == std::string::npos) return false;
-    const size_t second = name.find('.', first + 1);
-    if (second == std::string::npos) return false;
-    const std::string suffix = name.substr(second + 1);
-    for (const char* want : kGlm5) if (suffix == want) return true;
-    return false;
+    // DATA-DRIVEN, not a name list.  What NativeDense must serve is exactly "quantized tensors the pack did
+    // not put in dense.bin", which is a property of the artifact, not a list someone maintains: an attempt
+    // at a list grew 558 -> 560 -> 596 -> 632 and still met a name it had never heard of
+    // (blk.3.indexer_compressor_gate.weight).  The caller still applies the two real conditions - an MMVQ
+    // kernel exists for the type, and the shape is 2-D or (for glm5next) 3-D.
+    //
+    // The one exclusion is the expert tensors: those are owned by the expert cache reading the pack's
+    // experts.bin, and their block geometry is not this class's business.
+    if (name.find("_exps.") != std::string::npos) return false;
+    return true;
 }
 
 /// True when the artifact is glm5next: then ONLY glm5_eligible_name decides what is served natively.
@@ -75,6 +65,14 @@ struct Pending {
 
 bool NativeDense::served_names(const std::vector<std::string>& shards, bool include_ple_key,
                                std::set<std::string>& out, std::string& err) {
+    // served_names runs BEFORE load(), so it has to establish the naming regime itself - otherwise
+    // g_glm5_only is still false here and glm5next's 3-D MLA tensors are rejected as if they were qwen4exp's
+    // 2-D-only set, which is exactly how they came to be missing from the served set.
+    try {
+        strata::GgufFile first(shards.empty() ? std::string() : shards.front());
+        const strata::MetaValue* a = first.get("general.architecture");
+        g_glm5_only = (a && a->s == "glm5next");
+    } catch (const std::exception&) { g_glm5_only = false; }
     try {
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
@@ -215,6 +213,11 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             }
             for (const auto& tensor : gguf.tensors()) {
                 if (!eligible(tensor, include_ple_key)) continue;
+                // 3-D tensors (glm5next's MLA k_b/v_b): mark only, do not upload.  The MMVQ
+                // upload path is 2-D by construction - "incompatible matrix" is that assumption
+                // firing - and the MLA kernel wants its own layout anyway, so glm_bind.cpp fetches
+                // these from the GGUF itself.
+                if (tensor.shape.size() != 2) continue;
                 if (!seen.insert(tensor.name).second) {
                     err = "native dense: duplicate tensor " + tensor.name; return false;
                 }

@@ -71,6 +71,9 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "served_names: %s\n", err.c_str()); return 1;
     }
     std::fprintf(stderr, "natively served tensors: %zu\n", served.size());
+    for (const char* probe : {"blk.3.attn_k_b.weight", "blk.3.attn_v_b.weight", "blk.0.attn_q.weight"}) {
+        std::fprintf(stderr, "  probe %-26s in served set: %s\n", probe, served.count(probe) ? "yes" : "NO");
+    }
     uint64_t bytes = 0;
     if (!table.pool_bytes(pack, bytes, err, &served)) { std::fprintf(stderr, "pool_bytes: %s\n", err.c_str()); return 1; }
     void* arena = nullptr;
