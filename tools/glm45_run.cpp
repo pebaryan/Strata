@@ -427,14 +427,26 @@ int main(int argc, char** argv) {
         mla_index[b] = -1;
         kda_len[b] = 0;
         mla_len[b] = 0;
+        // FILLED BY SLOT, NOT BY LAYER, and that distinction is a real bug I had.
+        //
+        // The trunk reads state.kda_state[slot] and state.mla_cache[slot], where slot is kda_index[layer] /
+        // mla_index[layer] - so those two arrays are keyed by SLOT.  This runner was filling them by LAYER.  For blocks
+        // 0, 1 and 2 every block is KDA, so slot == layer and the two agree by accident; block 3 is MLA and takes no KDA
+        // slot, so from block 4 onward the mapping shifts by one and kda_state[slot] lands on the index that block 3
+        // would have had - never assigned, hence whatever the array held, and a fault named as a null argument.
+        //
+        // The same one-line shift applies to the MLA caches in the other direction, which is very likely what the
+        // layer-3 pointer differential was showing when four device pointers came back identical across two layers.
         if (C::glm::glm_attention_is_mla(b) == 1) {
             mla_cache[(size_t) b].assign((size_t) TOKENS * KV_LORA, 0.0f);
-            mla_ptrs[b] = mla_cache[(size_t) b].data();
-            mla_index[b] = n_mla++;
+            mla_index[b] = n_mla;
+            mla_ptrs[n_mla] = mla_cache[(size_t) b].data();
+            ++n_mla;
         } else {
             kda_state[(size_t) b].assign((size_t) NH * HD * HD, 0.0f);
-            kda_ptrs[b] = kda_state[(size_t) b].data();
-            kda_index[b] = n_kda++;
+            kda_index[b] = n_kda;
+            kda_ptrs[n_kda] = kda_state[(size_t) b].data();
+            ++n_kda;
         }
     }
     std::printf("state: %d KDA slots (%.0f MB), %d MLA caches (%d cells each)\n", n_kda,

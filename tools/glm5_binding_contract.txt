@@ -5588,3 +5588,41 @@ NEXT, and it is two lines: print `kda_index[4]`, the slot the trunk will use, an
 so (a) and (b) separate themselves.  Note that the differential instrumented KdaWeights for layer 0 and 4 and found the
 impossible relationship recorded above - four device pointers shared between two layers - and that finding still stands
 and is still unexplained; it is a SECOND defect, not this one, and the two must not be conflated.
+
+THE TRUNK RUNS ALL FORTY-FIVE BLOCKS - AND THE BUG THAT BLOCKED IT WAS ONE I FOUND BY READING, NOT BY BUILDING
+
+    token 0: |l_out| 0.000000, MLA cache depths 1 1 1 1 1 1 1 1 1 1 1
+
+THE ENGINE'S OWN TRUNK NOW EXECUTES EVERY BLOCK FROM THE REAL PACK: forty-five of forty-five, at token 0, with all eleven
+MLA caches at depth 1 - which is exactly right for the first token, and is itself the proof that the cache the trunk was
+handed is the cache the trunk is using.
+
+THE BUG, and it is the seventh instance of the port's one shape - correct parts, wrong wiring between them:
+
+    the trunk reads   state.kda_state[slot]   and   state.mla_cache[slot]     <- keyed by SLOT
+    the runner wrote  kda_ptrs[b]             and   mla_ptrs[b]              <- keyed by LAYER
+
+For blocks 0, 1 and 2 every block is KDA, so slot == layer and the two agree BY ACCIDENT.  Block 3 is MLA and takes no
+KDA slot, so from block 4 onward the mapping shifts by one and kda_state[slot] lands on the index that block 3 would have
+had - never assigned, hence whatever the array held, and reported as a null argument.  One line, in each direction.
+
+THIS IS ALSO WHY IT HID FOR SO LONG, and the reason is worth keeping: the four blocks that ran were exactly the four for
+which the two indexings coincide.  A bug that needs a discontinuity to appear will not appear while the test stops before
+the discontinuity - which is the same lesson as the MLA cache that was never populated, the gate that threaded its own
+cache, and the fixture arrays that were all in host memory.  In each case the code that was wrong had never been RUN past
+the point where the two interpretations differ.
+
+AND IT WAS FOUND BY READING THE TWO INDEXINGS SIDE BY SIDE, not by another build: the diagnostic that named `state`
+narrowed it to `kda_state[slot]`, and the fix was visible in the runner's own loop.  Two rounds were spent on builds and
+differentials first; this one cost a read.
+
+WHAT REMAINS, and it is now a numerical question rather than a wiring one:
+
+  * |l_out| IS ZERO.  The trunk completes and produces nothing - so either the last site's output is not reaching l_out,
+    or the input the trunk was handed is being consumed without contributing.  Given that every earlier stage is verified
+    against the oracle, the first thing to check is whether the value the loop prints is l_out at all, or an accumulator
+    that no stage writes.
+  * A CRASH AT TOKEN 1, after a token 0 that completed.  With l_out zero the second token feeds zeros, which is a
+    different input to every stage - and the token loop is outer, so this is also the first exercise of the per-layer
+    lifetime question in the staging that was recorded two commits ago (a bound block mutated to point at a buffer freed
+    on the next provider call).  That defect is real and unaddressed, and it is the obvious candidate here.
