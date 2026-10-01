@@ -176,7 +176,9 @@ target_compile_options(glm_kda_parity PRIVATE -O2)
 # native_dense.cpp carries NativeDense, which the binding driver must register so the pack's
 # GGUF-only rows can be served; it lives in strata_engine, which this driver deliberately does not
 # pull in, so take just the one translation unit.
-add_executable(glm5_bind_check tools/glm5_bind_check.cpp src/core/native_dense.cpp)
+add_executable(glm5_bind_check tools/glm5_bind_check.cpp src/core/native_dense.cpp
+                   src/core/glm_bind.cpp src/core/glm_layer.cpp
+                   src/kernels/glm_hc.cpp)
 target_include_directories(glm5_bind_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm5_bind_check PRIVATE -O2)
 target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::cudart)
