@@ -39,6 +39,7 @@
 #include "strata/core/native_dense.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
 namespace C = strata::core;
@@ -111,7 +112,46 @@ struct Provider {
     K::MlaGeometry mla_g;
     K::MoeGeometry dense_g, moe_g, shexp_g;
     C::ExpertSource* src = nullptr;
+    std::vector<float*> staged;      ///< this layer's host floats; freed when the next layer is asked for
 };
+
+/// Dequantize one quantized bound tensor to HOST floats.  The kernels are device kernels (dequant_q5_K was gated
+/// bit-exact against the oracle over 134 MB before being wired in), so the work happens on the device and the result is
+/// copied back - what matters is that it ENDS UP IN HOST MEMORY, because every consumer in the trunk is a CPU kernel.
+static float* dequant_to_host(const C::GlmBoundBlock::Tensor& t, std::string& err) {
+    const size_t n = (size_t) t.ne0 * (size_t) (t.ne1 > 0 ? t.ne1 : 1);
+    float* dev = nullptr;
+    if (cudaMalloc(&dev, n * sizeof(float)) != cudaSuccess) {
+        err = "dequant_to_host: cudaMalloc failed for " + t.name;
+        return nullptr;
+    }
+    if (t.native_type == 8) {
+        strata::kernels::dequant_q8_0((const uint8_t*) t.ptr, dev, (int64_t) n, nullptr);
+    } else if (t.native_type == 13) {
+        strata::kernels::dequant_q5_K((const uint8_t*) t.ptr, dev, (int64_t) n, nullptr);
+    } else if (t.native_type == 14) {
+        strata::kernels::dequant_q6_K((const uint8_t*) t.ptr, dev, (int64_t) n, nullptr);
+    } else {
+        err = "dequant_to_host: no dequantizer for type " + std::to_string(t.native_type) + " (" + t.name + ")";
+        cudaFree(dev);
+        return nullptr;
+    }
+    if (cudaDeviceSynchronize() != cudaSuccess) {
+        err = "dequant_to_host: the kernel failed for " + t.name + ": " + cudaGetErrorString(cudaGetLastError());
+        cudaFree(dev);
+        return nullptr;
+    }
+    float* host = (float*) std::malloc(n * sizeof(float));
+    if (host == nullptr) { err = "dequant_to_host: host allocation failed for " + t.name; cudaFree(dev); return nullptr; }
+    const cudaError_t cp = cudaMemcpy(host, dev, n * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaFree(dev);
+    if (cp != cudaSuccess) {
+        std::free(host);
+        err = "dequant_to_host: copy back failed for " + t.name + ": " + cudaGetErrorString(cp);
+        return nullptr;
+    }
+    return host;
+}
 
 static const uint8_t* blob_adapter(void* ctx, int layer, int expert) {
     return ((C::ExpertSource*) ctx)->blob(layer, expert);
@@ -120,7 +160,43 @@ static const uint8_t* blob_adapter(void* ctx, int layer, int expert) {
 static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, std::string& err) {
     Provider* p = (Provider*) raw;
     if (layer < 0 || layer >= N_LAYERS) { err = "layer out of range"; return false; }
-    out = p->w[(size_t) layer];                      // already assembled: the mapping is pure assignment
+    // ---- STAGE THIS LAYER'S WEIGHTS TO HOST, one layer at a time, releasing the previous layer's.
+    //
+    // The trunk's kernels are CPU-side, so every weight they read has to be host-resident floats - but materialising
+    // all forty-five layers at once is 20-30 GB and OOM-kills the box (measured: exit -9, no output).  The provider is
+    // the right place because glm_trunk_forward calls it once per layer, before that layer runs, which guarantees a
+    // layer's weights are needed only while that layer runs.
+    //
+    // Every quantized tensor is staged EXCEPT the dense FFN's three on blocks 0..2: those are consumed by the GPU path,
+    // which wants the quantized device blocks as they are, so they keep them.
+    for (float* f : p->staged) std::free(f);
+    p->staged.clear();
+    {
+        C::GlmBoundBlock& B = p->bound[(size_t) layer];
+        const bool dense = (layer < 3);
+        for (size_t i = 0; i < B.tensors.size(); ++i) {
+            C::GlmBoundBlock::Tensor& t = B.tensors[i];
+            if (!t.quantized || t.ptr == nullptr) continue;
+            // NO EXCEPTIONS, and the measurement is why: I first skipped the dense FFN's three tensors on blocks
+            // 0..2, on the assumption that a GPU path consumed them.  It does not - glm_stage_ffn calls the CPU
+            // expert_ffn, so the crash simply moved from kda_forward to expert_ffn when the rest were staged.  Every
+            // quantized tensor is staged, and the per-layer lifetime is what keeps it affordable.
+            (void) dense;
+            float* h = dequant_to_host(t, err);
+            if (h == nullptr) return false;
+            p->staged.push_back(h);
+            t.ptr = h;
+            t.quantized = false;      // never re-dequantize the same layer twice
+        }
+        // re-map: glm_fill_layer_weights is pure assignment, so doing it per layer costs nothing
+        if (!C::glm::glm_fill_layer_weights(B, layer, p->kda_g, p->mla_g, p->kda[(size_t) layer],
+                                           p->mla[(size_t) layer], p->shexp_store[(size_t) layer].data(),
+                                           p->w[(size_t) layer], err)) {
+            err = "provider: re-mapping layer " + std::to_string(layer) + ": " + err;
+            return false;
+        }
+    }
+    out = p->w[(size_t) layer];                      // assembled from the staged host weights
     const bool is_dense = (layer < 3);
     if (is_dense) {
         out.moe_g = &p->dense_g;

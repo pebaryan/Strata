@@ -5166,3 +5166,41 @@ SO THE REMAINING WORK IS SMALLER THAN THE LAST ENTRY IMPLIED: a per-layer provid
 existing dequant_transposed (or its unscrambled sibling) for the CPU-consumed tensors, staging them in host_stage and
 repointing the bound block before glm_fill_layer_weights runs - with the type carried along so the dispatch can happen.
 The OOM finding still stands: this must happen one layer at a time, because all forty-five at once is 20-30 GB.
+
+THE TRUNK RUNS: BLOCKS 0, 1 AND 2 EXECUTE FULLY FROM THE REAL PACK, AND LAYER 3 IS A CLEAN REPORT
+
+The per-layer streamer is in and it works.  It stages one layer's quantized tensors to host (dequantize on the device
+with the existing bit-exact kernels, copy back), re-maps the layer with glm_fill_layer_weights, and frees the previous
+layer's buffers when the next layer is asked for.  Each fix moved the crash exactly one kernel forward, which is how the
+whole path was walked:
+
+    hc_pre        -> staged the hc weights           -> kda_forward
+    kda_forward   -> staged the KDA's tensors        -> expert_ffn
+    expert_ffn    -> removed my own exception        -> NO CRASH
+
+That last step is worth recording as a correction: I had skipped the dense FFN's three tensors on blocks 0..2, assuming
+a GPU path consumed them.  It does not - glm_stage_ffn calls the CPU expert_ffn - and the crash moved straight to
+expert_ffn, which is the measurement that says the assumption was wrong.  NO EXCEPTIONS: every quantized tensor is
+staged, and the per-layer lifetime is what makes it affordable.
+
+WHAT THE RUN NOW DOES:
+
+    shards: 3
+    arena 0.12 GB, 645 tensors served from the GGUF
+    bound and mapped 45 blocks
+    state: 34 KDA slots (136 MB), 11 MLA caches (5 cells each)
+    input: hc_init ne=[4096,4,5,1], 81920 floats
+    trunk failed at token 0: glm_trunk_forward: layer 3: dequant_to_host: no dequantizer for type -1 (attn_k_b.weight)
+
+So blocks 0, 1 and 2 - a KDA layer and two more, with their hc sites, norms, KDA attention and dense FFN - all execute
+end to end from the pack, and the failure is now a REPORTED condition rather than a segfault, naming the tensor and the
+type it could not dequantize.  That is the difference between a debugging session and a bug report.
+
+THE REMAINING DEFECT IS NARROW AND NAMED.  attn_k_b.weight carries native_type -1, which is the sentinel for a tensor
+that is marked quantized but has no native ggml type - and these are exactly the tensors glm_bind.hpp already documents
+as ones NativeDense cannot upload ("glm5next's 3-D MLA tensors (attn_k_b / attn_v_b and friends), whose MMVQ-path
+blocks are not the MLA kernel's layout"), so the binding fetches them straight from the artifact instead.  That fetch
+branch evidently does not record the type it fetched - the same four-byte omission I fixed for the other branch - so
+either it should, or those tensors should be marked non-quantized once fetched and already floats.  Which of the two is
+right is a question the branch's own code answers; it is the next thing to look at, and it is one tensor family, not a
+category.
