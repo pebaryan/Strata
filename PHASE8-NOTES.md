@@ -279,3 +279,36 @@ port applies the same -1 fold that makes sigmoid(-h) == 1/(1+exp(h)).
 Method note, since this is the third convention trap in this phase: the guard is what makes the gate
 comparison trustworthy, and it is cheap - it uses a tensor the dump already contains and a step the oracle
 performs internally anyway. Run it BEFORE interpreting any comparison that follows.
+
+## Part 9: FOUND IT - dt_bias is bound with 64 entries and read as if it had 8192
+
+The port's KDA formula is identical to the oracle's, line for line: xn (normed, and the dump proves the
+norm right), the low-rank ssm_f_a -> ssm_f_b composition, +dt_bias, the per-head ssm_a multiply, the same
+-h fold, and beta = sigmoid(ssm_beta @ xt).  So the formula was never the suspect; the WIRING was.  The
+GGUF shapes decide it:
+
+    blk.0.ssm_a          (64,)        the kernel indexes [h]                consistent
+    blk.0.ssm_beta       (64, 4096)   the kernel walks h*ne + c             consistent
+    blk.0.ssm_f_a        (128, 4096)  matvec(out=hd, in=ne)                 consistent
+    blk.0.ssm_f_b        (8192, 128)  matvec(out=di, in=hd)                 consistent
+    blk.0.ssm_dt.bias    (8192,)      the kernel walks h*hd + i  <-- BOUND AS 64
+
+include/strata/kernels/glm_kda.hpp:49 states the contract:  `const float* dt_bias;  ///< [d_inner]`.
+src/core/layout.cpp:101, the ONLY declaration of ssm_dt.bias in the port, sizes it g.ssm_v_heads - the Qwen
+GDN convention, where dt genuinely is per-head.  In the GLM artifact ssm_dt.bias is d_inner = hd*nh = 8192
+wide and the formula adds it BEFORE the (nh, hd) reshape, so the kernel reads ~8128 floats past the end of
+a 64-float weight.  Whatever the packer placed next is what the gate has been adding.
+
+That single defect explains the measured signature exactly: the gate is wrong by 56% with r +0.9856 (a
+deterministic neighbour, not noise), while beta - which touches no dt_bias - is only 12% off and
+attn_norm/hc_attn_pre/hc_init are exact.
+
+WHY THE KDA PARITY GATE PASSED 3/3: it builds its own fixture weights, including an 8192-float dt_bias
+array, and calls the kernel directly.  It validates the kernel and never the wiring, so a loader that
+binds 64 floats is invisible to it.  Same shape of gap as the swiglu clamp and the router bias: the gate
+must exercise the term AND take its inputs from the path under test.
+
+FIX: size ssm_dt.bias (and the GLM KDA weight layout generally) from the artifact, not from the Qwen
+per-head convention - 8192 here, model-dependent, so the GLM layout needs its own entry rather than
+reusing gdn_v's.  Then assert at bind time that the length matches the kernel's documented [d_inner]
+contract, so the next mismatch of this kind fails loudly instead of silently reading a neighbour.
