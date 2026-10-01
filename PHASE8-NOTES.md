@@ -95,3 +95,42 @@ Port state meanwhile: the trunk runs all 45 blocks to the logits; against the re
 token ranks 331, top-50 overlap 2/50.  A partial semantic error accumulating over 45 blocks - and
 localizing it needs exactly the per-block ground truth this section is about.
 
+## Part 3: SOLVED, and it was the reader all along
+
+The read path is broken, and the signature is measured rather than argued.  Method: `--embd-test` feeds
+the graph a pattern of EMBEDDINGS whose values are chosen exactly (build_inp_embd takes the embd path
+when `ubatch.token` is null, so the graph's placeholder IS its input).  Then every downstream tensor can
+be checked against data I chose:
+
+    inp_embd (reshaped)   buf=CUDA_Host  off=32      -> matched the pattern EXACTLY (max|d| 0.000e+00)
+    result_output         buf=CUDA0      off=0       -> argmax reproduces the sampled token (correct)
+    hc_init               buf=CUDA0      off=441088  -> WRONG: not the pattern broadcast at all
+    hc_attn_pre-0         buf=CUDA0      off=768768  -> wrong
+    l_out-0               buf=CUDA0      off=441088  -> wrong
+
+So: device tensors at offset 0 and host tensors read correctly; device tensors at a NONZERO offset
+inside their buffer do not.  `ggml_backend_tensor_get` on those returns a different region of the same
+buffer - deterministically, which is why every dump reproduced itself byte for byte and why the values
+always looked plausible.
+
+This explains everything that came before it:
+
+* `hc_init`'s four "unequal streams": it was never the broadcast, it was another tensor's data.  The
+  relation that caught it (a broadcast whose copies must be identical) was the right test.
+* the earlier "attn_norm-0 is not rms_norm(hc_attn_pre-0) * attn_norm.weight" mismatch: BOTH tensors
+  came from wrong regions, so that comparison was meaningless, and the "the graph must apply a
+  different weight" conclusion was an artifact.
+* every `l_out-N` comparison in the first phase-8 attempt was comparing garbage to garbage.
+
+**Consequence, stated plainly: the port's divergence is NOT yet established.**  The +0.46 correlation
+against `result_output` stands (that tensor is at offset 0 and is validated by the sampled token), but
+nothing about WHICH PART of the trunk is wrong has been measured, because the only per-block reference
+was unreadable.
+
+**The fix**: never read a device tensor with `ggml_backend_tensor_get`.  Copy it into a host tensor
+(`ggml_backend_tensor_copy` into a CPU buffer attached to a host tensor, the same path llama.cpp itself
+uses to bring logits back) and read the host copy.  The disk compare harness then needs no changes; only
+the dumper's read does.  After that, the provenance column makes every dump self-checking: a tensor at a
+nonzero device offset is only trustworthy if it came through the copy path.
+
+

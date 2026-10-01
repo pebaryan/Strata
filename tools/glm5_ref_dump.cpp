@@ -35,6 +35,7 @@ namespace {
 struct Dumper {
     std::string dir;
     bool all = false;
+    bool embd_test = false;                  // feed a known embedding pattern instead of tokens
     bool dumping = false;
     std::ofstream manifest;
     int dumped = 0;
@@ -67,9 +68,14 @@ void dump_tensor(ggml_tensor * t) {
     // Without this a "wrong values" dump cannot be told from a "wrong tensor" dump.
     char prov[256];
     const char * bufn = t->buffer ? ggml_backend_buffer_name(t->buffer) : "(none)";
-    std::snprintf(prov, sizeof(prov), "view=%s contig=%s nb=[%zu,%zu,%zu,%zu] buf=%s",
+    // The offset of the tensor inside its buffer, and the view offset, because a read that ignores one
+    // of them returns a DIFFERENT tensor's data - plausible values, deterministic, and wrong.
+    const char * base = t->buffer ? (const char *) ggml_backend_buffer_get_base(t->buffer) : nullptr;
+    const long long off = (base && t->data) ? (long long) ((const char *) t->data - base) : -1;
+    std::snprintf(prov, sizeof(prov), "view=%s contig=%s nb=[%zu,%zu,%zu,%zu] buf=%s off=%lld voff=%zu",
                   t->view_src ? "Y" : "N", ggml_is_contiguous(t) ? "Y" : "N",
-                  (size_t) t->nb[0], (size_t) t->nb[1], (size_t) t->nb[2], (size_t) t->nb[3], bufn);
+                  (size_t) t->nb[0], (size_t) t->nb[1], (size_t) t->nb[2], (size_t) t->nb[3], bufn, off,
+                  (size_t) t->view_offs);
 
     // A non-contiguous tensor is a VIEW (a broadcast, a permute, a reshape of something else).  Reading
     // its buffer yields the underlying bytes, not the values the graph sees through it - which silently
@@ -138,8 +144,10 @@ int main(int argc, char ** argv) {
     const char * prompt = argv[3];
     const int n_predict = argc > 4 ? std::atoi(argv[4]) : 4;
     const int n_cpu_moe = argc > 5 ? std::atoi(argv[5]) : 46;
-    for (int i = 4; i < argc; ++i)
+    for (int i = 4; i < argc; ++i) {
         if (std::strcmp(argv[i], "--all") == 0) g_d.all = true;
+        if (std::strcmp(argv[i], "--embd-test") == 0) g_d.embd_test = true;
+    }
 
     g_d.manifest.open(g_d.dir + "/dump.tsv", std::ios::out | std::ios::trunc);
 
@@ -194,8 +202,48 @@ int main(int argc, char ** argv) {
     // one batch carrying the prompt; the dump happens during this first decode
     g_d.dumping = true;
     const bool logits_last = true;
+    if (g_d.embd_test) {
+        // THE READ-PATH TEST.  Feed the graph EMBEDDINGS instead of tokens: in that path the graph's
+        // placeholder IS the input (build_inp_embd selects inps[1] == inp->embd), so its values are
+        // known exactly, and every downstream copy - hc_init's four streams above all - can be
+        // checked against them.  "Is the dump's read path right?" stops being an inference about ggml
+        // and becomes a measurement.
+        const int64_t ne_inp = llama_model_n_embd(llama_get_model(ctx));
+        const int n_tok = (int) tokens.size();
+        std::vector<float> pat((size_t) ne_inp * n_tok);
+        // distinct per channel AND per token, so an axis mixup, a transposed read or a stale copy
+        // cannot look right
+        for (int t = 0; t < n_tok; ++t)
+            for (int64_t e = 0; e < ne_inp; ++e)
+                pat[(size_t) t * ne_inp + e] = 0.001f * (float) (e + 1) + 0.5f * (float) t;
+        std::vector<llama_pos> pos(n_tok);
+        std::vector<int32_t> nseq(n_tok, 1);
+        std::vector<llama_seq_id *> seq(n_tok);
+        std::vector<int8_t> logits(n_tok, 0);
+        llama_seq_id s0 = 0;
+        for (int t = 0; t < n_tok; ++t) { pos[t] = t; seq[t] = &s0; }
+        llama_batch b = {};
+        b.n_tokens = n_tok;
+        b.embd = pat.data();
+        b.pos = pos.data();
+        b.n_seq_id = nseq.data();
+        b.seq_id = seq.data();
+        b.logits = logits.data();
+        if (llama_decode(ctx, b) != 0) { std::fprintf(stderr, "embd decode failed\n"); return 1; }
+        // write the pattern in the dump's own layout ([ne_inp][n_tok], ne0 fastest) for the compare
+        std::FILE * pf = std::fopen((g_d.dir + "/EMBD-PATTERN.bin").c_str(), "wb");
+        if (pf) {
+            const int32_t hdr[5] = { 0, (int32_t) ne_inp, n_tok, 1, 1 };
+            std::fwrite(hdr, sizeof(int32_t), 5, pf);
+            for (int t = 0; t < n_tok; ++t)
+                std::fwrite(&pat[(size_t) t * ne_inp], sizeof(float), (size_t) ne_inp, pf);
+            std::fclose(pf);
+            std::printf("embd-test: wrote a known pattern of %d x %d\n", (int) ne_inp, n_tok);
+        }
+    } else {
     llama_batch batch = llama_batch_get_one(tokens.data(), (int32_t) tokens.size());
     if (llama_decode(ctx, batch) != 0) { std::fprintf(stderr, "decode failed\n"); return 1; }
+    }
     g_d.dumping = false;                       // the per-layer dump is for the prompt step
     std::printf(" dumped %d tensors", g_d.dumped);
 
