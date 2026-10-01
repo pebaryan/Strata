@@ -723,3 +723,31 @@ THREE CANDIDATES LEFT, none yet tested:
 
 The cheapest discriminator: compare all four bound tensors' values against the artifact directly (the same
 byte-comparison used for the F32 twelve at 9.1), which either clears 2 entirely or names it immediately.
+
+THE FOUR INPUTS ARE EXACT, THE CONSTANTS ARE EXACT - SO IT IS hc_pre's OWN MATH
+
+    engine vs oracle, all bit-for-bit:
+      hc_attn_fn     -0.378852844  0.39847374    41.3919046      (dequantized Q8_0)
+      hc_attn_base   -8            2.69234943    -116.46156
+      hc_attn_scale   0.0446214899 0.0888746381   0.194898594
+      attn_norm       0.0703125    0.157226562  420.698242
+
+and the constants agree with the reference:
+
+    glm_hc.cpp:66   HC_RMS_EPS = 1e-5f   (glm_hc.hpp:30 - the graph's norm_rms_eps, NOT hyper_connection.epsilon)
+    glm_hc.cpp:78   HC_EPS     = 1e-6     (hyper_connection.epsilon; oracle: glm5_hc_reference.py:46 EPS = 1e-6)
+
+So every INPUT to hc_pre is exact, its constants are exact, and its output is 5.6% off the reference's
+hc_attn_pre-0.  What is left is the order and form of its arithmetic, and the ground truth for that is
+tools/glm5_hc_reference.py - the oracle that was itself validated in phase 6.  The concrete suspects, readable in
+two files side by side:
+
+    glm_hc.cpp:64-73   ss accumulated over dim = HC*n_embd; rms = 1/sqrt(ss/dim + 1e-5); then
+                       acc += row[i] * (x[i] * rms)   - i.e. x is normalized THEN mixed
+    the oracle's hc_pre - compare term by term: whether the rms is taken over the flattened hc*n_embd block or
+                       per stream, whether the normalization multiplies x or the accumulated mix, and whether
+                       the sinks (pre/post/comb) are formed from the same `mixes` ordering.
+
+A 5.6% error is the signature of a systematic difference in FORM (a factor, an order, or a perimeter), not of
+loss of precision - dequantization error would show at 1e-2 at worst and the F32 tensors would be exact, which
+they are.
