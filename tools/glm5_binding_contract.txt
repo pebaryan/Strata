@@ -3336,3 +3336,59 @@ SO THE REMAINING WORK, FINAL FORM:
   5. head: final norm, lm_head, greedy argmax, and the pack's tokenizer for decode
 
 with the same gate as the Python trunk run: argmax(logits) == 12089 for the prompt 785 6722 315 9621 374.
+
+THE NATIVE EXPERT API, IN FULL, AND THE TWO TRAPS IT DOCUMENTS
+
+    struct NativeFmt {                       ///< one layer's native expert geometry
+        int gu_type, d_type;                 ///< ggml types of gate/up and of down
+        int gu_act, d_act;                   ///< their vec_dot_type (the activation formats)
+        int64_t n_embd, n_ff;
+        size_t gu_row, d_row;                ///< bytes per weight row
+        size_t up_off, down_off;             ///< inside the blob
+        size_t bytes;                        ///< the whole blob
+        size_t act_bytes, h_bytes;           ///< quantized activation sizes
+    };
+
+    bool native_experts_available() noexcept;
+    bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+
+    void native_quant_act(const NativeFmt& f, const float* x, void* dst);      x (n_embd floats) -> act_bytes
+    void native_quant_h  (const NativeFmt& f, const float* h, void* dst);      h (n_ff floats)   -> h_bytes
+    void native_gu_rows  (const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt,
+                          float* const* ff, int r0, int r1);
+            ff[t][r] = silu(gate_r . a[t]) * (up_r . a[t])
+    void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt,
+                          float* const* out, int r0, int r1);
+            out[t][r] = down_r . hq[t]
+
+  IMPORTANT READING POINT: r0/r1 are ROW ranges, i.e. a parallelism window over the expert's own ff rows, NOT a
+  selection of experts.  One call per expert computes the whole intermediate, so the eight selected experts are eight
+  pairs of (gu_rows, then quant_h, then down_rows) calls over the SAME descriptor with r0=0, r1=n_ff.
+
+  So one expert, one token is:
+      native_quant_act(fmt, x, act);
+      for each selected expert e with blob b_e and weight w_e:
+          native_gu_rows(fmt, b_e, &act, 1, &ff, 0, n_ff);
+          native_quant_h(fmt, ff, hq);
+          native_down_rows(fmt, b_e, &hq, 1, &expert_out, 0, n_embd);
+          accumulate expert_out * w_e into out;
+      plus the shared expert, which is an ordinary bound per-block tensor (ffn_*_shexp).
+
+TWO TRAPS, BOTH ALREADY DOCUMENTED IN THE EXISTING EXPERT CODE - do not re-derive them:
+
+  1. APPLY THE ROUTER WEIGHT EXACTLY ONCE.  expert_source.hpp warns that moe_combine (src/core/layer.cpp:479) sums
+     the experts and that applying the weight in the pool as well "applies the weight twice, which is invisible in a
+     single layer and compounds over 48".  So the weight belongs in the combine, and any per-expert helper that also
+     scales must not.
+
+  2. NO CACHE KEYED ON THE ACTIVATION.  The same header warns that caching the quantized activation by pointer, or a
+     cache keyed on `x_f`, would "quantize layer 0 and reuse it for all 47 remaining layers, which is a finite,
+     plausible, completely wrong token".  There is deliberately no cache there.
+
+  Both are the same class of error as everything else this port has caught: correct-looking arithmetic, silently
+  applied at the wrong frequency.  They are recorded here because they are exactly what a from-scratch implementation
+  would get wrong, and because the existing code already pays for them.
+
+  Also from that header, worth keeping: a blob whose n_embd or expert width differs from the descriptor is REFUSED
+  rather than mis-indexed - so native_fmt's n_embd/n_ff must be the model's, and the pack's own row is the place to
+  confirm the types (native_experts.txt carries gu_type and d_type per layer; layer 3 is 16 and 18).
