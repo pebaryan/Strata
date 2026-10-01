@@ -671,3 +671,26 @@ REMAINING FOR A WORKING GLM-5.3 IN THE ENGINE (not the oracle):
   3. Wire the engine path and chase every step through tools/glm5_e2e_test.py.
   4. Serving reality: ~75-85 GB resident vs 63 GB of VRAM+RAM on this box, so expect disk-streamed, low
      tokens/sec. Correctness is now established; that part is throughput.
+
+## Part 21: the KDA parity gate re-verified against the corrected oracle - and the rule for the engine
+
+Regenerating the fixture from the corrected oracle (tools/glm5_kda_reference.py --layer 4 --tokens 1
+--raw-fixture ...) and running build-volta/glm_kda_parity on it gives 0 failures, with v/attn/gated/result
+all at ~1e-06 relative and the invariants (gate in [-5,0], |q| per head = 1) holding.  So the C++ kernel's
+conv1d_silu - which indexes conv_w[k*d_inner + ch], i.e. the (d_conv, d_inner) layout - was ALWAYS correct;
+the fixtures fed it a transposed array.  The defect lived entirely in the Python loader, which is also why the
+gate certified it: same loader, same wrong order, agreement at 1e-06.
+
+THE RULE FOR THE ENGINE'S LOADER, to be applied when the engine path is wired: the artifact stores
+ssm_conv1d_{q,k,v}.weight as (d_inner, 1, d_conv) with d_conv FASTEST.  The (d_conv, d_inner) array the kernel
+expects is `reshape(d_inner, d_conv).T` - the transpose, not the reshape.  Get this wrong and q/k/v are
+scrambled by interleaved taps, everything downstream is wrong, and every operator-level gate still passes.
+
+REGRESSION TO ADD (not yet done, and it is the point of the whole lesson): the parity gate should be given a
+fixture built with the WRONG order and must be shown to FAIL on it.  A gate that cannot reject the known-bad
+input is not evidence.  This is the fourth time in this phase that a gate passed while the model was wrong
+(swiglu clamp, router bias, the double norm, and now the conv layout), so the assertion belongs in the gate
+itself rather than in a note.
+
+Also worth regenerating for completeness: the t=8 and layer-20 fixtures, since they were built from the
+pre-fix oracle.  The parity path is otherwise settled: kernel correct, oracle correct, agreement at 1e-06.
