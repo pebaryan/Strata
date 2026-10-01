@@ -61,6 +61,7 @@ static const float CLAMP = 10.0f;    // swiglu_clamp_exp / _shexp: 10.0 for ever
 
 struct StageCount {
     long calls = 0;
+    int token = 0;
     std::map<std::string, long> by_name;
 };
 
@@ -68,6 +69,16 @@ static void stage_cb(void* ctx, int layer, const char* name, const float* data, 
     StageCount* sc = (StageCount*) ctx;
     ++sc->calls;
     sc->by_name[name] += 1;
+    // ---- AND REPORT THE MAGNITUDE, because counting stages proves the loop ran and says nothing about what it produced.
+    // The oracle's own per-layer dumps for these same four families are on disk, and the runner's input IS the oracle's
+    // hc_init - so the two runs are comparable stage by stage from block 0, which is the bisection that found block 0's
+    // double-norm, block 1's chaining and block 3's four verdicts.  Token 0 only: that is where the lifetime and state
+    // questions do not arise, so a disagreement there is a stage defect rather than a state one.
+    if (sc->token == 0 && data != nullptr && n > 0) {
+        double ss = 0.0;
+        for (int i = 0; i < n; ++i) ss += (double) data[i] * (double) data[i];
+        std::printf("STAGE %d %s %.9g %d\n", layer, name, std::sqrt(ss / (double) n), n);
+    }
 }
 
 static bool read_dump(const std::string& p, std::vector<float>& out, int ne[4]) {
@@ -503,6 +514,7 @@ int main(int argc, char** argv) {
     StageCount sc;
     std::vector<float> l_out((size_t) HC * N_EMBD, 0.0f);
     for (int t = 0; t < TOKENS; ++t) {
+        sc.token = t;
         const float* x = inp.data() + (size_t) t * N_EMBD * HC;
         if (!C::glm::glm_trunk_forward(x, N_LAYERS, provider, &P, P.kda_g, P.mla_g, EPS, st, l_out.data(), nullptr, err,
                                        0, &stage_cb, &sc)) {
