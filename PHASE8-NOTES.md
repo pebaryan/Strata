@@ -253,3 +253,29 @@ Care before running it: the dump is in ggml memory order (i0 fastest) whereas th
 cost two turns in parts 3-5. Verify the oracle's own convention first by checking that its internal
 rms_norm(hc_attn_pre-0) reproduces the reference's attn_norm-0, which the dump already contains: that is a
 free end-to-end check of the oracle's input path before any gate comparison is believed.
+
+## Part 8: the formula is right; the PORT's KDA kernel is wrong - by a factor of 64
+
+tools/glm5_kda_oracle_vs_ref.py feeds the reference's own verified input into the numpy oracle and checks
+its internal norm FIRST (the guard), then compares the gate and beta against the reference's dumps:
+
+    GUARD  rms_norm(hc_attn_pre-0) -> attn_norm-0     5.960e-08   r +1.0000   MATCHES
+    ORACLE kda_gate vs reference                      4.35e-02    r +1.0000   0.88% of a 4.95 scale
+    ORACLE kda_beta vs reference                      6.90e-04    r +1.0000   0.07% of a 0.98 scale
+    PORT   kda_gate vs reference                      2.78e+00    r +0.9856   56%
+    PORT   kda_beta vs reference                      1.19e-01    r +0.9890   12%
+
+The oracle is 64x closer than the port on the gate and 172x closer on beta, both at r = +1.0000, so the KDA
+FORMULA and the weight mapping in the oracle are right and the port's C++ kernel is wrong. The residual
+~1% on the gate is consistent with rounding: g = GATE_LOWER * sigmoid(-h) is sharply nonlinear, and h
+reaches ~10, so a fraction of a percent in h shows up as ~1% in g. Judging a 4.95-scale gate with an
+absolute 1e-4 threshold had mislabelled it as a mismatch; the script now judges on RELATIVE error.
+
+Narrowed further: the port's error is systematic (r +0.9856) rather than a layout failure, which would
+decorrelate. So look at the gate/beta term itself in src/kernels/glm_kda.*: ssm_a (== -exp(A_log)),
+ssm_dt.bias, ssm_f_a/ssm_f_b, ssm_beta, the reshape to (nh, hd) before the ssm_a multiply, and whether the
+port applies the same -1 fold that makes sigmoid(-h) == 1/(1+exp(h)).
+
+Method note, since this is the third convention trap in this phase: the guard is what makes the gate
+comparison trustworthy, and it is cheap - it uses a tensor the dump already contains and a step the oracle
+performs internally anyway. Run it BEFORE interpreting any comparison that follows.
