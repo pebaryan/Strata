@@ -1929,3 +1929,34 @@ NEXT: leave result.bin as it is and rebuild the fixture with a SCALED input (x *
 changes the answer, and the gate has a real verdict - and the same fixture with an unscaled input becomes a
 regression case that must keep agreeing to fp32 precision.  The alternative, hunting for a real activation above
 10, may simply not exist at block 0.
+
+########  THE FFN GATE IS COMPLETE, AND IT CAN FAIL  ########
+
+    fixture                         worst abs     relative to rms   elements off   verdict
+    1  scaled, clamp = 10.0         1.965e-04     1.467e-05          0              PASS
+    2  unscaled                     1.378e-07     1.204e-05          0              INCONCLUSIVE
+    3  scaled, clamp = 0            3.059e+00     2.284e-01          4092           FAIL
+
+Read as one result rather than three: the engine's expert_ffn agrees with the oracle's dense_forward at the floor of
+float32-against-float64 rounding (runs 1 and 2, 1.2-1.5e-05 of rms), the clamp is genuinely exercised (23 of 12288
+pre-activations above 10 on the scaled fixture), and when the clamp is switched off the comparison breaks by a factor
+of about 15,000 - so run 1's PASS is the clamp being VERIFIED rather than merely present.  This is the port's own
+rule satisfied for the first time on a stage other than the KDA one: a parity gate must be shown to fail on a
+known-bad input.  Run 2 is the honesty check: the unscaled fixture cannot distinguish a correct clamp from no
+clamp, and says so instead of passing.
+
+THE TOLERANCE WAS THE BUG IN THE FIRST TWO RUNS, not the arithmetic.  At 1e-5 of rms the gate reported 3 and then 8
+elements off on correct code, because the oracle computes in float64 and the engine in float32 and the floor of that
+difference is 1.2e-05 of rms.  A threshold below the noise floor reports noise as failure.  1e-4 of rms is set with
+that observed floor written next to it, so the next person to tighten it has to argue with a measurement.
+
+WHAT IS NOW VERIFIED FOR BLOCK 0 OF GLM-5.3 IN THIS ENGINE:
+  * the loader binds a GLM artifact and every block kind (phase 9.1);
+  * hc_pre matches the oracle to 7 significant digits, and the host RMS norm to 5.4e-10 (stage 1);
+  * the KDA kernel passes 8/8 stages at T=1 and T=5, and all 16 of its weights bind to oracle values;
+  * dequantizers for types 8, 13 and 14 each BIT-EXACT against the oracle (33.5M and 50.3M elements);
+  * the leading dense FFN - a second stage of a block, not a second aspect of the first - matches the oracle at the
+    fp32 floor with its one-sided clamp verified by a demonstrated failure.
+
+SIX GATES, ALL PASSING, ALL COMMITTED: glm5_bind_check (stage 1), kda_gate (T=1, T=5), kda_binding_check.py
+(16/16), q5k_parity (176 and 210 byte blocks), ffn_gate (PASS + INCONCLUSIVE + FAIL-on-known-bad).
