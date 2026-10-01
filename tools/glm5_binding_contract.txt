@@ -751,3 +751,25 @@ two files side by side:
 A 5.6% error is the signature of a systematic difference in FORM (a factor, an order, or a perimeter), not of
 loss of precision - dequantization error would show at 1e-2 at worst and the F32 tensors would be exact, which
 they are.
+
+hypothesis about hc_pre's arithmetic REFUTED - it matches the oracle term for term
+
+    oracle  glm5_hc_reference.py:113   layer_in = np.einsum("st,set->et", pre, x)      # raw x, gated
+    kernel  glm_hc.cpp:105-108         acc += mix->pre[h] * x[h * n_embd + e]         # raw x, gated
+
+and the rms appears in BOTH only inside the mixes computation (fn @ rms_norm(flat)), never in layer_in.  So
+hc_pre is exactly as specified, and with exact inputs, exact constants and exact arithmetic it cannot produce a
+5.6% error on its own.  Two possibilities remain, and they are one cheap test apart:
+
+  A. the x being fed is not the x the reference used - i.e. hc_init as the harness reads it (candidate 3, the
+     only untested one: hc_init is 4096*4*5 = 81920 floats and the harness takes the first 16384 as token 0's
+     h-major [HC][n_embd] block, which is right IF the dump row is really [4096,4,5,1] in ggml order);
+  B. hc_attn_pre-0 is not layer_in at all - the graph node between hc_init and attn_norm-0 may be the
+     NORMALIZED STREAMS (x * rms, the value the mix consumes) rather than hc_pre's gated output.  That would
+     produce exactly this shape of mismatch: close, systematically off, and unrelated to any bug.
+
+THE TEST THAT SEPARATES THEM, and it needs no kernel change: call the ORACLE's own hc_pre on the SAME hc_init the
+harness reads and compare its layer_in against both the engine's hc_pre output and the dump's hc_attn_pre-0.  If
+the oracle agrees with the engine, then the dump row is not layer_in (B).  If the oracle agrees with the dump but
+not the engine, the difference is in x (A) - and then the only thing left to check is the harness's slice of
+hc_init, which is one print statement.
