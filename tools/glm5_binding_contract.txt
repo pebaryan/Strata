@@ -1007,3 +1007,27 @@ implicated and should be tested trivially-true in isolation.
 
 Note the pattern to break: four successive mechanisms were invented and then killed by one cheap read each.  The
 next session should make its FIRST act the order printout, not a hypothesis.
+
+########  THE FORK IS RESOLVED: attn_q BINDS BEFORE hc_attn_fn  ########
+
+Read the bind order instead of inferring it, and it settles the question that occupied the last stretch.  The bind
+iterates the pack's rows, so the pack index IS the bind order (index.txt, block 0):
+
+    line  9   blk.0.attn_q.weight       8  (Q8_0)  4096 x 8192
+    line 16   blk.0.hc_attn_fn.weight   8  (Q8_0)  16384 x 24
+
+attn_q is bound SEVEN ROWS BEFORE hc_attn_fn.  With the condition widened to include attn_q, its dequant therefore
+runs first, and hc_attn_fn's cudaMalloc failing afterwards is ordinary upstream poisoning - exactly the mechanism
+that was ruled out on the false premise that hc_attn_fn is the first tensor the branch handles.
+
+Where that false premise came from, and the lesson: the print loop runs AFTER the bind completes, so its order is
+the canonical table's order, not the bind order.  Three conclusions in this session died to that same shape of
+error - believing an ordering that was never measured.  The bind order is readable in one grep, and it should have
+been the first act, not the last.
+
+WHAT THIS MEANS FOR THE WIDENING, concretely: attn_q's dequant is the poisoner, and its extents look correct
+(n=33554432 elements -> 1048576 Q8_0 blocks -> 35.6 MB read, 134 MB written into a buffer sized n*4), while
+native_mmvq_weight_bytes gives exactly 34 bytes per 32 elements for case 8.  So the overrun is NOT in the extents,
+and the next measurement is to find which STEP of that dequant faults rather than to reason about it further:
+check cudaGetLastError() immediately after cudaMalloc, after the cudaStreamSynchronize, and after dequant_q8_0
+itself, for attn_q alone - three reads of the error state, no theory.
