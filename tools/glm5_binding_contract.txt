@@ -286,3 +286,21 @@ Note on the record: 062962f used `git add -A`, so it also committed the stage-1 
 tools/glm5_bind_check.cpp that segfaults.  The branch still builds (the branch's rule is about the build and
 its gates, and no gate runs this driver), but the mode does not pass and should not be read as verified.
 Leaving the record straight rather than amending history: that file's stage-1 path is UNVERIFIED.
+
+READ RESULT - the F32 pointer question is answered, and it does NOT explain the fault:
+
+    glm_bind.cpp:106    const float* p = (const float*) w->data;      // F32 branch, handed over as-is
+    weights.cpp:413     wr.data = dst_base + r.dst_off;                // dst_base is the caller's arena
+
+So an F32 tensor's pointer is arena + offset, the arena is this driver's cudaMalloc, and these are legitimate
+device addresses - hc_attn_base 0x7f8cb600c000, hc_attn_scale 0x7f8cb600c080 (96 bytes, rounded to 128).  No
+staging copy, no host mapping, nothing exotic.
+
+Therefore pointer KIND is not the explanation, and neither is the direction: cudaMemcpyDeviceToHost returned
+"invalid argument" and cudaMemcpyDefault faulted outright for the same tensor that hc_attn_fn - a plain
+cudaMalloc buffer - copied from without complaint.
+
+NEXT DIAGNOSTIC, and it is one run: instrument host_copy to print, BEFORE any copy, the raw pointer, the count,
+and cudaPointerGetAttributes().type for that exact tensor, and to print the memcpy's returned cudaError_t
+separately from cudaGetLastError().  Three segfaults have been spent on a chain of inference; the next step is
+to make the failing call report itself.
