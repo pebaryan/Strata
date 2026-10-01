@@ -208,3 +208,20 @@ Block chain to implement, per the reference's tensor names:
 Open items the chain must settle, all measured during phase 8: the KDA recurrence for T>1 once cost a full
 debugging cycle (state carry; invisible at T=1 where the state is zero), and the swiglu clamp of 10.0 applies
 to the shared expert AND the leading dense FFN.
+
+## 9.2 - the hc stage, fully specified (measured off the pack and the header)
+
+    blk.N.hc_attn_fn.weight      ne=16384,24   Q8_0  (native, from the GGUF)   -> hc_pre's `fn`
+    blk.N.hc_attn_base.weight    ne=24         F32                              -> hc_pre's `base`
+    blk.N.hc_attn_scale.weight   ne=3          F32                              -> hc_pre's `scale`
+    (and the same trio for the ffn site: hc_ffn_fn / hc_ffn_base / hc_ffn_scale)
+
+    hc_pre(x, fn, base, scale, n_embd, layer_in, mix)   x is [HC][n_embd] row-major, layer_in is [n_embd]
+    hc_post(site_out, residual, mix, n_embd, out)       out[dst] = post[dst]*site_out + sum_src comb[dst][src]*residual[src]
+    hc_mean(x, n_embd, out)                             the head's collapse over the streams
+
+All six tensors per block are already bound (the binding loads them; hc_*_fn is native Q8_0 and the base/scale
+are F32 resident).  So chain stage 1 - hc_pre(hc_init) -> attn_norm -> hc_post - has no unknowns left: the
+arguments, the layouts and the comparator (the reference's hc_attn_pre-0 / attn_norm-0, which the bisect already
+showed matching at 1.76e-05 and 1.121e-04 respectively) are all in hand.  Stages 2+ are the KDA/MLA call, the
+ffn stage (dense below block 3, moe_forward above), and the head, each with the same shape of contract.
