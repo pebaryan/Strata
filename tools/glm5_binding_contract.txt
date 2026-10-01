@@ -2180,3 +2180,35 @@ NEXT: probe the pre-SiLU conv output directly rather than inferring it.  The eng
 conv's own output is recoverable in one line - invert SiLU numerically on the engine's qc, or better, have the
 kernel emit it.  Comparing that against the recomputed xn @ wq.T, convolved by hand in numpy from the same
 fixture's conv_q, puts the conv's absolute error on the table as a single number.
+
+THE CONVOLUTIONS ARE IDENTICAL - READ BOTH SIDES AND THE CONV IS EXONERATED
+
+    engine  src = t + k - (d_conv - 1);
+            if (src >= 0 && src < tokens) acc += conv_w[k*d_inner + ch] * proj[src*d_inner + ch];
+            out[t*d_inner + ch] = acc / (1 + exp(-acc));           // = silu(acc)
+
+    oracle  shift = k - (D_CONV - 1)                               // -3, -2, -1, 0
+            if shift < 0: out[-shift:] += w[k] * x[:T+shift]
+            else:         out[:T-shift] += w[k] * x[shift:]
+
+Same correlation, same causal direction, same zero state, and silu applied identically.  Note both index the kernel
+as conv_w[k * d_inner + ch], i.e. the (d_conv, d_inner) layout that repack_conv produces - which is why the fixture
+must hold the repacked form and why a double repack would be a real bug.  It is not: the gate passes the fixture's
+array straight through and kda_forward indexes it in that layout.
+
+So the suspect moves UPSTREAM of the conv, to the matmul that produces proj.  The engine does it with
+matvec(w.attn_q, xt, out, di, ne) per token; the oracle does xn @ wq.T.  Those agree in layout - the fixture's
+w_wq is (8192, 4096) row-major and that is what matvec indexes - but this is now the only remaining step between a
+verified xn and a divergent qc.
+
+ONE INCIDENTAL OBSERVATION, recorded but NOT claimed as the fault: the assemble loop copies `proj` for every t,
+    std::memcpy(raw.data() + (size_t) t * di, proj.data(), (size_t) di * sizeof(float));
+which writes the SAME di floats into each token's row.  At tokens == 1 that is exactly right and unobservable, and
+both the block-0 and the T=5 gates pass, so it is not the cause here - but if `proj` is meant to be a per-token
+projection this line would be wrong for tokens > 1, and both fixtures that pass use either one token or a path that
+does not reach it.  Worth one minute's confirmation rather than a rewrite.
+
+NEXT, and it is a one-line diagnostic rather than a new probe: have report() print the INDEX of the largest
+difference, not just its magnitude.  A difference spread across all d_inner channels says the matmul; one
+concentrated at a boundary or at a single channel says the conv or an indexing slip.  That distinguishes the two
+remaining candidates with no kernel change and no new build.
