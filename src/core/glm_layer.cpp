@@ -243,10 +243,9 @@ bool glm_stage_moe(const float* xn, const float* router, const float* probs_b,
 /// `hc` is the trunk output in the engine's layout, [hc_streams][n_embd], stream-major within the token.
 bool glm_stage_head_mean_norm(const float* hc, int hc_streams, int n_embd, const float* output_norm, float* hidden,
                               std::string& err) {
-    if (!hc || !hidden || !output_norm) {
-        err = "glm_stage_head_mean_norm: null argument";
-        return false;
-    }
+    if (!hc) { err = "glm_stage_head_mean_norm: null argument: hc"; return false; }
+    if (!hidden) { err = "glm_stage_head_mean_norm: null argument: hidden"; return false; }
+    if (!output_norm) { err = "glm_stage_head_mean_norm: null argument: output_norm"; return false; }
     if (hc_streams <= 0 || n_embd <= 0) {
         err = "glm_stage_head_mean_norm: hc_streams and n_embd must be positive";
         return false;

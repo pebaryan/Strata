@@ -5701,3 +5701,29 @@ AND TWO THINGS REMAIN, ONE WIRING AND ONE NUMERICAL.
 
 STATE: the engine runs the entire chain - forty-five of forty-five blocks, five of five tokens - from the real pack, and
 stops at the last stage with a named refusal.
+
+THE HEAD'S NULL IS `output_norm`, AND THE FIX IS ONE TENSOR
+
+    head: glm_stage_head_mean_norm: null argument: output_norm
+
+The head's check is three pointers - hc, hidden, output_norm - and split into named refusals it answers in a single run.
+It is `output_norm`: the RMS-norm gain the head applies after averaging the streams, 4096 floats, which the port already
+extracted from the artifact earlier ("EXTRACT output_norm.weight (4096 floats, [-0.0146, 1.98])") and which the head gate
+has already verified end to end against the oracle.
+
+WHY IT IS NULL, AND IT IS THE SHAPE OF THE WHOLE PORT ONE LAST TIME: output_norm.weight is a TOP-LEVEL tensor.  Every
+other weight this runner binds belongs to a block, so the entire binding path - the served-name set, the 45 binds, the
+per-layer mapping, the staging - is organised by layer and has no place to put a tensor that belongs to the model rather
+than to a block.  Nothing is wrong with any of those parts; the tensor simply falls outside the structure that was built
+for the others, and the head reports it by name rather than reading a null.
+
+THE FIX, and it is one tensor: fetch output_norm.weight - either from the pack's served set or straight from the artifact
+the way the 3-D MLA tensors are fetched - hold it in the runner, and pass it to glm_stage_head_mean_norm.  Then the head
+runs, and the head is the instrument that answers the open question, because argmax is neither permutation- nor
+scale-invariant: the token gate is argmax(logits) == 12089 for the prompt 785 6722 315 9621 374, and it is the only
+measurement in this port that cannot be satisfied by a plausible-looking aggregate.
+
+WHAT THE RUN DOES TODAY, and this is the state to hand over: forty-five of forty-five blocks, five of five tokens, eleven
+MLA caches advancing 1 through 5, a live input at rms 8.27e-3 and a live output at rms 8.27e-3, stopping at the last
+stage on a named null.  Every gate in the port passes at the fp32 floor or is explained by measured quantization; the
+chain has never been faster or further.
