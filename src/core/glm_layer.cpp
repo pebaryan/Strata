@@ -257,4 +257,48 @@ bool glm_stage_head_mean_norm(const float* hc, int hc_streams, int n_embd, const
     return true;
 }
 
+
+/// Stage 5 (second half): the tied output projection and the greedy token.
+///
+/// logits[v] = dot(W row v, hidden), then argmax - the reference's own sequence (glm5_full_run.py:168-180) chunked
+/// over rows.  `W` is [vocab][n_embd] row-major and ALREADY DEQUANTIZED, which is a deliberate exception: this is the
+/// last operation in the model, the artifact's output.weight is 154,880 x 4,096 = 634,388,480 values (2.54 GB in
+/// fp32), and streaming it through the quantized-blob path would buy nothing at inference time - the whole matrix is
+/// touched exactly once per token either way.
+///
+/// The accumulation is in DOUBLE, matching the reference, because the argmax is a comparison over 154,880 sums of
+/// 4,096 terms: a float accumulator is enough to move the winner when two logits are close, and the token is the
+/// entire observable output of the model.
+bool glm_stage_head_project(const float* W, int vocab, int n_embd, const float* hidden, int& argmax, float& best,
+                            std::string& err) {
+    if (!W || !hidden) {
+        err = "glm_stage_head_project: null argument";
+        return false;
+    }
+    if (vocab <= 0 || n_embd <= 0) {
+        err = "glm_stage_head_project: vocab and n_embd must be positive";
+        return false;
+    }
+    argmax = -1;
+    best = 0.0f;
+    double best_s = -1e300;
+    bool any = false;
+    for (int v = 0; v < vocab; ++v) {
+        const float* row = W + (size_t) v * (size_t) n_embd;
+        double s = 0.0;
+        for (int e = 0; e < n_embd; ++e) s += (double) row[e] * (double) hidden[e];
+        if (!any || s > best_s) {
+            best_s = s;
+            argmax = v;
+            any = true;
+        }
+    }
+    if (!any) {
+        err = "glm_stage_head_project: no rows";
+        return false;
+    }
+    best = (float) best_s;
+    return true;
+}
+
 }  // namespace strata::core::glm

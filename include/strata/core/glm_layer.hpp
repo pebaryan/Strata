@@ -110,4 +110,9 @@ bool glm_stage_moe(const float* xn, const float* router, const float* probs_b,
 bool glm_stage_head_mean_norm(const float* hc, int hc_streams, int n_embd, const float* output_norm, float* hidden,
                               std::string& err);
 
+
+/// Stage 5 (second half): the tied output projection over an already-dequantized [vocab][n_embd] matrix, and argmax.
+bool glm_stage_head_project(const float* W, int vocab, int n_embd, const float* hidden, int& argmax, float& best,
+                            std::string& err);
+
 }  // namespace strata::core::glm

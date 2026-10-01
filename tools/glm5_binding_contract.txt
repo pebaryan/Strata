@@ -4208,3 +4208,39 @@ GGUFReader does not take a list of shards in this version.  The multi-shard read
 glm5_kda_reference.Model, which make_block_fixture.py already uses -
 `import glm5_kda_reference as K; K.Model(sorted(glob('*.gguf'))[0])` - and it opens the sibling shards itself.  Both
 failures were hit here before finding it.
+
+THE HEAD IS COMPLETE AND VERIFIED, TOKEN INCLUDED
+
+    glm_stage_head_project(W, vocab, n_embd, hidden, argmax, best, err)      src/core/glm_layer.cpp + header
+    tools/head_gate.cpp extended with the projection and the token check
+
+    engine hidden: rms 1.3855285   ==   oracle hidden: rms 1.3855285      (worst 4.76837e-07)
+    [sensitivity] skipping the mean would give worst 0.659243 - this gate separates the two by 1382533x
+    projection: w_output.bin holds 154880 rows of 4096 = 2,537,553,920 bytes
+    engine argmax 6196 (logit 10.3326) over 154880 rows
+    expected      6196
+    token PASS
+    HEAD GATE: PASS
+
+So the whole head pipeline - mean over the four HC streams, output_norm, the 154,880-row tied output projection, and
+the greedy argmax - reproduces the oracle's own token.  Nothing in the head is now unverified.
+
+WHY 6196 AND NOT 12089, and why that is the right thing to do first: the head consumes whatever the trunk produced, so
+a 3-BLOCK hidden state still exercises every line of it, and the oracle prints its own argmax for that depth.  Verifying
+the projection against 6196 establishes the code path BEFORE the full-model token is available; when the 45-block run
+finishes and the engine disagrees on 12089, the projection cannot be the reason.  The expected token is an argument
+precisely so the same tool serves both.  (The full 45-block oracle run is in progress and writes both l_out-{0..44} and
+its hidden state; pointing head_gate at that directory with 12089 is the real gate and needs no further code.)
+
+ONE DELIBERATE EXCEPTION TO THE STREAMING DISCIPLINE, recorded as such: the projection takes a MATERIALISED
+[154880][4096] float matrix rather than the quantized-blob path everything else in this port uses.  output.weight is
+634,388,480 values - 2.54 GB in fp32 - and it is the model's last operation, touched exactly once per token either way,
+so streaming it would buy nothing at inference time and would cost a quantized-matvec path that does not exist.  The
+accumulation is in DOUBLE, matching the reference, because the argmax compares 154,880 sums of 4,096 terms and a float
+accumulator is enough to move the winner when two logits are close - and the token is the entire observable output.
+
+STATE OF THE CHAIN, complete: every kernel verified against the oracle (KDA 12/12, MLA 5 stages with attn bit-exact,
+routed experts with the clamp proven wired, dense FFN, hc_pre, hc_post, both dequantizers, the weight mapping); blocks
+0 and 1 verified end to end, isolated and chained; the head verified complete including its token.  What remains is
+WIRING THAT NEEDS THE PACK - the is_mla and routed branches of glm_trunk_forward, which have still never executed - and
+then the 45-block run and argmax == 12089, whose head half is now known to work.

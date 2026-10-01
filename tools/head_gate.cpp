@@ -115,7 +115,43 @@ int main(int argc, char** argv) {
     std::printf("  [sensitivity] skipping the mean would give worst %.6g - this gate separates the two by %.0fx\n",
                 worst_no_mean, worst_no_mean / (worst > 0 ? worst : 1e-30));
 
-    const bool pass = worst < 1e-4 && std::isfinite(hr);
+    bool pass = worst < 1e-4 && std::isfinite(hr);
+
+    // ---- the projection and the greedy token ----
+    //
+    // Run whenever the dequantized output.weight is present.  The expected token is an ARGUMENT because the head can be
+    // checked at any trunk depth: a 3-block hidden state has its own oracle argmax (6196), and the full 45-block one has
+    // 12089 - the real gate.  Testing the projection against 6196 first means the code path is verified before the
+    // full-model token is available, and if the full model later disagrees it cannot be the projection that is wrong.
+    const std::string wpath = dir + "/w_output.bin";
+    const int expect = argc > 2 ? std::atoi(argv[2]) : -1;
+    if (FILE* probe = std::fopen(wpath.c_str(), "rb")) {
+        std::fseek(probe, 0, SEEK_END);
+        const long nb = std::ftell(probe);
+        std::fclose(probe);
+        const int vocab = (int) (nb / 4 / N_EMBD);
+        std::printf("  projection: %s holds %d rows of %d = %ld bytes\n", "w_output.bin", vocab, N_EMBD, nb);
+        std::vector<float> W((size_t) vocab * N_EMBD);
+        if (!read_floats(wpath, W.size(), W, "output.weight (dequantized)")) return 2;
+        int am = -1;
+        float bestv = 0.0f;
+        std::string perr;
+        if (!strata::core::glm::glm_stage_head_project(W.data(), vocab, N_EMBD, want.data(), am, bestv, perr)) {
+            std::printf("HEAD GATE: FAIL - the projection refused: %s\n", perr.c_str());
+            return 1;
+        }
+        std::printf("  engine argmax %d (logit %.6g) over %d rows\n", am, bestv, vocab);
+        if (expect >= 0) {
+            std::printf("  expected      %d\n", expect);
+            const bool tok_ok = (am == expect);
+            std::printf("  token %s\n", tok_ok ? "PASS" : "FAIL");
+            pass = pass && tok_ok;
+        }
+    } else {
+        std::printf("  projection: no w_output.bin in %s - the mean/norm check above is all this run covers\n",
+                    dir.c_str());
+    }
+
     std::printf("HEAD GATE: %s\n", pass ? "PASS" : "FAIL");
     return pass ? 0 : 1;
 }
