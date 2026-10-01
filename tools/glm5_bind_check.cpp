@@ -203,8 +203,10 @@ int main(int argc, char** argv) {
             return true;
         };
         std::vector<float> h_fn, h_base, h_scale, h_norm;
-        if (!host_copy("hc_attn_fn.weight", 0, h_fn) || !host_copy("hc_attn_base.weight", 0, h_base) ||
-            !host_copy("hc_attn_scale.weight", 0, h_scale) || !host_copy("attn_norm.weight", 0, h_norm))
+        // ORDER TEST: hc_attn_base FIRST, so if it succeeds here the hc_attn_fn copy is what breaks what
+        // follows - the print loop reads base before fn and never fails.
+        if (!host_copy("hc_attn_base.weight", 0, h_base) || !host_copy("hc_attn_scale.weight", 0, h_scale) ||
+            !host_copy("attn_norm.weight", 0, h_norm) || !host_copy("hc_attn_fn.weight", 0, h_fn))
             return 1;
         std::fprintf(stderr, "stage1: host copies fn=%zu base=%zu scale=%zu norm=%zu\n", h_fn.size(),
                      h_base.size(), h_scale.size(), h_norm.size());

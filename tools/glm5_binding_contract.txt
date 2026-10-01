@@ -448,3 +448,26 @@ cudaMalloc that the stage then reads 1.5 MB out of) rather than anything about t
 
 State: default path verified at 9.1's 12/12; the opt-in branch is the configuration stage 1 needs and is
 documented as unverified; stage 1 has still never printed a number.
+
+ORDERING REFUTED - THE TWO CALL SITES ARE IDENTICAL AND BEHAVE DIFFERENTLY
+
+With hc_attn_base copied FIRST, before any hc_attn_fn read, it STILL fails "invalid argument".  So the big copy is
+not what breaks what follows, and the ordering theory is dead too.
+
+Read side by side, the two call sites are the same code:
+
+    print loop (:109-110)   host.resize(n);    cudaMemcpy(host.data(), t.ptr, n    * sizeof(float), DeviceToHost)
+    host_copy  (:186-188)   dst.resize(want);  cudaMemcpy(dst.data(),  q, want * sizeof(float), DeviceToHost)
+
+with n and want both 24 for hc_attn_base, and q taken from the same bound.tensors loop (t.ptr).  One succeeds; the
+other returns "invalid argument" - in the same process, in the same run, for the same tensor, with the same CUDA
+call and the same size.
+
+That is the entire remaining gap, and it is now small enough to be settled by INSPECTION rather than by more
+runtime variants: print the pointer AND the vector's .data() AND the count in host_copy itself, and compare them
+against the print loop's values for the same tensor.  Something in the lambda's environment differs from the
+loop's - most plausibly that q is captured/derived differently than it appears, or that dst is empty at the call
+(want computed from a tensor whose ne0/ne1 were never set, giving 0 and a null .data() - the classic cause of
+"invalid argument" on a copy that looks correctly sized in the source).
+
+Everything else is committed and the default path is unchanged at the verified 9.1 state.
