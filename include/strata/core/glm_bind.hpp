@@ -10,7 +10,8 @@
 namespace strata::core {
 
 struct GlmBoundBlock {
-    struct Tensor { std::string name; const float* ptr = nullptr; int ne0 = 0; int ne1 = 0; };
+    struct Tensor { std::string name; const float* ptr = nullptr; int ne0 = 0; int ne1 = 0;
+                    bool quantized = false; };   ///< native GGUF blocks, not floats
     std::vector<Tensor> tensors;
     std::vector<float*> owned;
     std::vector<void*> host_stage;

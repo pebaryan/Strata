@@ -93,9 +93,19 @@ int main(int argc, char** argv) {
     std::vector<float> host;
     for (const strata::core::GlmBoundBlock::Tensor& t : bound.tensors) {
         if (!t.ptr) { std::printf("%s\tNULL\n", t.name.c_str()); continue; }
-        const size_t n = (size_t) t.ne0 * (size_t) t.ne1;
+        // ne1 == 0 means a 1-D tensor, not an empty one: ne0*ne1 silently gave n=0 for every norm vector.
+        const size_t n = (size_t) t.ne0 * (size_t) (t.ne1 > 0 ? t.ne1 : 1);
+        if (t.quantized) {
+            std::printf("blk.%d.%s\tne=%d,%d\n=quantized (native GGUF blocks; \n=%zu)\n", block, t.name.c_str(),
+                        t.ne0, t.ne1, n);
+            continue;
+        }
         host.resize(n);
-        cudaMemcpy(host.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
+        const cudaError_t st = cudaMemcpy(host.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
+        if (st != cudaSuccess) {
+            std::printf("blk.%d.%s\tCOPY FAILED: %s\n", block, t.name.c_str(), cudaGetErrorString(st));
+            continue;
+        }
         // stats, not just a hash: the engine's dequantizer and llama.cpp's need not agree bit for bit, and a
         // hash cannot tell a ULP apart from a wrong tensor.
         double sum = 0.0;
