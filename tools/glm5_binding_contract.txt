@@ -5427,3 +5427,42 @@ A NOTE ON THE RATIO, since this is the end of a long run: four of my own assumpt
 this session, and this round I retired three hypotheses I had stated with confidence - by reading the code rather than by
 another build.  The reading was cheaper and the conclusion is the same.  That is the habit worth keeping: when the next
 finger to point is at a struct field, read what writes it.
+
+THE EIGHT POINTERS, AND THE ANSWER THEY FORCE
+
+    layer 3 MlaWeights (geom 4096/64/256/512/1536):
+      wq_a        0x7fe9697e3010
+      q_a_norm    0x7fe972159580
+      wq_b        0x7fe957fff010
+      wk_b        0x7fe965fff010
+      kv_a        0x56236a52af50     <- HOST: the one my staging dequantized
+      kv_a_norm   0x7fe972154d80
+      wv_b        0x7fe95ffff010
+      wo          0x7fe943fff010
+
+SEVEN of the eight are 0x7fe9... and exactly one is 0x5623... - the staged host buffer.  And the arena is ALREADY
+cudaMallocManaged: the run allocates it that way with a comment explaining that hc_pre and rms_norm read the same bound
+block the CUDA kernels use, and that "with cudaMalloc the host dereference is a SIGSEGV".  Which forces the conclusion
+without another run:
+
+    IF those seven were inside the managed arena they would be HOST-READABLE - managed memory migrates on a host
+    access, that is what it is for - and there would be no fault.  They fault.  SO THEY ARE NOT IN THE ARENA: they are
+    PRIVATE cudaMalloc allocations, made per tensor by the GGUF-native projection, which is exactly the class the very
+    first pointer diagnostic found for hc_attn_fn ("OUTSIDE-arena", 0x7f4f3e200000, while hc_attn_base and attn_norm
+    were in-arena).
+
+THE DEFECT, in one sentence: the engine's binding serves GGUF-native tensors from PRIVATE DEVICE allocations, and this
+port's trunk reads its weights on the CPU.  It is the same defect as the hc_attn_fn crash and the same defect as the
+loader's dequant branch, in a third place - the native projection - and it is the last one, because every other source of
+weights (the managed arena, the staged dequantized buffers, the fetched 3-D blocks, the mmap'd experts) has now been
+checked and found host-readable.
+
+THE FIX: the native projection's own allocations must be managed (or host) memory, not cudaMalloc, for the same reason
+the arena is - a bound block feeds CPU kernels and CUDA kernels from the same pointers, and only managed memory is
+readable from both.  It is one allocation site, and the comment that already sits on the arena is the argument for it.
+
+WHY THIS WAS THE LAST THING TO BE FOUND, and it is the shape of the whole session: this is the FIFTH instance of a
+component that passes its own gate while the wiring around it is wrong.  The MLA kernel's gate feeds it fixture arrays in
+ordinary host memory; the binder's gates never ask a CPU kernel to read a bound tensor; and the pointer that decides is
+made one layer down in the projection, where no gate was looking.  Each fix moved the crash one kernel further and left
+one more allocation site to check, and this is the last site.
