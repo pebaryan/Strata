@@ -611,3 +611,30 @@ gate could never have seen it.
 Standing rule, now with five falsified hypotheses behind it this phase: measure which quantity a dumped
 tensor actually is BEFORE reasoning about it (done here, and it cleared two wrong conclusions), and prefer a
 bounded variant grid with an unambiguous pass criterion (+1.0 correlation) over further source-reading.
+
+## Part 19: end-to-end test on the output - built, and it FAILS
+
+tools/glm5_e2e_test.py runs the whole output path: hidden state -> output.weight -> logits -> argmax, against
+llama.cpp as the oracle.  Result:
+
+    hidden state : corr +0.07921   max|d| 1.349e+01   (reference scale 9.262)
+    reference    : argmax 12089  (golden 12089)  OK      <- the oracle side checks out
+    ours         : argmax 421    corr +0.24460   relative err 87.6%
+    the reference's own top token ranks 11705 in our logits; top-5 overlap 0/5
+    E2E VERDICT: FAIL
+
+The reference's own logits reproduce the golden token 12089 exactly, so the test harness, the logits
+extraction and the output.weight orientation are all correct - what fails is the trunk that feeds them.
+
+CONTRADICTION TO RESOLVE, and it is now the highest-value item: this run used the RAW residual for the KDA
+(the part-12 fix), and its hidden state is WORSE than the pre-fix run (+0.079 vs +0.208).  Yet the isolated
+block-0 front end measured CLEARLY better with raw (gate 56% -> 0.88%).  Both are measurements, so one of the
+two call sites is not doing what I think.  The prime suspect is where `cur_raw = cur` is captured in
+glm5_full_run.py's loop: if `cur` has already been normed by an earlier step at that point in the loop, or if
+the loop reuses the variable afterwards, then the trunk is still getting a normed input (or now gets
+something else) while the driver's single-block path does not.  Print cur vs cur_raw at the KDA call for
+block 0 in the full run and compare against the driver's - that settles it in one run.
+
+The e2e test is the right top-level gate from here: it is cheap, it fails loudly, and its oracle side is
+verified against the golden tokens rather than assumed.  Chase every fix through it rather than through the
+per-tensor bisect alone.
