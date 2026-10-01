@@ -900,3 +900,25 @@ The KDA gate is one step from running, and the step is a single diagnostic:
   AND THE PROCESS RULE, learned the hard way twice today: this driver must be edited by regenerating it or by
   ONE targeted patch, never by multi-anchor string surgery - the attempt above deleted part of the stage block
   and compiled stale, which is indistinguishable from a wrong result until the error text is read.
+
+KDA STAGE - THE NAME MYSTERY IS SOLVED, AND WHAT THE TENSOR SHAPES ALREADY SAY
+
+1. WHY THE LOOKUP FAILED.  The print loop does not print Tensor::name - it prints the name with the prefix added
+   in the printf itself:
+
+       std::printf("blk.%d.%s\tne=%d,%d\n", block, t.name.c_str(), t.ne0, t.ne1);
+
+   so the stored names are BARE: "attn_norm.weight", "attn_q.weight", "ssm_conv1d_q.weight".  A key built as
+   "blk.0." + suffix can never match, which is exactly what the MISSING result was.  Look up by the bare name.
+
+2. THE KDA GATE NEEDS FLOAT WEIGHTS.  attn_q/k/v are Q8_0 natively, and the branch that dequantizes at bind time
+   (glm_bind.cpp:120) currently requires the name to end in "_fn.weight".  Generalising it to any quantized tensor
+   requires the PLAN ROW's field name, which is not `quantized` - the row struct is GlmTensorRow and the field is
+   one of the members listed above.  One read settles it; do not guess the member name again, which is what broke
+   this attempt.
+
+3. A FINDING THAT SAVES THE NEXT SESSION A CYCLE: the bound attention matrices already come out in the
+   orientation the oracle uses.  The loop prints blk.0.attn_q.weight as ne=8192,4096 - i.e. [d_inner, n_embd],
+   which is what glm5_kda_reference's `xn @ w["wq"].T` expects, and attn_output as ne=4096,8192 = [n_embd,
+   d_inner], which is what `w["wo"]` expects.  So the KdaWeights fill is a straight name mapping with NO
+   transpose, and if the gate disagrees on the first run, transposition is not the first suspect.
