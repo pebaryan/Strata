@@ -2713,3 +2713,32 @@ routing are all recorded above - and the dump provides an expected value for eve
 stage by stage rather than only end to end.  What it needs beyond the loop itself is a driver that runs it for block 0
 and prints each intermediate's statistics beside its dump family, in the same shape kda_gate and ffn_gate already
 use; then feed l_out-0 in as block 1's input and check the chain.
+
+THE LOOP'S REMAINING QUESTION IS AN INTERFACE, NOT AN ALGORITHM
+
+The seven calls and their buffers are fully specified.  What is undecided is how the loop RECEIVES the block's
+weights: it needs roughly fifteen pointers (hc_attn_fn/base/scale, attn_norm, the sixteen KDA weights, hc_ffn_*,
+ffn_norm, and the FFN's three matrices), and the choice determines the code that follows rather than being a detail
+inside it.  Two candidates, with what each costs:
+
+  (a) a plain struct of pointers, filled by the caller.  Explicit, no lookup, trivially testable with the fixture
+      data the gates already load, and it keeps glm_layer.cpp free of any dependency on the binding.  Cost: a
+      fifteen-field struct that the caller must fill correctly, so a driver has to be written alongside it.
+
+  (b) take the bound block (GlmBoundBlock from glm_bind.hpp) and look tensors up by name.  Less plumbing for a
+      driver, because the driver already binds a block - but the names are BARE ("attn_q.weight"), which has bitten
+      this port once already, and it couples the chain to the binding layer, so the loop could no longer be tested
+      against fixture files without a bound artifact.
+
+(a) is the better fit for how everything here has been verified: every gate in this port loads plain arrays from
+files, so a struct-of-pointers loop can be driven by exactly those arrays.  (b) would make the chain testable only
+end-to-end through the loader, which is the arrangement that has cost this port the most time.
+
+RECOMMENDATION: (a), with the struct defined in glm_layer.hpp next to the stage declarations, and a driver that fills
+it from the fixture files already on disk - the same arrays kda_gate and ffn_gate load - so the loop's first run is
+gated against the dump stage by stage rather than only as a whole.
+
+WHY THIS IS THE STOPPING POINT AND NOT ANOTHER ADDITIVE EDIT: every step that went well this session was additive and
+build-verified - a new stage function, a new tool, a new fixture.  This is different: it is a decision that shapes the
+next several edits, and choosing it in the tail of a long context is how this session's earlier rewrites happened.
+The stage functions are all committed, linked and counted; nothing is half-written.
