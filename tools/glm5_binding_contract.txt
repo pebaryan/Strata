@@ -3299,3 +3299,40 @@ THE EXPERT PATH IS REUSABLE AFTER ALL - the item I called "the real work" is mos
 NET EFFECT ON THE PLAN: item 3 shrinks from "the real work, genuine unknowns" to "wire a pack dir into
 FileExpertSource and confirm the blob types".  The remaining substantial piece is item 1 - the loop over trunk blocks
 0..44 with glm_attention_is_mla / glm_ffn_is_dense dispatch - plus the per-kind packing and the head.
+
+ARCHITECTURAL POINT, AND IT CHANGES THE SHAPE OF THE MoE WORK: TWO EXPERT PATHS, NOT ONE
+
+There are two ways this codebase computes an expert, and they are not interchangeable:
+
+  RESIDENT / DEQUANTIZED:  moe_forward -> expert_ffn, both taking float POINTERS to gate/up/down.  This is what
+      glm_stage_moe wraps, and it is the right consumer for fixtures, small models and anything whose weights fit in
+      memory - including every gate this port has built so far, which all load float arrays from files.
+
+  STREAMED / NATIVE:       native_expert.hpp, which computes from the QUANTIZED blob directly:
+          native_fmt(gu_type, d_type, n_embd, n_ff, NativeFmt& f, err)   builds the descriptor from exactly the
+                                                                          gu_type/d_type fields native_experts.txt
+                                                                          carries per layer (layer 3 is 16 and 18)
+          native_quant_act(f, x, dst)                                    quantize the activation
+          native_gu_rows(f, blob, act, nt, ff)                           gate and up applied to the blob
+          native_down_rows(f, blob, hq, nt, out)                         down applied
+      It never materialises float weights, which is the whole reason 86 GB of experts can be streamed at all.
+
+So for the RUN the routed blocks must go through native_* with the router's ids and weights from moe_route (which is
+already available and gated), not through glm_stage_moe.  glm_stage_moe stays correct and useful - it is what the
+per-kernel gates exercise and what a small model would use - but it is NOT the path the 86 GB pack takes, and a chain
+that called it for the routed blocks would try to dequantize 288 experts per layer into memory.
+
+THIS IS THE SAME DISTINCTION AS EVERYWHERE ELSE IN THIS PORT: the gate path and the run path are related but not
+identical, and the difference is precisely where the weights live.  Worth stating plainly because both functions exist,
+both compile, and the difference is invisible in a signature.
+
+SO THE REMAINING WORK, FINAL FORM:
+
+  1. the trunk loop over blocks 0..44 dispatching on glm_attention_is_mla / glm_ffn_is_dense
+  2. per-kind packing of bound tensors into KdaWeights / MlaWeights (and the router/bias/shexp for the routed FFN)
+  3. routed blocks: moe_route for ids+weights, then FileExpertSource::blob(layer, expert) + native_fmt/native_gu_rows/
+     native_down_rows for the expert compute, combined with the router weights, plus the shared expert via moe_forward
+  4. the MLA latent cache across tokens
+  5. head: final norm, lm_head, greedy argmax, and the pack's tokenizer for decode
+
+with the same gate as the Python trunk run: argmax(logits) == 12089 for the prompt 785 6722 315 9621 374.
