@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <map>
 #include <set>
 #include <sstream>
@@ -37,6 +38,7 @@
 #include "strata/core/glm_trunk.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/native_dense.hpp"
+#include "strata/core/native_head.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/quantize_act.hpp"
@@ -274,14 +276,15 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
 
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: glm45_run <pack-dir> <gguf-shard1> [hc-init.bin] [w-output.bin] [w-norm.bin]\n");
+        std::fprintf(stderr, "usage: strata-glm <pack-dir> <gguf-shard1> [hc-init.bin | --serve] [w-output.bin] [w-norm.bin]\n");
         return 2;
     }
     const std::string pack = argv[1];
     const std::string shard1 = argv[2];
-    const std::string in_path = argc > 3 ? argv[3] : "/home/peb/moredata/glm5-oracle-full/hc_init.bin";
-    const std::string wout_path = argc > 4 ? argv[4] : "/home/peb/moredata/glm5-head-gate/w_output.bin";
-    const std::string wnorm_path = argc > 5 ? argv[5] : "/home/peb/moredata/glm5-head-gate/w_output_norm.bin";
+    const bool serve = argc > 3 && std::string(argv[3]) == "--serve";
+    const std::string in_path = !serve && argc > 3 ? argv[3] : "/home/peb/moredata/glm5-oracle-full/hc_init.bin";
+    const std::string wout_path = argc > (serve ? 4 : 4) ? argv[4] : "/home/peb/moredata/glm5-head-gate/w_output.bin";
+    const std::string wnorm_path = argc > (serve ? 5 : 5) ? argv[5] : "/home/peb/moredata/glm5-head-gate/w_output_norm.bin";
     std::string err;
 
     // ---- all three GGUF shards: shard 1 is metadata-only, so a one-shard NativeDense sees an empty tensor list
@@ -328,6 +331,16 @@ int main(int argc, char** argv) {
     if (!table.load(pack, arena, bytes, err, &served)) { std::fprintf(stderr, "load: %s\n", err.c_str()); return 1; }
     C::NativeDense nd;
     if (!nd.load(shards, table, err)) { std::fprintf(stderr, "native: %s\n", err.c_str()); return 1; }
+    C::NativeEmbed native_embed;
+    if (serve && (shards.size() < 2 || !native_embed.load(shards[1], N_EMBD, 154880, err))) {
+        std::fprintf(stderr, "embedding: %s\n", err.c_str());
+        return 1;
+    }
+    C::NativeHead native_head;
+    if (serve && (shards.size() < 2 || !native_head.load(shards[1], N_EMBD, 154880, err))) {
+        std::fprintf(stderr, "output head: %s\n", err.c_str());
+        return 1;
+    }
     std::printf("arena %.2f GB, %zu tensors served from the GGUF\n", bytes / 1073741824.0, served.size());
 
     // ---- geometry.  The clamps are set EXPLICITLY: their defaults are 0.0f, which DISABLES them, and the header
@@ -455,6 +468,7 @@ int main(int argc, char** argv) {
     }
 
     // ---- state: one KDA state per KDA layer, one MLA cache per MLA layer, both keyed by the ARTIFACT's layer number
+    const int cache_cells = serve ? 8192 : TOKENS;
     std::vector<std::vector<float> > kda_state(N_LAYERS);
     std::vector<std::vector<float> > kda_conv(N_LAYERS);
     std::vector<std::vector<float> > mla_cache(N_LAYERS);
@@ -481,7 +495,7 @@ int main(int argc, char** argv) {
         // The same one-line shift applies to the MLA caches in the other direction, which is very likely what the
         // layer-3 pointer differential was showing when four device pointers came back identical across two layers.
         if (C::glm::glm_attention_is_mla(b) == 1) {
-            mla_cache[(size_t) b].assign((size_t) TOKENS * KV_LORA, 0.0f);
+            mla_cache[(size_t) b].assign((size_t) cache_cells * KV_LORA, 0.0f);
             mla_index[b] = n_mla;
             mla_ptrs[n_mla] = mla_cache[(size_t) b].data();
             ++n_mla;
@@ -495,7 +509,7 @@ int main(int argc, char** argv) {
         }
     }
     std::printf("state: %d KDA slots (%.0f MB), %d MLA caches (%d cells each)\n", n_kda,
-                n_kda * (double) NH * HD * HD * 4.0 / 1048576.0, n_mla, TOKENS);
+                n_kda * (double) NH * HD * HD * 4.0 / 1048576.0, n_mla, cache_cells);
 
     C::glm::GlmTrunkState st;
     st.kda_state = kda_ptrs;
@@ -505,52 +519,7 @@ int main(int argc, char** argv) {
     st.mla_len = mla_len;
     st.mla_index = mla_index;
 
-    // ---- the input: the oracle's own hc_init, five tokens of 16384 floats, ne0 fastest
-    std::vector<float> inp;
-    int ne_in[4] = {0, 0, 0, 0};
-    if (!read_dump(in_path, inp, ne_in)) { std::fprintf(stderr, "cannot read %s\n", in_path.c_str()); return 1; }
-    if (ne_in[0] != N_EMBD || ne_in[1] != HC || ne_in[2] < TOKENS) {
-        std::fprintf(stderr, "unexpected hc_init shape [%d,%d,%d,%d]\n", ne_in[0], ne_in[1], ne_in[2], ne_in[3]);
-        return 1;
-    }
-    std::printf("input: hc_init ne=[%d,%d,%d,%d], %zu floats\n", ne_in[0], ne_in[1], ne_in[2], ne_in[3], inp.size());
-    // ---- IS THE INPUT ALIVE?  |l_out| came back 0.000000 over a full forty-five-block pass, and a zero input would
-    // produce exactly that, because rms_norm of zeros is zeros/eps and every stage downstream is linear in it.  Printing
-    // the input's magnitude costs one line and decides between "the trunk does not write its output" and "the trunk was
-    // handed nothing" - which are very different bugs and look identical from the outside.
-    {
-        double in_ss = 0.0, in_max = 0.0;
-        for (float v : inp) { in_ss += (double) v * v; if (std::fabs((double) v) > in_max) in_max = std::fabs((double) v); }
-        std::printf("input magnitude: rms %.8g, max |v| %.8g, first 4: %.6g %.6g %.6g %.6g\n",
-                    std::sqrt(in_ss / (double) inp.size()), in_max, inp[0], inp[1], inp[2], inp[3]);
-    }
-
-    // ---- run: the TOKEN loop is outer, because the layers are stateful and the state carries across it
-    StageCount sc;
-    std::vector<float> l_out((size_t) HC * N_EMBD, 0.0f);
-    for (int t = 0; t < TOKENS; ++t) {
-        sc.token = t;
-        const float* x = inp.data() + (size_t) t * N_EMBD * HC;
-        if (!C::glm::glm_trunk_forward(x, N_LAYERS, provider, &P, P.kda_g, P.mla_g, EPS, st, l_out.data(), nullptr, err,
-                                       0, &stage_cb, &sc)) {
-            std::fprintf(stderr, "trunk failed at token %d: %s\n", t, err.c_str());
-            return 1;
-        }
-        double ss = 0.0;
-        for (float v : l_out) ss += (double) v * v;
-        std::printf("  token %d: |l_out| %.6f, MLA cache depths", t,
-                    std::sqrt(ss / (double) l_out.size()));
-        for (int b = 0; b < N_LAYERS; ++b) {
-            if (mla_index[b] >= 0) std::printf(" %d", mla_len[mla_index[b]]);
-        }
-        std::printf("\n");
-        std::fflush(stdout);
-    }
-    std::printf("stage reports: %ld (", sc.calls);
-    for (const std::pair<const std::string, long>& kv : sc.by_name) std::printf("%s %ld ", kv.first.c_str(), kv.second);
-    std::printf(")\n");
-
-    // ---- the head: the mean over the four streams, then output_norm, then the tied projection
+    // ---- the head: load its small norm and large projection once.  Serve mode keeps both resident across requests.
     std::vector<float> onorm;
     int ne_n[4] = {0, 0, 0, 0};
     // ---- output_norm: read it, and REFUSE rather than pass an empty vector on.
@@ -559,7 +528,16 @@ int main(int argc, char** argv) {
     // garbage, nullptr - so when read_dump parsed this file and produced no elements, the null the head reported was
     // created right here, one line earlier, and the head was telling the truth about an argument this code handed it.
     // The lesson is the same one this port keeps relearning: an argument that is null is not always a binding failure.
-    bool have_norm = read_dump(wnorm_path, onorm, ne_n) && (int) onorm.size() == N_EMBD;
+    bool have_norm = false;
+    if (serve) {
+        const C::WeightRef* nr = table.find("output_norm.weight");
+        if (nr && nr->data && nr->bytes == (uint64_t) N_EMBD * sizeof(float)) {
+            onorm.assign((const float*) nr->data, (const float*) nr->data + N_EMBD);
+            have_norm = true;
+        }
+    } else {
+        have_norm = read_dump(wnorm_path, onorm, ne_n) && (int) onorm.size() == N_EMBD;
+    }
     if (!have_norm) {
         onorm.assign((size_t) N_EMBD, 0.0f);
         std::FILE* f = std::fopen(wnorm_path.c_str(), "rb");
@@ -580,36 +558,108 @@ int main(int argc, char** argv) {
         std::printf("output_norm: %zu floats, rms %.6g, first 3: %.6g %.6g %.6g\n", onorm.size(),
                     std::sqrt(s2 / (double) onorm.size()), onorm[0], onorm[1], onorm[2]);
     }
-    std::vector<float> hidden((size_t) N_EMBD, 0.0f);
-    if (!C::glm::glm_stage_head_mean_norm(l_out.data(), HC, N_EMBD, onorm.data(), hidden.data(), err)) {
-        std::fprintf(stderr, "head: %s\n", err.c_str());
-        return 1;
+    const long vocab = 154880;
+    std::vector<float> output_w;
+    if (!serve) {
+        std::ifstream wf(wout_path, std::ios::binary);
+        if (!wf) { std::fprintf(stderr, "cannot read %s\n", wout_path.c_str()); return 1; }
+        output_w.resize((size_t) vocab * N_EMBD);
+        wf.read((char*) output_w.data(), (std::streamsize) (output_w.size() * sizeof(float)));
+        if (!wf) { std::fprintf(stderr, "short read from %s\n", wout_path.c_str()); return 1; }
     }
-    std::printf("hidden rms %.6f\n", [&] {
-        double s = 0.0;
-        for (float v : hidden) s += (double) v * v;
-        return std::sqrt(s / hidden.size());
-    }());
 
-    // the projection: 154,880 rows of 4,096, ne0 fastest
-    std::ifstream wf(wout_path, std::ios::binary);
-    if (!wf) { std::fprintf(stderr, "cannot read %s\n", wout_path.c_str()); return 1; }
-    wf.seekg(0, std::ios::end);
-    const long wn = (long) wf.tellg();
-    wf.seekg(0);
-    const long vocab = wn / 4 / N_EMBD;
-    std::printf("output.weight: %ld rows of %d\n", vocab, N_EMBD);
-    std::vector<float> row((size_t) N_EMBD);
-    int best = -1;
-    double best_s = -1e300;
-    for (long v = 0; v < vocab; ++v) {
-        wf.read((char*) row.data(), (std::streamsize) (N_EMBD * 4));
-        if (!wf) break;
-        double s = 0.0;
-        for (int j = 0; j < N_EMBD; ++j) s += (double) row[(size_t) j] * (double) hidden[(size_t) j];
-        if (s > best_s) { best_s = s; best = (int) v; }
+    std::vector<float> l_out((size_t) HC * N_EMBD), hidden((size_t) N_EMBD), x((size_t) HC * N_EMBD);
+    float *d_embed = nullptr, *d_hidden = nullptr, *d_logits = nullptr;
+    cudaStream_t head_stream = nullptr;
+    std::vector<float> logits(serve ? (size_t) vocab : 0);
+    if (serve && (cudaMalloc(&d_embed, (size_t) N_EMBD * sizeof(float)) != cudaSuccess ||
+                  cudaMalloc(&d_hidden, (size_t) N_EMBD * sizeof(float)) != cudaSuccess ||
+                  cudaMalloc(&d_logits, (size_t) vocab * sizeof(float)) != cudaSuccess ||
+                  cudaStreamCreateWithFlags(&head_stream, cudaStreamNonBlocking) != cudaSuccess)) {
+        std::fprintf(stderr, "embedding/head scratch allocation failed\n"); return 1;
     }
-    std::printf("\nargmax = %d   (logit %.6f)   expected 12089\n", best, best_s);
+    auto reset_state = [&]() {
+        for (auto& v : kda_state) std::fill(v.begin(), v.end(), 0.0f);
+        for (auto& v : kda_conv) std::fill(v.begin(), v.end(), 0.0f);
+        for (auto& v : mla_cache) std::fill(v.begin(), v.end(), 0.0f);
+        for (int i = 0; i < N_LAYERS; ++i) mla_len[i] = 0;
+    };
+    auto run_x = [&](const float* in, int pos, bool diagnostic, int& best, float& best_logit) -> bool {
+        StageCount sc; sc.token = pos;
+        if (!C::glm::glm_trunk_forward(in, N_LAYERS, provider, &P, P.kda_g, P.mla_g, EPS, st, l_out.data(), nullptr,
+                                       err, 0, diagnostic ? &stage_cb : nullptr, diagnostic ? &sc : nullptr)) return false;
+        if (!C::glm::glm_stage_head_mean_norm(l_out.data(), HC, N_EMBD, onorm.data(), hidden.data(), err)) return false;
+        if (!serve)
+            return C::glm::glm_stage_head_project(output_w.data(), (int) vocab, N_EMBD, hidden.data(), best, best_logit, err);
+        if (cudaMemcpyAsync(d_hidden, hidden.data(), (size_t) N_EMBD * sizeof(float), cudaMemcpyHostToDevice,
+                            head_stream) != cudaSuccess ||
+            !native_head.run(d_hidden, d_logits, (void*) head_stream, err) ||
+            cudaMemcpyAsync(logits.data(), d_logits, (size_t) vocab * sizeof(float), cudaMemcpyDeviceToHost,
+                            head_stream) != cudaSuccess || cudaStreamSynchronize(head_stream) != cudaSuccess) {
+            if (err.empty()) err = "native output head failed";
+            return false;
+        }
+        best = (int) std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
+        best_logit = logits[(size_t) best];
+        return true;
+    };
+    auto embed = [&](int64_t tok) -> bool {
+        if (tok < 0 || tok >= vocab) { err = "token outside vocabulary"; return false; }
+        native_embed.gather_one(tok, d_embed, nullptr);
+        if (cudaDeviceSynchronize() != cudaSuccess ||
+            cudaMemcpy(x.data(), d_embed, (size_t) N_EMBD * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+            err = "token embedding gather failed"; return false;
+        }
+        for (int h = 1; h < HC; ++h)
+            std::memcpy(x.data() + (size_t) h * N_EMBD, x.data(), (size_t) N_EMBD * sizeof(float));
+        return true;
+    };
+
+    if (serve) {
+        std::printf("READY glm-5.3-flash %ld 8192\n", vocab); std::fflush(stdout);
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line == "QUIT") break;
+            if (line.rfind("GEN ", 0) != 0) { std::printf("ERR expected GEN <max_new> <id,id,...>\n"); std::fflush(stdout); continue; }
+            char* ep = nullptr; long max_new = std::strtol(line.c_str() + 4, &ep, 10);
+            while (ep && *ep == ' ') ++ep;
+            std::vector<int64_t> ids; std::string item; std::stringstream ss(ep ? ep : "");
+            while (std::getline(ss, item, ',')) if (!item.empty()) ids.push_back(std::strtoll(item.c_str(), nullptr, 10));
+            if (max_new < 1 || ids.empty() || ids.size() + (size_t) max_new > (size_t) cache_cells) {
+                std::printf("ERR invalid request or context too long\n"); std::fflush(stdout); continue;
+            }
+            reset_state(); int best = -1; float logit = 0.0f; bool ok = true; int pos = 0;
+            for (int64_t tok : ids) {
+                if (!embed(tok) || !run_x(x.data(), pos++, false, best, logit)) { ok = false; break; }
+            }
+            long produced = 0;
+            while (ok && produced < max_new) {
+                std::printf("T %d\n", best); std::fflush(stdout); ++produced;
+                if (best == 154820 || best == 154827 || produced == max_new) break;
+                if (!embed(best) || !run_x(x.data(), pos++, false, best, logit)) ok = false;
+            }
+            if (ok) std::printf("DONE %ld %zu\n", produced, ids.size());
+            else std::printf("ERR %s\n", err.c_str());
+            std::fflush(stdout);
+        }
+        cudaFree(d_embed);
+        cudaFree(d_hidden);
+        cudaFree(d_logits);
+        cudaStreamDestroy(head_stream);
+        return 0;
+    }
+
+    // Diagnostic acceptance run: preserve the oracle fixture gate.
+    std::vector<float> inp; int ne_in[4] = {0,0,0,0};
+    if (!read_dump(in_path, inp, ne_in) || ne_in[0] != N_EMBD || ne_in[1] != HC || ne_in[2] < TOKENS) {
+        std::fprintf(stderr, "cannot read compatible hc_init from %s\n", in_path.c_str()); return 1;
+    }
+    reset_state(); int best = -1; float best_logit = 0.0f;
+    for (int t = 0; t < TOKENS; ++t)
+        if (!run_x(inp.data() + (size_t) t * N_EMBD * HC, t, true, best, best_logit)) {
+            std::fprintf(stderr, "trunk failed at token %d: %s\n", t, err.c_str()); return 1;
+        }
+    std::printf("\nargmax = %d   (logit %.6f)   expected 12089\n", best, best_logit);
     std::printf("ENGINE TOKEN: %s\n", best == 12089 ? "PASS" : "MISMATCH");
     return best == 12089 ? 0 : 1;
 }

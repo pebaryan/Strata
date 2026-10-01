@@ -1,6 +1,7 @@
 #include "strata/core/native_head.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <cuda_runtime.h>
@@ -24,8 +25,18 @@ bool NativeHead::load(const std::string& path, int64_t n_in, int64_t n_out, std:
     }
     try {
         strata::GgufFile gguf(path);
-        err = strata::check_architecture(gguf);
-        if (!err.empty()) return false;
+        // Split GGUFs keep architecture metadata only in shard 1, while GLM's
+        // output tensor lives in shard 2. The caller validates the complete
+        // shard set; still run the architecture guard when this shard carries it.
+        if (const strata::MetaValue* arch = gguf.get("general.architecture")) {
+            if (arch->s == "glm5next") {
+                strata::Glm5NextGeometry geo;
+                err = strata::check_glm5next_architecture(gguf, geo);
+            } else {
+                err = strata::check_architecture(gguf);
+            }
+            if (!err.empty()) return false;
+        }
         const strata::TensorInfo* tensor = nullptr;
         for (const auto& candidate : gguf.tensors()) {
             if (candidate.name != "output.weight") continue;
@@ -113,12 +124,13 @@ bool NativeEmbed::load(const std::string& path, int64_t n_embd, int64_t n_vocab,
         for (const auto& c : gguf.tensors())
             if (c.name == "token_embd.weight") t = &c;
         if (!t || t->shape.size() != 2 || t->shape[0] != (uint64_t) n_embd || t->shape[1] != (uint64_t) n_vocab ||
-            !strata::kernels::iq_supported((int) t->type) || n_embd % 256) {
+            (!strata::kernels::iq_supported((int) t->type) &&
+             !strata::kernels::dequant_bf16_supported((int) t->type)) || n_embd % 256) {
             err = "native embedding: token_embd.weight is absent, of another shape, or of a type without a GPU "
                   "dequantizer";
             return false;
         }
-        row_ = strata::kernels::iq_row_bytes((int) t->type, n_embd);
+        row_ = strata::kernels::native_mmvq_weight_bytes((int) t->type, (int) n_embd, 1);
         bytes_ = (uint64_t) row_ * (uint64_t) n_vocab;
         if (cudaHostAlloc(&host_, bytes_, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess) {
             // Under WSL2 the driver's pinned/mapped host budget (~1 GiB) can be spent by the GPU contexts
@@ -161,7 +173,10 @@ void NativeEmbed::gather_dev(const int32_t* tokens, int64_t n_tok, float* out, v
 }
 
 void NativeEmbed::gather_one(int64_t token, float* out, void* stream) const {
-    strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+    if (strata::kernels::iq_supported(type_))
+        strata::kernels::iq_dequant_f32(type_, (const uint8_t*) dev_ + (size_t) token * row_, n_embd_, out, stream);
+    else
+        strata::kernels::dequant_f32(type_, dev_, token, 1, n_embd_, out, stream);
 }
 
 }  // namespace strata::core
