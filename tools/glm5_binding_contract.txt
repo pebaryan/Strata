@@ -3139,3 +3139,43 @@ engine's stage 1 was right; the dump was a slightly different run; and every "FA
 difference being amplified, not the engine's error.  Four separate comparison defects this session had the same root -
 type, shape, size and provenance each assumed rather than checked - and this is the fifth, and the one that took
 longest to see because the numbers were all plausible.
+
+########  THE CHAIN SURFACE NOW COVERS EVERY BLOCK KIND  ########
+
+    T strata::core::glm::glm_stage_hc_norm     stage 1  hc_pre + the site's RMS norm   (both sites)
+    T strata::core::glm::glm_stage_kda         stage 2  attention, KDA blocks
+    T strata::core::glm::glm_stage_mla         stage 3b attention, MLA blocks
+    T strata::core::glm::glm_stage_hc_post     stage 3  the hyper-connection combination (both sites)
+    T strata::core::glm::glm_stage_ffn         stage 4  FFN, leading dense blocks
+    T strata::core::glm::glm_stage_moe         stage 4b FFN, routed blocks
+    T strata::core::glm::glm_block_forward     one whole block, end to end
+
+Seven symbols, checked with nm rather than inferred from an absence of error text.  The two added this round are thin
+calls into kernels that already exist and already have their own parity gates - moe_forward (which does the routing,
+the weighted sum AND the unweighted shared expert in one call, so the stage adds no arithmetic) and mla_forward (which
+takes a [n_cache][kv_lora] latent cache with the current position already in it).
+
+The link failure was the now-familiar one: mla_forward undefined because src/kernels/glm_mla.cpp was not in the
+target's sources.  This is the third time that has happened (glm_kda.cpp, glm_moe.cpp, glm_mla.cpp) - each time the
+compiler catches it, because an undefined reference is the one kind of missing-symbol bug that cannot be silent.
+
+WHAT "RUN THE WHOLE CHAIN" STILL NEEDS, precisely, so the next step is a list and not a hunt:
+
+  1. THE BLOCK LOOP over all 46 blocks.  glm_block_forward does one block; nothing walks them.  Block kind comes
+     from the artifact: glm5next.attention.head_count_kv is per-layer (1 = MLA, 0 = KDA), and the FFN is dense for
+     the leading blocks and routed for the rest (leading_dense_block_count = 3).
+  2. THE ROUTED EXPERT SOURCE.  moe_forward takes POINTERS to the selected experts' weights, so something must
+     produce them: native_experts.txt gives, per layer, the gate/up/down offsets and byte counts of 288 experts
+     inside the named GGUF shard (44 lines, first is a comment).  src/core/expert_source.cpp exists and mentions
+     n_used/top_k - it must be checked for whether it can serve GLM's pack or only the qwen4exp layout.
+  3. THE MLA WEIGHT BINDING.  MlaWeights (q_lora, kv_lora, the two norms) is not filled anywhere yet; only the KDA
+     site has a binding path (glm_bind.cpp).
+  4. THE CACHES.  KDA carries the recurrent state (already threaded through glm_block_forward); MLA carries a
+     [n_cache][kv_lora] latent cache that has to persist across tokens.
+  5. THE HEAD AND THE TOKENIZER.  Final norm, lm_head, argmax for greedy, and the pack's tokenizer/ for decode.
+  6. A CHAIN DRIVER whose gate is already written down: the reference's greedy generation for the prompt
+     785 6722 315 9621 374 is 12089 13 1084 374, so argmax(logits) on the last prompt token must be 12089.  That is
+     the same gate tools/glm5_full_run.py passes in Python, which is what makes the two comparable - and it means the
+     port's target is a number, not an impression.
+
+Item 2 is the one with real unknowns; the rest are assembly over kernels that already have gates.

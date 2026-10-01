@@ -178,4 +178,47 @@ bool glm_block_forward(const float* x, int tokens, const GlmBlockWeights& w, flo
     return true;
 }
 
+/// Stage 3b: the MLA site, for the blocks whose attention is latent rather than KDA (the artifact declares the
+/// kind per layer in glm5next.attention.head_count_kv: 1 = MLA, 0 = KDA).  `cache` is [n_cache][kv_lora] of
+/// latents with the current position already in it, because the reference appends before attending.
+///
+/// The indexer's selection is all-tokens below 8192 positions, which is where this model's prompts sit; past that
+/// a caller must apply the indexer's selection before calling.  Stated rather than assumed, since the reference
+/// makes the same statement.
+bool glm_stage_mla(const kernels::glm::MlaWeights& w, const kernels::glm::MlaGeometry& g, const float* x,
+                   int n_cache, const float* cache, float* out, std::string& err) {
+    if (!x || !cache || !out) {
+        err = "glm_stage_mla: null argument";
+        return false;
+    }
+    if (g.n_embd <= 0 || g.n_head <= 0 || n_cache <= 0) {
+        err = "glm_stage_mla: geometry and n_cache must be positive";
+        return false;
+    }
+    kernels::glm::mla_forward(w, g, x, n_cache, cache, out);
+    return true;
+}
+
+/// Stage 4b: the MoE site, for the blocks whose FFN is routed (43 of this model's 46).  moe_forward does the
+/// whole site - route, weighted sum, then the UNWEIGHTED shared expert - so this stage adds no arithmetic.
+///
+/// It takes POINTERS to the expert weights rather than owning storage, deliberately: the experts are streamed
+/// from the 86 GB pack through native_experts.txt rather than held resident, so residency is the caller's
+/// business and this stage stays a call.  `experts[i]` is the i-th selected expert's {gate, up, down} in the
+/// order the router returns; `shared` is one {gate, up, down} triple.
+bool glm_stage_moe(const float* xn, const float* router, const float* probs_b,
+                   const kernels::glm::MoeGeometry& g, const float* const* const* experts,
+                   const float* const* shared, float* out, std::string& err) {
+    if (!xn || !router || !experts || !shared || !out) {
+        err = "glm_stage_moe: null argument";
+        return false;
+    }
+    if (g.n_embd <= 0 || g.ff <= 0 || g.n_expert <= 0) {
+        err = "glm_stage_moe: geometry must be positive";
+        return false;
+    }
+    kernels::glm::moe_forward(router, probs_b, g, xn, experts, shared, out);
+    return true;
+}
+
 }  // namespace strata::core::glm

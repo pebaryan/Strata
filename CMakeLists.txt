@@ -177,7 +177,7 @@ target_compile_options(glm_kda_parity PRIVATE -O2)
 # GGUF-only rows can be served; it lives in strata_engine, which this driver deliberately does not
 # pull in, so take just the one translation unit.
 add_executable(glm5_bind_check tools/glm5_bind_check.cpp src/core/native_dense.cpp
-                   src/core/glm_bind.cpp src/core/glm_layer.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
+                   src/core/glm_bind.cpp src/core/glm_layer.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp
                    src/kernels/glm_hc.cpp)
 target_include_directories(glm5_bind_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm5_bind_check PRIVATE -O2)
@@ -202,7 +202,7 @@ target_link_libraries(q5k_parity PRIVATE strata_kernels CUDA::cudart)
 # FFN gate (branch glm5next-port): block 0's leading dense FFN against tools/glm5_moe_reference.py's dense_forward.
 # Dequantizes the fixture's raw blocks with the two bit-exact K-quant kernels, and asserts that its own input
 # actually exceeds the clamp limit before reporting a verdict.
-add_executable(ffn_gate tools/ffn_gate.cpp src/kernels/glm_moe.cpp)
+add_executable(ffn_gate tools/ffn_gate.cpp src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp)
 
 # hc_post gate (branch glm5next-port): the residual combination, the last unverified piece of block 0.  Host-only -
 # no CUDA, no weights - and it asserts that both of its terms actually move the result before reporting a verdict.
@@ -216,7 +216,7 @@ target_link_libraries(ffn_gate PRIVATE strata_core strata_kernels CUDA::cudart)
 
 # MoE parity (branch glm5next-port): the router (sigmoid gating, the selection-only bias, top-8 of 288,
 # normalize-then-scale) and the expert/shared-expert FFNs, against tools/glm5_moe_reference.py.
-add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe.cpp)
+add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp)
 target_include_directories(glm_moe_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_moe_parity PRIVATE -O2)
 
@@ -913,6 +913,6 @@ if(STRATA_BUILD_TESTS)
 endif()
 
 add_executable(block_gate tools/block_gate.cpp src/core/glm_layer.cpp src/core/glm_bind.cpp
-                   src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp src/kernels/glm_hc.cpp
+                   src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp
                    src/kernels/cuda/quantize_act.cu)
 target_link_libraries(block_gate PRIVATE strata_kernels CUDA::cudart)

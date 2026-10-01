@@ -15,6 +15,7 @@
 
 #include "strata/kernels/glm_kda.hpp"
 #include "strata/kernels/glm_moe.hpp"
+#include "strata/kernels/glm_mla.hpp"
 
 #include "strata/kernels/glm_hc.hpp"
 
@@ -88,5 +89,18 @@ struct GlmBlockWeights {
 /// are allocated internally; nothing is carried between calls except what the caller passes.
 bool glm_block_forward(const float* x, int tokens, const GlmBlockWeights& w, float hc_rms_eps,
                        float* l_out, float* state, void* stream, std::string& err);
+
+/// Stage 3b: the MLA site, for blocks whose attention is latent rather than KDA (the artifact declares the kind
+/// per layer in glm5next.attention.head_count_kv).  `cache` is [n_cache][kv_lora] of latents, the current
+/// position included, since the reference appends before attending.
+bool glm_stage_mla(const kernels::glm::MlaWeights& w, const kernels::glm::MlaGeometry& g, const float* x,
+                   int n_cache, const float* cache, float* out, std::string& err);
+
+/// Stage 4b: the MoE site - route, weighted expert sum, and the unweighted shared expert, all inside moe_forward.
+/// Takes pointers to the expert weights rather than owning them, because the experts are streamed from the pack.
+/// `experts[i]` is the i-th selected expert's {gate, up, down} in the router's order; `shared` is one triple.
+bool glm_stage_moe(const float* xn, const float* router, const float* probs_b,
+                   const kernels::glm::MoeGeometry& g, const float* const* const* experts,
+                   const float* const* shared, float* out, std::string& err);
 
 }  // namespace strata::core::glm
