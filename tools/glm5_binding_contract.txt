@@ -844,3 +844,34 @@ WHAT WENT WRONG IN THE COMPARISONS, since it cost most of this session and will 
 NEXT IN 9.2, with the same discipline: the attention call (KDA on blocks with KDA, MLA on the others) against the
 matching reference module, then hc_post, then the ffn stage (leading dense below block 3, moe_forward above), and
 finally the head - with glm5_e2e_test.py (argmax 12089) as the terminal gate.
+
+## 9.2 NEXT STAGE - THE ATTENTION CALL (KDA first, MLA after)
+
+KdaWeights (include/strata/kernels/glm_kda.hpp) is 16 pointers, and they map onto bound tensor names one for one -
+the binding already serves every one of them, conv_q/k/v already repacked into the [d_conv][d_inner] the kernel
+indexes:
+
+    attn_norm  <- blk.N.attn_norm.weight          (F32, and stage 1 already verifies this one)
+    wq wk wv   <- blk.N.attn_q / attn_k / attn_v .weight        (Q8_0 native, dim-swapped by native serving)
+    conv_q/k/v <- blk.N.ssm_conv1d_q/k/v .weight                (F32, repacked by the binding)
+    ssm_a      <- blk.N.ssm_a                 (kernel wants -exp(A_log), per the field comment)
+    dt_bias    <- blk.N.ssm_dt.bias
+    ssm_f_a/b  <- blk.N.ssm_f_a / ssm_f_b .weight        ([hd][n_embd], [d_inner][hd])
+    ssm_beta   <- blk.N.ssm_beta.weight                  ([nh][n_embd])
+    ssm_g_a/b  <- blk.N.ssm_g_a / ssm_g_b .weight
+    o_norm     <- blk.N.ssm_norm.weight                  ([hd], the ssm_norm gain)
+    wo         <- blk.N.attn_output.weight               ([n_embd][d_inner])
+
+The gate, and it is a direct one - the reference exposes exactly what is needed:
+
+    glm5_kda_reference.py:117   kda_block(w, x, tokens, want_state=False)     w = load_weights(m, layer)  (:167)
+    engine                      kda_forward(w, g, x, tokens, out, ...)
+
+so: build KdaGeometry once (d_inner, d_conv, nh, hd, n_embd, eps values), fill KdaWeights from the bound tensors
+by the mapping above, call kda_forward, and compare against kda_block on the same input - gating on the ORACLE,
+per the rule recorded above, not on any dump node.
+
+Two things to carry in from the measurements already made: the conv orientation is already handled (the binding
+repacks to [d_conv][d_inner], so the kernel's conv_w[k*d_inner + ch] indexing is satisfied), and the swiglu clamp
+of 10.0 applies to the ffn stage rather than here.  The T>1 state carry - phase 8's full debugging cycle - only
+matters once more than one token is run per call, which this gate does not need.
