@@ -1247,3 +1247,35 @@ STATE: stage 1 verified; KDA gate PASS at T=1 and T=5; glm5_bind_check exit 0 on
 dequant path exits 0 with the native_type == 8 guard in place.  Fixtures: glm5-kda-l0-t1 and glm5-kda-l0-t5, each
 holding input/result/intermediates, with the sixteen w_*.bin files copied into both since the weights are the
 same block.
+
+BINDING CHECK FOR THE F32 KDA TENSORS - WHAT IS VERIFIED, AND A BROKEN COMPARATOR
+
+Verified by READING THE RAW DRIVER LINES against the oracle's own values, which is the only method that has not
+misled this session:
+
+    blk.0.attn_norm.weight      engine  +0.0703125  +0.157226562  420.698242
+                                oracle  +0.0703125  +0.15722656   420.698242        EXACT
+    blk.0.ssm_conv1d_q.weight   engine  -0.3984375  +0.2109375   -0.70519589
+                                oracle  -0.3984375  +0.2109375                     EXACT
+
+Those two are the two structural classes that matter: a plain F32 vector straight from the arena, and one of the
+CONV tensors, which the binding repacks into [d_conv][d_inner] and therefore could easily have arrived permuted or
+transposed.  Both match the oracle exactly, so the repack is right at least in extent and scale, and the F32 path
+is right for this tensor.
+
+Honest limits: this is 2 of 13 by eye, min/max/sum only, and sum matching does not prove the conv tensor's internal
+ordering - it excludes a wrong tensor, a wrong scale and a wrong element count, not a permutation.
+
+THE COMPARATOR IS BROKEN, and it is worth recording because it kept looking like engine failures:
+tools/kda_binding_check.py parses 0 rows from the driver's output.  The driver separates fields with the two
+characters backslash + t (a literal '\\t' in its printf - confirmed by repr()), and I failed to express that
+correctly four times in a row: twice in shell one-liners where quoting ate a backslash (producing absurd values
+read out of the hash field, which looked like 13 real failures), and twice in the script.  Every one of those
+failures was my measurement, not the engine.  A binding verdict must not be reported from this script until it
+parses the row count it expects - the script now refuses to report with 0 rows parsed, which is the behaviour to
+keep.
+
+WHAT THE NEXT SESSION SHOULD DO FIRST: fix that regex against a repr() of the actual line (not against what the
+format is believed to be), confirm it parses 26 rows for block 0, and only then read its verdicts.  The engine-side
+facts it should then check are the remaining eleven F32 tensors plus, separately, whether wq/wk/wv can be verified
+at all without a dequantizer for their 22-byte type.
