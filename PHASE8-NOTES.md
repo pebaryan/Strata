@@ -694,3 +694,26 @@ itself rather than in a note.
 
 Also worth regenerating for completeness: the t=8 and layer-20 fixtures, since they were built from the
 pre-fix oracle.  The parity path is otherwise settled: kernel correct, oracle correct, agreement at 1e-06.
+
+## Part 22: the KDA gate can now FAIL - known-bad input is rejected
+
+The fixture writer gained a regression mode (STRATA_BAD_CONV_FIXTURE=1) that emits the (d_conv, d_inner) conv
+array transposed AT THE BYTE-WRITING STEP ONLY, so the fixture holds a deliberately wrong conv layout while
+its expected outputs were computed with the correct one.  Same gate, same kernel, same oracle:
+
+    correct fixture   v/attn/gated/result all ~1e-06 of scale, 0 failures
+    bad fixture       v 1.95x of scale (worst element 10x), attn/gated 1.00x, result 1.18x -> FAILURES
+
+So the defect that survived this entire phase is now caught by the gate, and a PASS carries information.
+
+The instruction that makes this repeatable: flipping the order in the LOADER (tried first) does not work,
+because the oracle's own expected outputs are computed with the same weights - the fixture then holds wrong
+weights AND wrong expected values, and the gate passes.  That wrong-against-wrong self-consistency is exactly
+how the original bug survived four gates.  The flip must be at the writer.
+
+FOUR GATES PASSED WHILE THE MODEL WAS WRONG IN THIS PHASE: the swiglu clamp, the router bias, the double
+normalization, and the conv layout.  Every one had its inputs derived from the implementation under test.
+Any new operator gate should ship with a known-bad fixture it is required to reject.
+
+Remaining: regenerate the t=8 and layer-20 fixtures from the corrected oracle (t=1 is done and passes), then
+wire the engine path with the loader rule reshape(d_inner, d_conv).T and chase it through glm5_e2e_test.py.

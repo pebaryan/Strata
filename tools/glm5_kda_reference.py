@@ -199,6 +199,9 @@ def load_weights(m: Model, layer: int) -> dict:
     return w
 
 
+BAD_CONV = __import__("os").environ.get("STRATA_BAD_CONV_FIXTURE") == "1"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--gguf", required=True)
@@ -240,10 +243,24 @@ def main() -> int:
             for arr in (w["attn_norm"], w["wq"], w["wk"], w["wv"], w["conv_q"], w["conv_k"], w["conv_v"],
                         w["ssm_a"], w["dt_bias"], w["ssm_f_a"], w["ssm_f_b"], w["ssm_beta"],
                         w["ssm_g_a"], w["ssm_g_b"], w["o_norm"], w["wo"], x):
-                fh.write(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+                _a = np.ascontiguousarray(arr, dtype=np.float32)
+                if BAD_CONV and _a.shape == (D_CONV, D_INNER):
+                    # REGRESSION MODE: emit the conv weights in the WRONG order while the fixture's expected
+                    # outputs above were computed with the right one, so the parity gate must FAIL.  Flipping
+                    # in the loader instead would corrupt the expected values too (wrong against wrong) and
+                    # the gate would pass - which is exactly how the original defect survived every gate.
+                    _a = np.ascontiguousarray(_a.T)
+                fh.write(_a.tobytes())
             for arr in (mid["qc"], mid["kc"], mid["vc"], mid["g"], mid["beta"], mid["q"], mid["k"],
                         mid["v"], mid["attn"], mid["o"], result):
-                fh.write(np.ascontiguousarray(arr, dtype=np.float32).tobytes())
+                _a = np.ascontiguousarray(arr, dtype=np.float32)
+                if BAD_CONV and _a.shape == (D_CONV, D_INNER):
+                    # REGRESSION MODE: emit the conv weights in the WRONG order while the fixture's expected
+                    # outputs above were computed with the right one, so the parity gate must FAIL.  Flipping
+                    # in the loader instead would corrupt the expected values too (wrong against wrong) and
+                    # the gate would pass - which is exactly how the original defect survived every gate.
+                    _a = np.ascontiguousarray(_a.T)
+                fh.write(_a.tobytes())
         print(f"wrote raw fixture {a.raw_fixture}")
     return 0
 
