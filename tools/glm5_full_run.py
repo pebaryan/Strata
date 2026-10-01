@@ -96,6 +96,7 @@ def main() -> int:
         cur, post, comb = DRV.hc_pre_3d(inpL, w.tensor(p + "hc_attn_fn.weight"),
                                         w.tensor(p + "hc_attn_scale.weight"),
                                         w.tensor(p + "hc_attn_base.weight"))
+        cur_raw = cur                                                    # pre-norm residual
         cur = DRV.rms_norm_ne0(cur, w.tensor(p + "attn_norm.weight"))   # [n_embd, T]
 
         if is_mla:
@@ -112,7 +113,7 @@ def main() -> int:
             attn_out = np.stack(outs).T                                  # [n_embd, T]
         else:
             kw = KDA.load_weights(w.m, il)
-            kda_out, _kmid = KDA.kda_block(kw, cur.T, len(toks), want_state=True)
+            kda_out, _kmid = KDA.kda_block(kw, cur_raw.T, len(toks), want_state=True)
             attn_out = kda_out.T                                         # [n_embd, T]
 
         inpL = DRV.hc_post_3d(attn_out, residual, post, comb)
