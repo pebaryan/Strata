@@ -4729,3 +4729,45 @@ THIS IS THE SAME LESSON AS THE DOUBLE-NORM AND THE MLA CACHE, in its final and m
 verifies a part cannot see a wiring error - and here the part was never tested through the wiring the model uses.  Every
 gate in this port hands its kernel the state it needs in the form it wants; the trunk hands the MoE stage QUANTIZED
 BYTES FROM A PACK, and nothing had ever asked that path to reproduce a number.
+
+THE BLOB SPLIT IS CORRECT, SO THE REMAINING 4.6% NEEDS A DIFFERENT EXPLANATION - AND THE LIKELY ONE IS QUANTIZATION
+
+src/kernels/cpu/native_expert.cpp computes the sub-offsets like this:
+
+    f.gu_row   = ggml_row_size(gu_type, n_embd);      // IQ2_XXS: 66 bytes per 256 weights -> 1056 per 4096 row
+    f.up_off   = f.gu_row * (size_t) n_ff;            // 1056 * 2048 = 2,162,688
+    f.down_off = 2 * f.up_off;                        // 4,325,376
+    f.bytes    = f.down_off + f.d_row * n_embd;       // + 98*8*4096 = 7,536,640
+
+Every term is right, and f.bytes comes out at exactly the pack's declared blob_bytes - which is now explained rather
+than merely observed, since the same three quantities produce both.  There is NO off-by-one to find here, and the
+hypothesis that the stage reads gate/up/down at the wrong sub-offset is DEAD.
+
+WHICH LEAVES A POSSIBILITY THE GATE ITSELF HAS BEEN HIDING, and it should be stated before anyone spends another
+session hunting: THE NATIVE PATH CANNOT MATCH A FLOAT REFERENCE.  The oracle dequantizes the experts to float32 and
+multiplies in float64; glm_stage_moe_native multiplies IQ2_XXS weights (2.06 bits) by Q8_K-quantized activations.
+Those are different computations, and IQ2_XXS is a TWO-BIT format - a per-weight error of tens of percent that cancels
+across a 4096-term dot product but does not vanish.  What is observed is exactly its shape: the rms agrees to 0.04%
+(errors cancelling) while the worst element is off by 4.6% (an output that is a cancellation of large terms with small
+residual).  Compare the two failures this session DID prove, both of which looked different: the double-norm bug gave
+a 3.0% rms deviation and the MLA-cache bug gave 99.8% of rms - both moved the rms or destroyed the result, while this
+one leaves the rms essentially intact.
+
+THE BAR IS ALSO INHERITED FROM THE WRONG PLACE.  block3_gate's 1e-3-of-rms threshold was set for float comparisons,
+where blocks 0 and 1 legitimately reach 1.2e-05 with the DENSE float FFN.  Applying it to a path that runs 2-bit
+weights benchmarks the quantizer, not the port, and "FAIL" at 4.6% carries no information about correctness.
+
+THE DECISIVE TEST, which needs one thing the port does not have yet: run BOTH engine paths on the SAME input and
+compare THEM.  glm_stage_moe (float, dequantized experts) and glm_stage_moe_native (quantized, from the pack) fed the
+block's own ffn_norm: if the float path matches the oracle tightly while the native path differs by a few percent, the
+difference IS the quantization and block 3 is CORRECT - its gate was simply asking a quantized path to reproduce a
+float one.  If instead the two engine paths differ by far more than the quantizer can explain, the native stage is
+still broken.  That is a single experiment that settles the block either way, and it should be run before any further
+structural hunting in the stage.
+
+NOTE ON WHAT THIS MEANS FOR THE PORT'S ACCEPTANCE TEST: the authority for this port has always been the TOKEN
+(argmax == 12089 through the engine's own 45-block trunk).  A per-block float comparison cannot be the goal for the
+routed blocks, because the production path is the quantized one - llama.cpp itself runs exactly these IQ2_XXS experts
+and produces the right tokens.  Per-block float gates remain the right tool for the dense, hc, norm and attention
+stages, where they are meaningful; for the routed stage the meaningful comparison is native-vs-native and, ultimately,
+the token.
