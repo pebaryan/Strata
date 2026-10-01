@@ -79,8 +79,13 @@ struct GlmTrunkState {
 ///
 /// Returns false on the first layer that fails, with the layer number in `err`, so a failure names a block rather
 /// than the trunk.
+/// `first_layer` is the index the loop STARTS at, and it is not cosmetic: the dispatch
+/// (glm_attention_is_mla / glm_ffn_is_dense), the weight provider and the state maps are all keyed by the artifact's
+/// layer number, so a run that starts at layer 3 must say so or it would be dispatched as layer 0 - KDA instead of
+/// MLA, dense instead of routed.  Defaults to 0 for a run over the whole trunk.
 bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, void* provider_ctx,
                        const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
-                       float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err);
+                       float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
+                       int first_layer = 0);
 
 }  // namespace strata::core::glm

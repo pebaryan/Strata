@@ -31,7 +31,8 @@ void copy_floats(float* dst, const float* src, size_t n) {
 
 bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, void* provider_ctx,
                        const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
-                       float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err) {
+                       float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
+                       int first_layer) {
     if (!x || !provider || !l_out) {
         err = "glm_trunk_forward: null argument";
         return false;
@@ -57,7 +58,9 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
     float* cur = buf_a.data();
     float* nxt = buf_b.data();
 
-    for (int layer = 0; layer < layers; ++layer) {
+    for (int i = 0; i < layers; ++i) {
+        // the artifact's layer number, not the loop's counter: every dispatch and lookup below is keyed by it
+        const int layer = first_layer + i;
         const bool is_mla = glm_attention_is_mla(layer) == 1;
         const bool is_dense = glm_ffn_is_dense(layer);
 

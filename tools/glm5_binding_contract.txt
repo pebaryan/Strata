@@ -4366,3 +4366,28 @@ STATE: the routed expert path's plumbing is now validated against the pack's rea
 fixtures on disk with its shapes confirmed, and the oracle's l_out-2 / l_out-3 give that block's input and reference.
 What remains is the block-3 gate itself - the tool that binds those 21 tensors, opens FileExpertSource, fills moe_fmt and
 blob_fn, and calls glm_trunk_forward - which would be the first execution of the is_mla AND routed branches.
+
+glm_trunk_forward CAN NOW START AT A LAYER, WHICH IS WHAT A BLOCK-3 RUN NEEDS
+
+    glm_trunk_forward(..., int first_layer = 0)
+
+The loop previously dispatched on ITS OWN COUNTER, so a one-layer run always used layer 0 - KDA and dense.  Every
+dispatch (glm_attention_is_mla / glm_ffn_is_dense), every weight lookup and the state maps are keyed by the ARTIFACT's
+layer number, so a run starting at block 3 must say so or it is dispatched as a KDA dense block and the provider is
+asked for tensors block 3 does not have.  The loop now computes `const int layer = first_layer + i;` once and uses it
+for all of them.  Defaulted, so the existing callers are unchanged - and they were re-run to prove it rather than
+assumed:
+
+    block 0          worst 7.35745e-08   relative 1.23591e-05   ratio 1   TRUNK GATE: PASS
+    block 1 chained  worst 1.16415e-07   relative 1.60491e-05   ratio 1   TRUNK GATE: PASS
+    head, full depth engine argmax 12089   token PASS                     HEAD GATE: PASS
+
+Identical numbers to before the change, which is the point: a refactor of verified code has to be re-verified, and
+"it cannot have changed anything" is not evidence.
+
+WHY THIS WAS THE LAST BLOCKER ON A BLOCK-3 RUN: block 3 is the first MLA layer AND is routed, so both branch conditions
+differ from block 0's - and with the loop able to start at 3, a one-layer run now exercises the is_mla branch and the
+routed branch, neither of which has ever executed.  Everything that run needs is already in place and verified: the 21
+dense tensors fetched and shape-checked, the routed descriptor matching the pack's blob_bytes to the byte for layer 3,
+FileExpertSource's interface read, the oracle's l_out-2 as input and l_out-3 as reference, and the ggml link line
+recorded (build-glm5/ggml/src/libggml-{cpu,base}.a).
