@@ -3392,3 +3392,45 @@ TWO TRAPS, BOTH ALREADY DOCUMENTED IN THE EXISTING EXPERT CODE - do not re-deriv
   Also from that header, worth keeping: a blob whose n_embd or expert width differs from the descriptor is REFUSED
   rather than mis-indexed - so native_fmt's n_embd/n_ff must be the model's, and the pack's own row is the place to
   confirm the types (native_experts.txt carries gu_type and d_type per layer; layer 3 is 16 and 18).
+
+THE NATIVE MoE STAGE, FULLY DETERMINED - ROUTE / PARTS / COMBINE, AND WHERE THE WEIGHT GOES
+
+The existing engine splits a MoE layer into two halves and says why (src/core/layer.cpp:~472):
+
+    moe_route(...)   publishes `ids` and `weights` for THIS layer
+    <the expert compute fills `parts`, UNWEIGHTED>
+    moe_finish(...)  combines `parts` with `ids`/`weights`
+
+"The two halves in sequence.  `moe_route` publishes `ids`/`weights` for THIS layer and `moe_finish` combines `parts`
+with them, so a caller of this wrapper must have `parts` ready BEFORE the call."
+
+That is the answer to the first trap: the router weight is applied in the COMBINE, once.  A per-expert helper that also
+scales produces a model that is wrong in a way one layer cannot show.
+
+So the GLM stage, using GLM's own already-gated pieces:
+
+    1  kernels::glm::moe_route(router, probs_b, g, x, ids, weights)      sigmoid + exp_probs_b + top-8 of 288,
+                                                                          normalise by max(sum, MOE_F16_MIN), * 2.5
+    2  native_fmt(gu_type, d_type, n_embd, n_ff, fmt, err)                from the pack's own per-layer types
+       native_quant_act(fmt, x, act)                                      once per token, NOT cached (trap 2)
+       for i in 0..7:
+           blob = source->blob(layer, ids[i])
+           native_gu_rows(fmt, blob, &act, 1, &ff, 0, n_ff)
+           native_quant_h(fmt, ff, hq)
+           native_down_rows(fmt, blob, &hq, 1, &parts[i], 0, n_embd)      UNWEIGHTED
+    3  out = sum_i parts[i] * weights[i]                                  the weight applied HERE, once
+    4  out += the shared expert, from the bound per-block ffn_*_shexp tensors, clamp_shexp (10.0), added UNWEIGHTED
+         - the reference adds the parallel-SiLU shared expert without a router weight
+
+Every input to that exists: moe_route is gated, ExpertSource::blob is implemented (FileExpertSource opens a pack dir),
+native_* is written and exposes exactly these four calls, and the shared expert is an ordinary bound tensor.  What is
+left is the ~50 lines that wire them, the buffer sizes taken from fmt.act_bytes / fmt.h_bytes / n_ff, and then the
+trunk loop around it.
+
+THIS IS THE POINT TO HAND OFF, and the reason is specific rather than a mood: the remaining work is a 50-line function
+with buffer arithmetic and a combine, written into a session that has already caught five separate defects of exactly
+that kind - sizes inferred rather than measured, a width copied from the wrong row, a comparison against the wrong
+provenance.  Every one was caught by an assertion or a tool that refused to run, and the only reason they cost one
+round instead of a day is that the fixture was verified before the code ran on it.  A native MoE stage written at the
+tail of this session would have neither the room to build that fixture nor the room to debug it, and the pattern of
+this entire session says the error would be a plausible number rather than a crash.
