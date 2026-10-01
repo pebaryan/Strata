@@ -3758,3 +3758,53 @@ WHAT REMAINS, unchanged in shape and now much smaller: the pack provider (routed
 from the pack's own gu_type/d_type), the loop over all 45 blocks with KDA states and MLA caches, the head, and the
 token gate argmax == 12089.  The assembly is proven to execute; what is unproven is that it is numerically right, and
 that is what the oracle's block output would settle.
+
+CORRECTION AND A LIVE DISCREPANCY: the engine's l_out is 3.0% BELOW BOTH references
+
+The oracle's own block-0 output was produced with the runner's existing dump path, no new code:
+
+    $PY tools/glm5_full_run.py --gguf $GGUF --tokens "785 6722 315 9621 374" --blocks 1 \
+        --dump /home/peb/moredata/glm5-oracle-lout
+    -> wrote l_out-0.bin (327,700 B = 5-word header + 81,920 floats)
+    -> "block 0 (KDA, dense) done; |l_out| 1.7166"
+
+and the same trunk_gate run, pointed at that directory instead of the ref dump:
+
+    oracle l_out-0 rms   0.00599758
+    dump   l_out-0 rms   0.00599831        <- the oracle and the dump AGREE, 0.012% apart
+    engine l_out   rms   0.0058151         <- 3.0% below both (ratio 0.96958)
+    worst absolute difference 0.0427237
+
+THIS RETRACTS THE EXPLANATION I WROTE TWENTY MINUTES AGO, and the retraction matters more than the result.  After the
+first run I recorded that the 3.1% gap was "consistent with this port's established finding that the dump is the
+outlier at hc_pre, amplified by the KDA's exponential gate".  That reasoning is now dead: at l_out the ORACLE and the
+DUMP agree to 0.012%, so the dump cannot be the thing the engine is disagreeing with.  The engine is 3% below a
+reference that two independent sources agree on.  The note still printed by trunk_gate ("the dump is this port's known
+outlier...") is therefore MISLEADING AT THIS STAGE and needs rewording rather than keeping, because it would let a
+future reader excuse a real 3% gap as an artifact.
+
+WHERE THE 3% CAN STILL LEGITIMATELY COME FROM, and it is one specific thing that has not been excluded:
+
+    THE ENGINE DID NOT CONSUME THE SAME INPUT THE ORACLE DID.
+
+trunk_gate feeds x from glm5-ref-dump5/hc_init.bin - the REFERENCE DUMP's embedding streams - while the oracle
+computed its block-0 input itself from the token ids.  This file already records that those two differ: at
+hc_attn_pre the dump reads rms 0.004125 while the engine AND the oracle both read 0.00412163, about 0.08%.  A 0.08%
+difference at the input, through a KDA whose gate is exponential and which the measurement above shows produces a
+280x amplification at the attention output, is exactly the size that lands as ~3% at l_out.
+
+So the comparison is NOT YET APPLES TO APPLES, and it cannot distinguish "the assembly is 3% wrong" from "the assembly
+was given a 0.08%-different input".  That is the single thing to fix next:
+
+    1  have the oracle dump ITS OWN block-0 input streams (the hc_pre input it computes), i.e. one more write_tensor
+       in the runner's dump path - the same file the engine already reads, so trunk_gate needs no change;
+    2  re-run with the engine consuming the oracle's input;
+    3  THEN the tolerance can be tight.  If the engine still sits 3% off, that is a real assembly bug and the hunt
+       starts inside the block; if it collapses to the fp32 floor, the assembly is verified and the 3% was the input.
+
+Nothing about the 3% should be called either way until step 3 - which is precisely the mistake that was just made and
+retracted above.
+
+ALSO WORTH RECORDING so it does not mislead later: the 1-block oracle run prints "logits argmax = 134277 expected
+12089 MISMATCH".  That is EXPECTED and meaningless here - --blocks 1 runs only block 0, so the head is being applied
+to a single-block hidden state.  The 12089 gate only means anything for a full 45-block run.
