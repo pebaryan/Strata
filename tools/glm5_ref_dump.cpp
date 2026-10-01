@@ -36,6 +36,11 @@ struct Dumper {
     std::string dir;
     bool all = false;
     bool embd_test = false;                  // feed a known embedding pattern instead of tokens
+    std::string only;                        // if set, only tensors whose name contains this are requested
+                                             // from the scheduler.  Asking for ONE tensor lets the
+                                             // scheduler compute large graph ranges instead of a
+                                             // single node at a time, which is what its buffer
+                                             // liveness analysis assumes.
     bool dumping = false;
     std::ofstream manifest;
     int dumped = 0;
@@ -171,7 +176,10 @@ void dump_tensor(ggml_tensor * t) {
 }
 
 bool cb_eval(ggml_tensor * t, bool ask, void * /*ud*/) {
-    if (ask) return true;                    // evaluate everything: skipping a tensor would break the graph
+    if (ask) {
+        if (g_d.only.empty()) return true;   // evaluate everything: skipping a tensor would break the graph
+        return t->name && std::strstr(t->name, g_d.only.c_str()) != nullptr;
+    }
     if (!g_d.dumping || !t->name || !t->name[0]) return true;
     if (!g_d.wanted(std::string(t->name))) return true;
     dump_tensor(t);
@@ -194,6 +202,7 @@ int main(int argc, char ** argv) {
     for (int i = 4; i < argc; ++i) {
         if (std::strcmp(argv[i], "--all") == 0) g_d.all = true;
         if (std::strcmp(argv[i], "--embd-test") == 0) g_d.embd_test = true;
+        if (std::strcmp(argv[i], "--only") == 0 && i + 1 < argc) g_d.only = argv[++i];
     }
 
     g_d.manifest.open(g_d.dir + "/dump.tsv", std::ios::out | std::ios::trunc);
