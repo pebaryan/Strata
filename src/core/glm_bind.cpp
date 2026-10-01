@@ -118,7 +118,7 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
                 got.ptr = p;
             }
         } else if (std::getenv("STRATA_HC_DEQUANT") &&
-                   (w->native_type == 8 || w->native_type == 13) &&
+                   (w->native_type == 8 || w->native_type == 13 || w->native_type == 14) &&
                    ((full.size() >= 10 && full.compare(full.size() - 10, 10, "_fn.weight") == 0) ||
                     (std::getenv("STRATA_DEQUANT_ALL_Q8_0")))) {
             // The hc function matrices (hc_attn_fn / hc_ffn_fn) are consumed as FLOATS by hc_pre, which reads
@@ -163,6 +163,8 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
                 strata::kernels::dequant_q8_0((const uint8_t*) w->native_data, dev_f, n, stream);
             } else if (w->native_type == 13) {
                 strata::kernels::dequant_q5_K((const uint8_t*) w->native_data, dev_f, n, stream);
+            } else if (w->native_type == 14) {
+                strata::kernels::dequant_q6_K((const uint8_t*) w->native_data, dev_f, n, stream);
             } else {
                 err = std::string("glm_bind: no dequantizer for type ") + std::to_string(w->native_type) +
                       " (" + full + ")";

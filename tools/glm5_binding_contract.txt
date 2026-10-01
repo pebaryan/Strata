@@ -1835,3 +1835,28 @@ refusing any block size with no dequantizer, so a third type needs an argument r
 STATE: types 8 (Q8_0), 13 (Q5_K) and 14 (Q6_K) all have dequantizers, and both K-quants are proven bit-exact against
 the oracle.  The bind-time guard covers {8, 13} and needs one more case for 14 - which is what ffn_down is - after
 which every tensor of the leading dense FFN can be bound as floats and the ffn gate itself can be built.
+
+STEP 3 OF THE Q6_K ROUND DONE: THE FFN TENSORS BIND AS FLOATS
+
+Guard and dispatch extended to type 14, after the bit-exact parity result gave it the same standing as 8 and 13:
+
+    exit=0   unhandled-type errors 0   dequant errors 0
+    blk.0.ffn_down.weight   ne=12288,4096  n=50331648  -0.117431641  0.117431...   <- oracle -0.117432 / +0.117432
+    blk.0.ffn_gate.weight   ne=4096,12288  n=50331648
+    blk.0.ffn_up.weight     ne=4096,12288  n=50331648
+
+All three were "quantized" in every previous run; now every tensor of the leading dense FFN is readable as floats,
+and ffn_down's own values match the oracle.  The KDA binding is unchanged (16 PASS, 0 FAIL, 0 quantized), checked
+after the change rather than assumed from it, because this is the same branch that produces it.
+
+WHAT IS NOW IN PLACE FOR THE FFN GATE - all four prerequisites, none of them there two rounds ago:
+  * the engine can dequantize every type this block's FFN uses (8, 13, 14), each proven BIT-EXACT against the
+    oracle rather than merely compiled;
+  * the FFN weights bind as floats through the engine's own loader;
+  * the reference to gate against is tools/glm5_moe_reference.py's swiglu_ffn (line 123) and dense_forward (204);
+  * the two semantics that a plausible implementation gets wrong are recorded: the GATE clamp is one-sided (from
+    above only), and the leading dense FFN uses swiglu_clamp_SHEXP rather than the routed experts' limit.
+
+REMAINING FOR THE GATE: a fixture (an input vector plus the oracle's dense_forward output for it) and a tool that
+calls the engine's dense FFN and compares.  That is the next build, and it is the first thing in this port that
+exercises a second stage of a block rather than a second aspect of the first.
