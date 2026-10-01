@@ -83,11 +83,16 @@ class Weights:
 
 def write_tensor(dump: pathlib.Path, name: str, arr: np.ndarray) -> None:
     """fp32 with the reference dumper's header: type, ne0..ne3, data with ne0 fastest."""
-    a = np.ascontiguousarray(arr, dtype=np.float32)
+    # FORTRAN ORDER, because the header's ne0 is the FASTEST axis.  a.tobytes() writes C order, which has the LAST
+    # axis fastest, so for any array with more than one dimension the bytes and the header disagreed - and this went
+    # unnoticed for two reasons: every earlier dump was 1-D, where the two orders coincide, and an rms cannot see a
+    # permutation, so the oracle's l_out-0 "agreed" with the reference dump to 0.012% while the two files actually held
+    # differently-arranged data.  That is what made the first block comparison unusable.
+    a = np.asfortranarray(arr, dtype=np.float32)
     ne = list(a.shape) + [1] * (4 - a.ndim)
     with open(dump / f"{name}.bin", "wb") as fh:
         fh.write(struct.pack("<5i", 0, ne[0], ne[1], ne[2], ne[3]))
-        fh.write(a.tobytes())
+        fh.write(a.tobytes(order="F"))
 
 
 def rms_norm_ne0(x: np.ndarray, w: np.ndarray | None = None, eps: float = 1e-5) -> np.ndarray:

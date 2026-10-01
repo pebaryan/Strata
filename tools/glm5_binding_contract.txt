@@ -3854,3 +3854,52 @@ established which file is in which order and the comparison is run on one of the
 UNTIL THAT IS DONE, no statement about the engine's block arithmetic is supported by evidence.  This port has spent the
 session comparing numbers that came from different arrangements of the same data, and the honest position is that the
 block-level comparison has not yet been performed.
+
+FOUND THE REAL BUG: write_tensor WROTE C ORDER WHILE ITS HEADER CLAIMED ne0-FASTEST
+
+tools/glm5_block_driver.py:84 promised "data with ne0 fastest" and packed ne = list(a.shape) into the header, then
+wrote `a.tobytes()` - which is C order, i.e. the LAST axis fastest.  For a 1-D array the two orders coincide, which is
+why it survived; for the 3-D tensors this port is now dumping (4096, 4, 5) they do not, so every file the oracle wrote
+had its bytes in one arrangement and its header claiming another.  Fixed to np.asfortranarray + tobytes(order="F").
+
+HOW IT WAS FOUND, and it was not by looking at the writer:
+
+    ref-dump hc_init : 4096-stride copies True   distinct 4096-blocks 5  at [0,4,8,12,16]
+    oracle   hc_init : 4096-stride copies False  distinct 4096-blocks 20 at [0..19]
+
+The tensor is the embedding replicated over 4 streams, so in the dump's ne0-fastest layout the four streams are
+contiguous 4096-stride copies of each other.  The oracle's file showed NO such copies at any stride - impossible for
+that tensor under that header, and enough to convict the writer.
+
+WHY IT COST A WHOLE SESSION OF CONFUSION, and the general lesson:
+
+  * AN RMS IS PERMUTATION-INVARIANT.  Every comparison this port ran used rms, and a permutation leaves rms unchanged.
+    So the oracle's l_out-0 "agreed" with the reference dump's to 0.012% (0.00599758 vs 0.00599831) - two files in
+    different arrangements, agreeing by construction.  That single fact fabricated the "the oracle and the dump agree,
+    therefore the engine is wrong" conclusion, which is now retracted;
+  * a per-value index map CANNOT recover the permutation when the data is redundant: hc_init holds only 8,154 unique
+    values among 81,920, so every lookup was ambiguous and the "map" I recovered was the first-occurrence artifact
+    (it printed oracle->ref [0, 16384, 32768, 49152, 65536, 0, ...], which is meaningless);
+  * what DID work was structural: find the invariance the tensor must satisfy (identical streams at a fixed stride)
+    and test whether the file satisfies it.  That is what identified the layout, and it needed no reference at all.
+
+THE FIXED COMPARISON, and the real result:
+
+    engine l_out rms 0.0058151   oracle l_out-0 rms 0.00599758
+    worst absolute difference 0.0121951   ratio 0.969575     (3.0% low)
+
+and it is the SAME number the engine produced from the reference dump's hc_init (ratio 0.969458, worst 0.0121585) -
+which is the consistency check that shows the fix is right: once both files carry ne0-fastest bytes, feeding the engine
+either one gives the same answer, as it must, because they hold the same tensor.
+
+SO THE BLOCK COMPARISON HAS NOW ACTUALLY BEEN PERFORMED, for the first time, and the engine is 3.0% BELOW the oracle.
+This is a real discrepancy and not an input artifact.
+
+THE LEADING SUSPECT, and it is a specific one that has never been gated: dequant_q6_K.  The engine's dense ffn_down
+comes from raw_down.bin's 210-byte blocks, dequantized by dequant_q6_K - transcribed this session, explicitly recorded
+as UNWIRED until now, and reaching real tensor data for the FIRST TIME in this very run.  Its sibling dequant_q5_K is
+gated bit-exact against the oracle's own dequantization over 33,554,432 elements; Q6_K has never been compared to
+anything.  A subtly wrong Q6_K would leave the gate/up path exact, perturb ffn_down, and land as a few percent at
+l_out - exactly the shape of what is measured.  The next gate is therefore q6k_parity: dequantize
+blk.0.ffn_down.weight's raw blocks and compare against the oracle's own dequantization of the same tensor, the way
+q5k_parity does it and NOT by comparing the implementation against itself.
