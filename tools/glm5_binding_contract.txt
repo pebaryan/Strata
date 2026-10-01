@@ -1650,3 +1650,29 @@ STATE AT HANDOFF, all committed on glm5next-port: stage 1 PASS; KDA gate PASS at
 binding 16 PASS 0 FAIL 0 QUANTIZED; Q5_K parity BIT-EXACT over 33,554,432 elements; dequant root cause fixed
 (guard {8,13}, hard error for anything else).  Artifacts: glm5_bind_check, kda_gate, kda_binding_check.py,
 q5k_parity, fixtures glm5-kda-l0-t1 / glm5-kda-l0-t5 / glm5-q5k-parity.  Nothing is half-built.
+
+STEP 4 IS REDUNDANT - CHECKED BEFORE DOING IT, AND IT CHANGES THE PLAN
+
+Step 4 was "run kda_gate on the engine's bound weights instead of the fixture files".  Before writing the export, the
+obvious question: what would that compare?  The fixture files ARE the oracle's values, and the binding check has
+already shown the engine's bound values equal the oracle's for all sixteen tensors (16 PASS, 0 FAIL, every rel
+between 4e-11 and 1.3e-08).  So kda_gate fed the engine's weights would be handed numbers identical to the ones it
+already passes on, and its PASS is determined in advance.  The gate would not be measuring composition; it would be
+measuring nothing.
+
+Worth naming why the plan got this far without noticing: each step was specified while looking at the step before
+it, and nobody asked what step 4 could possibly FAIL on.  A gate whose failure modes cannot be enumerated is not a
+gate.  The same question applied earlier would have caught it.
+
+THE REAL NEXT STEP IS THE CHAIN, NOT THE BINDING.  The KDA stage is verified in both halves - kernel (gate PASS at
+T=1 and T=5, Q5_K dequant bit-exact) and binding (16/16) - so the port moves on:
+
+    hc_post   src/kernels/glm_hc.cpp:112   void hc_post(const float* site_out, const float* residual,
+                                                      const HcMix& mix, int n_embd, float* out, ...)
+              tools/glm5_hc_reference.py:127   def hc_post(cur, residual, post, comb)
+
+hc_post is the mirror of the stage-1 front end and needs NO WEIGHTS - only the site's output, the residual and the
+HcMix that hc_pre already produces (which the stage-1 block in the driver already computes).  So it is gateable
+today, host-side, the same way hc_pre was: run the engine's hc_post and the oracle's on the same inputs and compare.
+That is the next link in the block chain, and after it the ffn stage (leading dense below block 3, moe_forward
+above) - which is what stands between this port and a second block in the chain.
