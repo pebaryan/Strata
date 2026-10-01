@@ -138,22 +138,26 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
                 const double d = dec[(size_t) i];
                 for (int j = 0; j < hd; ++j) S_h[(size_t) i * hd + j] *= d;
             }
-            // delta[i] = (v[i] - sum_j S[i][j]*k[j]) * beta
-            for (int i = 0; i < hd; ++i) {
+            // delta[j] = (v[j] - sum_i S[i][j]*k[i]) * beta, then S[i][j] += k[i]*delta[j], then the read.
+            // The state's FIRST index is the KEY axis - it pairs with k in the prediction and with q in the read
+            // - so these loops sum over i and are indexed by j.  Getting this backwards agrees at the first
+            // token (S = 0, so both conventions collapse to delta*(k.q)) and diverges from the second on, which
+            // is exactly how the parity gate passed on 1 token while failing on 3 and 5.
+            for (int j = 0; j < hd; ++j) {
                 double acc = 0.0;
-                for (int j = 0; j < hd; ++j) acc += S_h[(size_t) i * hd + j] * kn[(size_t) j];
-                delta[(size_t) i] = ((double) vh[i] - acc) * (double) bt;
+                for (int i = 0; i < hd; ++i) acc += S_h[(size_t) i * hd + j] * kn[(size_t) i];
+                delta[(size_t) j] = ((double) vh[j] - acc) * (double) bt;
             }
-            // S[i][j] += delta[i] * k[j]
+            // S[i][j] += k[i] * delta[j]
             for (int i = 0; i < hd; ++i) {
-                const double d = delta[(size_t) i];
-                for (int j = 0; j < hd; ++j) S_h[(size_t) i * hd + j] += d * kn[(size_t) j];
+                const double kv = kn[(size_t) i];
+                for (int j = 0; j < hd; ++j) S_h[(size_t) i * hd + j] += kv * delta[(size_t) j];
             }
-            // attn[i] = (sum_j S[i][j]*q[j]) * scale, read after the update
-            for (int i = 0; i < hd; ++i) {
+            // attn[j] = (sum_i S[i][j]*q[i]) * scale, read AFTER the update
+            for (int j = 0; j < hd; ++j) {
                 double acc = 0.0;
-                for (int j = 0; j < hd; ++j) acc += S_h[(size_t) i * hd + j] * qn[(size_t) j];
-                attn[((size_t) t * nh + h) * hd + i] = (float) (acc * scale);
+                for (int i = 0; i < hd; ++i) acc += S_h[(size_t) i * hd + j] * qn[(size_t) i];
+                attn[((size_t) t * nh + h) * hd + j] = (float) (acc * scale);
             }
         }
     }
