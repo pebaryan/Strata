@@ -3942,3 +3942,51 @@ One caveat to carry into that: the reference dump's own hc_init and the oracle's
 and the dump's per-stage tensors were written by the reference dumper (ne0-fastest, correct) - so the bisection can
 use the dump's stages directly, but its INPUT must be the oracle's hc_init, not the dump's, until the two are shown
 identical elementwise rather than merely equal in rms.  That is the same trap, and it is avoidable by construction now.
+
+THE 3% IS SOLVED: THE KDA WAS BEING NORMALISED TWICE.  BLOCK 0 NOW MATCHES THE ORACLE TO THE FP32 FLOOR.
+
+    before the fix:  engine l_out rms 0.0058151   worst absolute difference 0.0121951   ratio 0.969575
+    after  the fix:  engine l_out rms 0.00595305  worst absolute difference 7.35745e-08  ratio 0.992576
+
+THE WORST ELEMENTWISE DIFFERENCE FELL BY 165,000x - from 1.2e-2 to 7.4e-8, which against an rms of ~0.006 is a relative
+error of 1.2e-5, i.e. the fp32 noise floor this port already measured (1.480e-05 on the block-1 FFN gate).  Block 0 now
+agrees with the oracle to the precision of the arithmetic, and the 3% was never an approximation: it was a bug.
+
+THE BUG, in my own assembly and in one line of glm_trunk_forward:
+
+    src/kernels/glm_kda.cpp:58   `xn[t*ne+i] = xt[i] * inv * w.attn_norm[i]`
+        -> the KDA kernel norms its own input internally with attn_norm
+    glm5_full_run.py:105,122     `cur_raw = cur  # pre-norm residual`  then  `kda_block(kw, cur_raw.T, ...)`
+        -> and the oracle's runner therefore hands it the PRE-norm residual, using `cur = rms_norm(cur, attn_norm)`
+           only for MLA
+    glm_trunk.cpp (mine)         `glm_stage_hc_norm(cur, ..., w.attn_norm, xn.data(), ...)` and then `glm_stage_kda(xn)`
+        -> so the KDA received an ALREADY-normed tensor and normalised it a second time
+
+The fix is `is_mla ? w.attn_norm : nullptr`: the site norm is applied for MLA, and for KDA the norm weight is left to
+the kernel that insists on doing it itself.
+
+WHY NO EXISTING GATE COULD HAVE CAUGHT IT, and this is the lesson worth keeping:
+
+  * the KDA's own gate passes 12/12 at ~1e-6 because ITS FIXTURE FEEDS IT A RAW INPUT - the oracle's own writer
+    produced that fixture, and the oracle feeds a raw input, so the fixture and the kernel agreed with each other
+    while the assembly around them did not;
+  * every other stage was likewise correct in isolation: hc_pre to 7 digits, hc_post to 2.6e-7, the dense FFN at the
+    fp32 floor, both dequantizers bit-exact.  A test that verifies a part cannot see a wiring error;
+  * it took an assembly test - the trunk loop run end to end on real weights and compared against the oracle - to
+    reduce the error to one line.  And it took finding the writer bug first, because until the input files were
+    ne0-fastest on both sides the comparison could not distinguish this from a dozen other explanations.
+
+IT ALSO RETIRES THE OLD 0.08% STORY AND THE "DUMP IS THE OUTLIER" STORY, both of which were explanations of symptoms
+of this bug.  The dump never was the outlier in a way that mattered: what was wrong was the wiring, and every
+intermediate number that looked slightly off was downstream of a KDA fed the wrong input.
+
+ONE REPORTING ARTIFACT TO NOTE so the next reader is not misled: the printed ratio (0.992576) is NOT a 0.7% error.
+trunk_gate computes the engine's rms over the token slice it ran (16,384 floats) while it computes the dump's rms over
+the whole file (81,920 floats, five tokens), so the two rms values have different denominators.  The elementwise
+comparison is computed over the common extent and is the meaningful number.  That should be fixed in the tool - rms
+over the same extent as the comparison - because a reader who trusts the ratio over the worst-difference would draw
+exactly the wrong conclusion.
+
+STATE: the trunk loop executes end to end and block 0 matches the oracle to the fp32 floor.  What remains is the pack
+provider for the routed blocks, all 45 blocks with KDA states and MLA caches, the head, and the token gate
+argmax == 12089.

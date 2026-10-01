@@ -80,8 +80,16 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
         }
 
         // ---- the attention site ----
-        if (!glm_stage_hc_norm(cur, ne, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, w.attn_norm, xn.data(),
-                               &mix_a[0], hc_rms_eps, stream, err)) {
+        //
+        // THE NORM IS APPLIED HERE ONLY FOR MLA.  The KDA kernel norms its own input internally with w.attn_norm
+        // (src/kernels/glm_kda.cpp:58 does `xn = x * inv * attn_norm[i]`), and the oracle's runner hands kda_block the
+        // PRE-norm residual for exactly that reason - its own line reads `cur_raw = cur  # pre-norm residual` and then
+        // `kda_block(kw, cur_raw.T, ...)`, while `cur = rms_norm(cur, attn_norm)` is used only for MLA.  Passing the
+        // normed value here as well normalised the KDA's input TWICE, which is invisible to the KDA's own gate - that
+        // fixture feeds it a raw input, as the oracle does - and to every other stage gate, because each of them is
+        // correct in isolation.  It is exactly the class of mistake only an assembly test can find.
+        if (!glm_stage_hc_norm(cur, ne, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, is_mla ? w.attn_norm : nullptr,
+                               xn.data(), &mix_a[0], hc_rms_eps, stream, err)) {
             err = "glm_trunk_forward: layer " + std::to_string(layer) + " attention site: " + err;
             return false;
         }
