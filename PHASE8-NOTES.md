@@ -346,3 +346,32 @@ with the same xn and no dt_bias, since a 12% error there needs its own explanati
 Method note worth keeping: part 9 was written from a grep hit in the wrong code path and disproved by one
 cheap measurement.  Read the table that the path under test actually uses, and measure the artifact before
 blaming a declaration.
+
+## Part 11: the artifact's KDA matrices are Q8_0, and the pack stores them TRANSPOSED
+
+The index's field 9 is the ggml type and field 11 the block size:
+
+    blk.0.ssm_a           type 0 (F32), block 1        <- and byte-identical to the GGUF
+    blk.0.ssm_dt.bias     type 0 (F32), block 1        <- likewise
+    blk.0.ssm_beta.weight type 8 (Q8_0), block 32      listed as (4096, 64)
+    blk.0.ssm_f_a.weight  type 8 (Q8_0), block 32      listed as (4096, 128)
+    blk.0.ssm_f_b.weight  type 8 (Q8_0), block 32      listed as (128, 8192)
+
+Two consequences, and the second is testable immediately:
+
+1. The gate's v = ssm_f_b @ (ssm_f_a @ xn) + dt_bias is the only term in the KDA front end whose weights
+   the port reads QUANTIZED, which is why the error concentrates there: g 56% at r +0.9856, beta 12%, and
+   everything upstream exact.  (The oracle reads the same tensors dequantized and matches the reference to
+   0.9%, so the values in the artifact are not in question.)
+
+2. The pack's listed shape is the TRANSPOSE of the GGUF's in every case - beta (4096,64) vs the GGUF's
+   (64,4096), f_a (4096,128) vs (128,4096), f_b (128,8192) vs (8192,128).  That is consistent with the
+   port's matvec contract `matvec(W, x, y, out, in)` (f_a as out=hd/in=ne wants (ne, hd) = (4096,128)),
+   so the transposition is deliberate for the matvec path - BUT the beta access in glm_kda.cpp is
+   `b_row = ssm_beta + h * ne` with `acc += b_row[c] * xt[c]`, which requires (nh, ne) with ne contiguous
+   - the GGUF's orientation, NOT the pack's.  Read in the pack's (ne, nh) layout that walks columns, which
+   is a wrong-weights read, and beta is precisely the output that is wrong with no other explanation yet.
+
+Next, in order: (a) confirm how the port's loader dequantizes and transposes the Q8_0 KDA matrices, block
+order included, against the GGUF; (b) fix the beta access to match whatever orientation the loader
+actually produces, rather than the one the kernel was written against.
