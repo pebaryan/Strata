@@ -135,10 +135,10 @@ def kda_block(w: dict, x: np.ndarray, tokens: int, want_state: bool = False):
     attn = np.zeros((T, NH, HD), dtype=np.float64)
     for t in range(T):
         S *= np.exp(g[t])[:, :, None]                       # S[i][:] *= exp(g[i])   (index i, the first)
-        pred = np.einsum("hij,hj->hi", S, k[t])             # sum_j S[i][j] k[j]
+        pred = np.einsum("hij,hi->hj", S, k[t]) # sum_i S[i][j] k[i], indexed by the value axis             # sum_j S[i][j] k[j]
         delta = (v[t] - pred) * beta[t][:, None]            # (nh, hd)
-        S += np.einsum("hi,hj->hij", delta, k[t])           # S[i][j] += delta[i] * k[j]
-        attn[t] = np.einsum("hij,hj->hi", S, q[t]) * scale  # read AFTER the update
+        S += np.einsum("hi,hj->hij", k[t], delta) # S[i][j] += k[i] * delta[j]           # S[i][j] += delta[i] * k[j]
+        attn[t] = np.einsum("hij,hi->hj", S, q[t]) * scale  # read AFTER the update, contract the key axis
 
     # the norm is over ne0 = head_dim, i.e. WITHIN each head over its 128 channels, with a 128-entry gain
     o = rms_norm(attn.reshape(T, NH, HD), w["o_norm"], axis=-1).reshape(T, D_INNER)

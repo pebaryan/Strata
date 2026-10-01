@@ -476,3 +476,38 @@ inputs come from the implementation cannot detect a wrong implementation.
 
 Verification after the fix: attn_output-0 must drop from r +0.5267 (2.187e-02 on a 0.0243 scale) to
 agreement, and l_out-0 must follow.  That is the test; nothing less counts.
+
+## Part 15: PART 14 IS WRONG - the axis swap is equivalent.  And the reference names attn_output elsewhere
+
+Part 14 claimed the recurrence contracts the wrong axes and that this was the bug.  Applied and measured:
+
+    kda_gate-0     4.373e-02   r +1.0000   unchanged (correct, as before)
+    kda_beta-0     6.887e-04   r +1.0000   unchanged
+    attn_output-0  2.201e-02   r +0.5207   was 2.187e-02 r +0.5267  -> NO CHANGE
+    l_out-0        6.881e-02   r +0.4134   was 6.960e-02 r +0.4130  -> NO CHANGE
+
+So the two index conventions produce the same recurrence and the swap is a relabeling after all.  Part 14
+is retracted; the source-reading was careful but the conclusion was wrong, and one run settled it.
+
+Two things follow, and the second is the real lead:
+
+1. tools/glm5_kda_reference.py now has an inconsistency to resolve: line 213 still contracts the old way
+   (`einsum("hij,hj->hi", S0, kk)`) in whatever helper that is.  Either make it consistent or establish that
+   it is a genuinely different operator.  Left alone deliberately rather than blind-patched.
+
+2. The bug for attn_output-0 is NOT in the recurrence's indexing.  Since the recurrence is validated by a
+   dump we cannot see inside, the next thing to question is the COMPARISON ITSELF: attn_output-0 is
+   assumed (asserted in glm5_block_driver.py's docstring, which is our annotation, not evidence) to be the
+   pre-norm, pre-wo recurrence output.  If llama.cpp attaches the name "attn_output-%d" AFTER the gated
+   RMS norm or after wo, then we have been comparing a recurrence output against a post-processed tensor -
+   which would produce exactly this signature: the right magnitude, a partial correlation, and complete
+   insensitivity to changes in the recurrence.
+
+   Check the naming site in llama.cpp's graph construction for the kda path (llama-graph.cpp / the model's
+   build functions) and see which tensor `cb(..., "attn_output-%d")` actually names, and in what order
+   relative to the gated norm (ssm_norm / the sigmoid gate) and wo.
+
+Also worth stating plainly: this is the fourth hypothesis this phase that measurement killed.  The lesson is
+not "read more source" but "before comparing two tensors, establish by construction that they are the same
+quantity" - the guard that worked for rms_norm and for the gate, and the one nobody has run for
+attn_output-0.
