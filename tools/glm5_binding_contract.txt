@@ -5560,3 +5560,31 @@ A NOTE ON WHY THE FIRST TOKEN DID NOT FAIL AT LAYER 0 TOO: it did not need to.  
 until layer 1 frees its buffers; the aliasing is only visible through a pointer that is read AFTER the free, and the
 first read of a stale pointer in this run happens to be a KDA field of a later layer.  The differential printed layers 0
 and 4 in the SAME pass, which is what made the recycling visible.
+
+THE ARGUMENT IS NAMED: `state`, AND THE TWO WAYS IT CAN BE NULL
+
+    trunk failed at token 0: glm_trunk_forward: layer 4 KDA:
+        glm_stage_kda: null argument: state (the recurrent S, from kda_state[slot])
+
+glm_stage_kda checks exactly three pointers - `xn`, `out`, `state` - and the message now says which.  It is `state`, the
+recurrent S matrix, which the trunk takes from `state.kda_state[slot]`.
+
+THIS IS THE PAYOFF OF A ONE-LINE CHANGE AND IT IS WORTH RECORDING AS A HABIT: the previous message listed all three
+candidates, and I spent a differential and a run instrumenting KdaWeights - a REFERENCE, which cannot be null when it
+refers to a valid object, and so was never a candidate at all.  A refusal that NAMES its argument would have saved that
+round, the same way the trunk's own "layer N <stage>: <reason>" saved two rounds before it.
+
+TWO WAYS `state` CAN BE NULL, and they are distinguishable by one more two-line diagnostic rather than by reasoning:
+
+  a) THE SLOT IS -1, so `state.kda_state[-1]` reads one pointer BEFORE the array - undefined behaviour that returns
+     whatever is there, and NULL is a perfectly ordinary thing to find.  The trunk computes `slot = state.kda_index ?
+     state.kda_index[layer] : -1`, and the runner sets `kda_index[b] = -1` for layers where glm_attention_is_mla(b) == 1
+     and `kda_index[b] = n_kda++` otherwise.  If the runner and the trunk ever disagree about which layers are MLA, this
+     is what it looks like - and it looks exactly like a null argument rather than like an indexing bug.
+  b) `kda_ptrs[slot]` IS GENUINELY NULL - the buffer was never allocated or never assigned into the array the trunk was
+     handed.
+
+NEXT, and it is two lines: print `kda_index[4]`, the slot the trunk will use, and `kda_ptrs[slot]` for layers 0 and 4 -
+so (a) and (b) separate themselves.  Note that the differential instrumented KdaWeights for layer 0 and 4 and found the
+impossible relationship recorded above - four device pointers shared between two layers - and that finding still stands
+and is still unexplained; it is a SECOND defect, not this one, and the two must not be conflated.

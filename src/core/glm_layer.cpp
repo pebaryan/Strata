@@ -52,10 +52,13 @@ bool glm_stage_hc_norm(const float* x, int n_embd, const float* hc_fn, const flo
 /// are all T=1 or a fresh T=5, so nothing here carries state across calls yet; a real sequential decode would.
 bool glm_stage_kda(const float* xn, const kernels::glm::KdaWeights& w, const kernels::glm::KdaGeometry& g,
                    int tokens, float* out, float* state, std::string& err) {
-    if (!xn || !out || !state) {
-        err = "glm_stage_kda: null argument";
-        return false;
-    }
+    // NAMED, one per branch, because "null argument" cost a run and a differential over the WRONG struct: the message
+    // listed three candidates and the diagnostic I wrote instrumented KdaWeights, which is not among them (it is a
+    // reference, and a bad reference to a valid object is not null).  A refusal that names the argument is worth more
+    // than one that lists the possibilities.
+    if (!xn) { err = "glm_stage_kda: null argument: xn (the site input)"; return false; }
+    if (!out) { err = "glm_stage_kda: null argument: out (the site output buffer)"; return false; }
+    if (!state) { err = "glm_stage_kda: null argument: state (the recurrent S, from kda_state[slot])"; return false; }
     if (tokens <= 0 || g.n_embd <= 0) {
         err = "glm_stage_kda: tokens and n_embd must be positive";
         return false;
