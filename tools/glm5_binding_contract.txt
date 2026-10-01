@@ -3663,3 +3663,46 @@ everything is worse than no gate, because it produces confidence.
 
 Also corrected in the same pass: I had written `strata::core::kernels::glm::` for the weight structs, but the
 namespace is `strata::kernels::glm::` - caught by the compiler, which is the fifth guessed identifier this session.
+
+THE FIRST EXECUTION OF glm_trunk_forward IS FEASIBLE WITHOUT THE PACK - the recipe, measured
+
+Measured just now: /home/peb/moredata/glm5-ffn-l0 holds ONLY raw quantized blobs -
+    raw_gate.bin 34,603,008 B   raw_up.bin 34,603,008 B   raw_down.bin 41,287,680 B
+plus input.bin / result.bin / engine_output.bin, each 16,384 B (4096 floats).  There are NO float dense matrices on
+disk.  And tools/ffn_gate.cpp shows how that is not an obstacle: it dequantizes the raw blobs itself -
+
+    dequant_file(dir + "/raw_gate.bin", 176, ff * n_embd, wg);     // 176-byte blocks -> Q5_K
+    dequant_file(dir + "/raw_up.bin",   176, ff * n_embd, wu);
+                                            // raw_down.bin is 210-byte blocks -> Q6_K
+    if (block_bytes == 176)      dequant_q5_K(...);
+    else if (block_bytes == 210) dequant_q6_K(...);
+
+so a trunk gate for ONE layer can build every weight layer 0 needs with no pack, no arena, no expert source:
+
+    hc_attn_*, attn_norm, hc_ffn_*, ffn_norm    <- glm5-block-l0/*.bin (float, already verified loadable)
+    the sixteen KDA tensors                     <- glm5-kda-l0-t1/w_*.bin (float, the binding check's own fixture)
+    ffn_gate / ffn_up / ffn_down                <- DEQUANTIZED from glm5-ffn-l0/raw_{gate,up,down}.bin
+
+and drive it with the provider this session just wrote and just gated:
+
+    glm_trunk_forward(x, 1, provider_from_fixtures, ctx, kda_g, mla_g, 1e-5f, state, l_out, nullptr, err)
+
+with x = the four HC streams of token 0.
+
+TWO THINGS THAT MAKE IT WORTH DOING rather than merely possible:
+
+  * it is the FIRST EXECUTION of the trunk loop - the assembly of hc_pre, attn_norm, KDA, hc_post, hc_pre, ffn_norm,
+    the dense FFN and hc_post in the order the dump's stage names give.  Every one of those stages has passed its own
+    gate; none has ever run in sequence;
+  * it exercises dequant_q6_K on real tensor data.  dequant_q5_K is gated bit-exact against the oracle's own
+    dequantization over 33,554,432 elements, but Q6_K was transcribed and is only reached through this path - so a
+    first trunk run is also the first time the transcribed Q6_K touches blk.0.ffn_down.weight, which is exactly
+    41,287,680 bytes = 196,608 blocks x 210 B.
+
+WHAT THE COMPARISON IS, and its honest limit: the dump holds l_out-0, the block's own output, so the gate can compare
+against it - but this file already records that the DUMP IS THE OUTLIER at hc_pre (rms 0.004125 against the engine's
+and the oracle's 0.00412163, about 0.08%), and that the KDA's exponential gate AMPLIFIES exactly that difference.  So
+a l_out-0 comparison must be reported as a measured ratio with that amplification named, not as a tight pass/fail -
+or, better, the expected output should come from the oracle (glm5_hc_reference.py and glm5_kda_reference.py both exist
+and both run on this input already).  A tight tolerance against the dump would produce a FAIL that says nothing about
+the trunk, which is the mistake this file has already made once and retracted.
