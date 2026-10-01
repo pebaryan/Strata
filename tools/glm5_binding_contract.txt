@@ -2865,3 +2865,46 @@ STATE: the fixture is proven, the loop is written and links, and NOTHING HAS RUN
 run plus the per-stage comparison - the driver half of this tool, comparing hc_attn_pre, attn_norm, attn_output,
 hc_attn_post, hc_ffn_pre, ffn_norm, ffn_out and l_out against their dump families, then feeding l_out-0 back in as
 block 1's input.
+
+########  THE REMAINING WORK, SPECIFIED SO THE NEXT STEP IS MECHANICAL  ########
+
+The goal is NOT complete: nothing has run glm_block_forward, and loading being right does not make the loop right.
+block_gate's first half is done and proven (29/29 shape-checked).  What remains is the run and the comparison, and
+it is the only thing between this port and a verified chain.
+
+IN block_gate.cpp, after the loading section passes its checks, build the weights and run:
+
+  (1) GlmBlockWeights w;  fill from the arrays already loaded in the three sections above -
+        from the block dir:  hc_attn_fn, hc_attn_base, hc_attn_scale, attn_norm,
+                             hc_ffn_fn, hc_ffn_base, hc_ffn_scale, ffn_norm
+        from the KDA dir:    the sixteen arrays into a KdaWeights (that struct's fields are declared at
+                             include/strata/kernels/glm_kda.hpp:40 - READ THEM, do not infer the names: this session
+                             lost four rounds to guessed identifiers);
+        from the FFN dir:    three matrix buffers, filled by dequantizing raw_gate/raw_up with dequant_q5_K and
+                             raw_down with dequant_q6_K - exactly what tools/ffn_gate.cpp already does, so copy that
+                             call pattern rather than inventing one;
+        geometry:            KdaGeometry g (defaults are correct for this model); MoeGeometry fg with ff = 12288 for
+                             the leading dense block, w_scale/norm_w untouched, and clamp_limit = 10.0 (shexp);
+        plus:                kda = &kw, kda_geom = &g, ffn_geom = &fg.
+  (2) buffers: x from the loaded x.bin (HC x n_embd = 16,384 floats), l_out HC x n_embd, and a state of
+      nh*hd*hd = 64*128*128 = 1,048,576 floats ZEROED - the recurrence is sequential, so it must start at zero.
+  (3) call glm_block_forward(x, 1, w, 1e-5f, l_out, state, nullptr, err) and report err if it returns false.
+  (4) compare: the loop's intermediates are internal, so for a first run compare what it returns - l_out - against
+      the dump's l_out-0, and ALSO check the shape: l_out should be ne=4 streams x 4096.  Then, to localise any
+      disagreement rather than only detecting it, drive the four stages directly in the same order and compare each
+      against its dump family: hc_attn_pre-N (from hc_norm with norm_w=nullptr), attn_norm-N (with norm_w), then
+      attn_output-N after the KDA call, then hc_attn_post-N, then hc_ffn_pre-N, ffn_norm-N, ffn_out-N, l_out-N.
+      Every one of those has an expected value on disk.
+  (5) after block 0 passes, feed l_out-0 back as block 1's input and repeat with block 1's weights - the check this
+      whole session has been building toward, because it tests the block against the REAL hidden state rather than
+      against a seed the loop was given.
+
+READ THE STRUCT FIELDS BEFORE WRITING THEM.  Every identifier in this port has a declared name that is not always
+the intuitive one: kda uses nh / hd / d_inner() (not n_heads / head_dim / d_inner), the fixture names two arrays
+dt_bias and o_norm, and hc_*_fn is 4096 x 96 rather than 4096 x 24.  Guessing cost six compiler errors and four
+failed edits this session; grep -A14 'struct <Name>' costs one command.
+
+EXPECT THE FIRST RUN TO DISAGREE SOMEWHERE.  The loop has never executed, and the likely places are the residual
+routing at the two hc_post stages and the shape alternation between [n_embd] and [HC][n_embd] - both are float*, so a
+mistake there compiles and runs and produces wrong numbers rather than an error.  That is exactly why the comparison
+is per stage as well as end to end.
