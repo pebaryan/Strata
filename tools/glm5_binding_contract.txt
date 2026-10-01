@@ -2424,3 +2424,32 @@ WHAT MADE THIS WORK, in the order it mattered:
 TOOLS ADDED: tools/split_raw_fixture.py (raw fixture -> the 29-file layout, with the aggregate size assertion).
 FIXTURES: /home/peb/moredata/glm5-kda-l1-oracle (oracle-produced, block 1, PASS),
 /home/peb/moredata/glm5-kda-l0-t1 (block 0, 12/12 PASS), /home/peb/moredata/glm5-kda-badconv (known-bad, must FAIL).
+
+########  BLOCKS 0, 1 AND 2 ALL PASS 12/12 - EVERY LEADING-DENSE KDA BLOCK IS VERIFIED  ########
+
+    block 1   KDA GATE: PASS   (12/12 now that result.bin exists; the stage list was skipping it by name)
+    block 2   result 2.982e-06  xn 1.009e-07  qc 1.985e-06  kc 1.187e-06  vc 9.338e-07
+              g 7.893e-07  beta 2.675e-07  q 1.373e-06  k 1.198e-06  v 9.338e-07
+              attn 2.145e-06  o 2.243e-06                       KDA GATE: PASS
+
+leading_dense_block_count is 3, so blocks 0, 1 and 2 are the KDA+dense kind and all three now pass every stage the
+gate compares, including the block output.  The next KDA block would be 4, where the block kind changes.
+
+THE PIPELINE IS NOW THREE COMMANDS PER BLOCK and involves no hand-rolled conversion:
+    glm5_kda_reference.py --gguf GGUF --layer N --tokens T --raw-fixture RAW
+    split_raw_fixture.py RAW OUTDIR
+    kda_gate OUTDIR T
+Both split and gate verify their own inputs on the way - the splitter asserts the array sizes consume the file
+exactly, and the gate reports per-stage relative error against the fixture.  That is what makes a third block cheap
+rather than another investigation.
+
+SCOPE, stated precisely so this is not overclaimed.  What is verified: the KDA stage, on the real weights of blocks
+0, 1 and 2, against reference output that is self-consistent by construction, at T=1 (and T=5 for block 0).  What is
+NOT thereby verified: the FFN and hyper-connection stages of blocks 1 and 2 - those are verified for block 0 only -
+and the chain itself, because the gate's inputs come from the oracle's seed rather than from block N-1's output.  A
+passing KDA gate says the kernel handles this block's weights correctly, which is what it is for; it does not say
+the block computes the right answer from the real hidden state.
+
+FIXTURES: glm5-kda-l0-t1 (block 0, 12/12), glm5-kda-l1-oracle (block 1, 12/12), glm5-kda-l2-oracle (block 2, 12/12),
+glm5-kda-l0-t5 (block 0 at T=5), glm5-kda-badconv (known-bad, must FAIL).  Tools: split_raw_fixture.py,
+make_kda_fixture.py (superseded - keep for reference, prefer the oracle's writer).
