@@ -60,6 +60,7 @@ int report(const std::string& name, const std::vector<float>& got, const std::st
 
 int main(int argc, char** argv) {
     const std::string dir = argc > 1 ? argv[1] : "/home/peb/moredata/glm5-kda-l0-t1";
+    const int tokens = argc > 2 ? std::atoi(argv[2]) : 1;
     const int n_embd = 4096, nh = 64, hd = 128, d_conv = 4, d_inner = nh * hd;
 
     strata::kernels::glm::KdaGeometry g;
@@ -97,19 +98,20 @@ int main(int argc, char** argv) {
     w.ssm_g_a = s.ssm_g_a.data(); w.ssm_g_b = s.ssm_g_b.data();
     w.o_norm = s.o_norm.data(); w.wo = s.wo.data();
 
-    const std::vector<float> x = read_bin(dir + "/input.bin", (size_t) n_embd);   // one token
-    std::vector<float> out((size_t) n_embd, 0.f);
+    const size_t tok_nh_hd = (size_t) tokens * nh * hd;
+    const std::vector<float> x = read_bin(dir + "/input.bin", (size_t) tokens * n_embd);
+    std::vector<float> out((size_t) tokens * n_embd, 0.f);
     std::vector<float> state((size_t) nh * hd * hd, 0.f);                         // fresh state: the S matrix
 
-    std::vector<float> mg((size_t) nh * hd), mbeta((size_t) nh), mq((size_t) nh * hd), mk((size_t) nh * hd),
-                       mv((size_t) nh * hd), mattn((size_t) nh * hd), mo((size_t) d_inner);
+    std::vector<float> mg(tok_nh_hd), mbeta((size_t) tokens * nh), mq(tok_nh_hd), mk(tok_nh_hd),
+                       mv(tok_nh_hd), mattn(tok_nh_hd), mo((size_t) tokens * d_inner);
     strata::kernels::glm::KdaIntermediates mid;
     mid.g = mg.data(); mid.beta = mbeta.data(); mid.q = mq.data(); mid.k = mk.data();
     mid.v = mv.data(); mid.attn = mattn.data(); mid.o = mo.data();
 
-    strata::kernels::glm::kda_forward(w, g, x.data(), /*tokens=*/1, out.data(), state.data(), &mid);
+    strata::kernels::glm::kda_forward(w, g, x.data(), tokens, out.data(), state.data(), &mid);
 
-    std::printf("kda gate, block 0, 1 token, weights and input from the oracle's fixture\n");
+    std::printf("kda gate: %s, %d token(s), weights and input from the oracle's fixture\n", dir.c_str(), tokens);
     int failures = 0;
     failures += report("result", out,   dir, "result.bin");
     failures += report("g",      mg,    dir, "inter_g.bin");

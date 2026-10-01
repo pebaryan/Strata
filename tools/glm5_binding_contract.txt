@@ -1216,3 +1216,34 @@ Three things this establishes, and three it does NOT:
 
 NEXT: the T>1 case is the honest next gate - reuse this harness with tokens=2,3,5, dumping the oracle's intermediates
 for each token count, since the recurrence is the one part of KDA that is known to have failed before.
+
+########  KDA GATE PASSES AT T=1 AND T=5 - THE MULTI-TOKEN RECURRENCE IS CLEAN  ########
+
+Same gate, same weights, two token counts, both fixtures built by the phase-6-validated oracle:
+
+    T=1:  result 3.53e-06  g 3.81e-07  beta 2.86e-07  q 2.04e-06  k 1.46e-06  v 8.84e-07  attn 1.75e-06  o 1.90e-06
+    T=5:  result 3.57e-06  g 5.80e-07  beta 3.71e-07  q 1.84e-06  k 2.03e-06  v 1.34e-06  attn 2.94e-06  o 3.03e-06
+    KDA GATE: PASS (both)
+
+attn at T=5 is the number that matters: phase 8 measured that same stage at 3.71e-01 of scale and recorded it as a
+multi-token recurrence bug.  It is now 2.94e-06.
+
+WHAT THAT DOES AND DOES NOT MEAN - stated carefully, because the tempting reading is wrong:
+
+  * The honest reading is that the kernel's recurrence was never the culprit at T>1.  This gate feeds kda_forward
+    the oracle's own weights through plain host pointers; the phase-8 failure was observed through the port's
+    chain, where the conv tensors and the weight arena were both suspect and both have since changed.  The
+    recurrence itself now agrees with the reference to 3e-06 with nothing else in the loop, so the earlier failure
+    is best explained as wiring rather than arithmetic.
+  * It is NOT evidence that the T>1 defect was "fixed" - no specific fix was made to the recurrence, and claiming
+    one would be inventing a history.  What is true is that the stage is now measured clean under controlled
+    inputs.
+  * It does NOT cover the binding.  Every weight here comes from a file written by the oracle, so this is the
+    kernel and never the wiring - the standing rule.  The engine's own binding of these sixteen tensors is still
+    unverified, and attn_q/k/v in particular cannot be bound as floats until a dequantizer exists for the 22-byte
+    type they use.
+
+STATE: stage 1 verified; KDA gate PASS at T=1 and T=5; glm5_bind_check exit 0 on the default path; the widened
+dequant path exits 0 with the native_type == 8 guard in place.  Fixtures: glm5-kda-l0-t1 and glm5-kda-l0-t5, each
+holding input/result/intermediates, with the sixteen w_*.bin files copied into both since the weights are the
+same block.
