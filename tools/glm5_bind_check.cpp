@@ -173,23 +173,17 @@ int main(int argc, char** argv) {
             if (!q) { std::fprintf(stderr, "stage1: %s not bound\n", n); return false; }
             const size_t want = count ? count : (size_t) d0 * (size_t) (d1 > 0 ? d1 : 1);
             dst.resize(want);
-            // Ask CUDA what the pointer IS rather than assuming: the dequantized hc_fn lives in a cudaMalloc
-            // buffer, while the F32 arena weights are host-accessible in this build - a blanket
-            // DeviceToHost copy fails with "invalid argument" on the latter, and blanket memcpy would
-            // segfault on the former.
-            cudaPointerAttributes attr{};
-            const bool is_device = (cudaPointerGetAttributes(&attr, q) == cudaSuccess &&
-                                    attr.type == cudaMemoryTypeDevice);
-            cudaGetLastError();   // clear the "invalid argument" a host pointer raises
-            if (is_device) {
-                if (cudaMemcpy(dst.data(), q, want * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
-                    std::fprintf(stderr, "stage1: copy %s failed: %s\n", n, cudaGetErrorString(cudaGetLastError()));
-                    return false;
-                }
-            } else {
-                std::memcpy(dst.data(), q, want * sizeof(float));
+            // The arena is cudaMalloc'd device memory (this driver allocates it that way), and the
+            // dequantized hc_fn sits in a cudaMalloc buffer too, while the loader's own staging buffers are
+            // cudaHostAlloc'd.  Rather than infer which is which - three earlier attempts did, and both
+            // cudaMemcpyDeviceToHost and plain memcpy were wrong for some tensor - use cudaMemcpyDefault,
+            // which resolves the direction under UVA.
+            const cudaError_t cst = cudaMemcpy(dst.data(), q, want * sizeof(float), cudaMemcpyDefault);
+            if (cst != cudaSuccess) {
+                std::fprintf(stderr, "stage1: copy %s failed: %s\n", n, cudaGetErrorString(cst));
+                return false;
             }
-            std::fprintf(stderr, "  %-22s %s\n", n, is_device ? "device -> host" : "host (used directly)");
+            std::fprintf(stderr, "  %-22s copied %zu floats\n", n, want);
             return true;
         };
         std::vector<float> h_fn, h_base, h_scale, h_norm;

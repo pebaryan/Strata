@@ -257,3 +257,27 @@ weights.  src/core/layer.cpp uses WeightRef::data with sform_of / plane_ptrs, an
 engine's stated convention for "this WeightRef's bytes, as host code may touch them".  Whatever they do -
 managed memory, a host-mapped arena, or a device->host staging step - is what stage 1 must do too.  Do not
 guess between memcpy and DeviceToHost again; three measurements have already ruled out both by trial.
+
+UPDATE - cudaMemcpyDefault also faults, so the question is now narrow:
+
+    hc_attn_fn.weight   -> copied 393216 floats OK   (a cudaMalloc buffer, from the 9ac5c58 dequant)
+    hc_attn_base.weight -> SEGFAULT inside cudaMemcpyDefault, before it can return an error
+
+The probe values from the direct-pointer run looked plausible for both:
+    hc_attn_fn    0x7f8200200000    hc_attn_base  0x7f8cb600c000
+    hc_attn_scale 0x7f8cb600c080    attn_norm     0x7f8cb6004000
+and hc_attn_base is a 96-byte F32 row that IS in dense.bin (pack row: ne=24, type=0, bytes=96), so it is not a
+shape-only row and not a native one.
+
+So the single question to answer - by READING, not by another memcpy variant - is: what does bind_glm_block
+actually store in got.ptr for an F32 tensor, and where does that pointer live?  Candidates, in order of
+likelihood:
+  1. w->data for a pack-resident F32 row is an offset into a HOST staging copy (weights.cpp uses cudaHostAlloc
+     for staging at :202), not the device arena - then the correct read is direct, and the fault came from
+     something else entirely.
+  2. the binding keeps F32 rows pointing into the arena, and the arena in this driver was freed or never
+     mapped for host - then hc_attn_fn succeeding and hc_attn_base faulting would mean the arena pointer and
+     the cudaMalloc'd dequant buffer differ in kind, which cudaPointerGetAttributes should have said out loud.
+
+Either way it is a ten-line read of bind_glm_block's F32 branchplus weights.cpp's mapping logic.  Three
+segfaults have been spent inferring it; the next move is to look.
