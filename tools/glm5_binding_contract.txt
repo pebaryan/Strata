@@ -5235,3 +5235,33 @@ produced "the layout the MLA kernel wants", but that claim was about a path whos
 
 NEXT: gdb for the new site, then compare the fetched attn_k_b/attn_v_b layout against the MLA parity fixture's, which
 is the only verified statement of what mla_forward expects for those two tensors.
+
+THE NEW CRASH SITE: INSIDE mla_forward, WHICH NARROWS IT TO THE TWO FETCHED TENSORS
+
+    #0 strata::kernels::glm::mla_forward(MlaWeights const&, MlaGeometry const&, const float*, int, const float*,
+                                        float*, MlaIntermediates const&)
+    #1 strata::core::glm::glm_stage_mla
+    #2 strata::core::glm::glm_trunk_forward
+    #3 main
+
+So the staging works, blocks 0..2 ran, layer 3 was entered, and the kernel itself faults on one of the weights it was
+handed.  Which one narrows without further tools: hc_pre, rms_norm and kda_forward are all past, the MLA's own weights
+are either in the arena (plain floats, already host-readable), staged by the runner (dequantized to host, and the
+staging reported no failure), or - for exactly two of them - the fetched attn_k_b and attn_v_b, which are the tensors
+this commit's fix changed the provenance of.
+
+THE PRIME SUSPECT IS THEIR EXTENT, and the arithmetic says so.  attn_k_b and attn_v_b are the 3-D MLA tensors
+NativeDense cannot upload; the old branch sized them as
+
+    nbytes = w->ne0 * w->ne1 * 4
+
+which is TWO dimensions' worth of elements at four bytes each.  If these tensors are genuinely 3-D - and glm_bind.hpp's
+own comment says NativeDense skips them because their blocks are not the MLA kernel's layout, without saying the
+tensors are 2-D - then a two-dimensional product is short, and the fact that the OLD path never faulted proves nothing
+because it never ran: the staging refused the tensor before any kernel saw it, which is precisely what the last commit
+noted.  So the fetch has to say what it actually is: the tensor's true rank and element count from the artifact's own
+metadata, then a pointer and a size the MLA kernel's expectation can be checked against.
+
+THE CHECK THAT SETTLES IT, and it needs no guess: the MLA parity fixture is the only verified statement of what
+mla_forward expects for wk_b and wv_b - its own gate matches to 0.000e+00 - so read the fixture's shape for those two
+tensors and compare it against what the fetch now hands over.  That is a comparison of two files, not an experiment.
