@@ -1147,3 +1147,34 @@ inputs it substitutes.
 
 STATE: default path exit 0, stage 1 = -0.359747499 / 0.424176991 / 3.25002776.  The widened path exits 0 with 0
 failures now that the type guard is in place.
+
+KDA GATE FIXTURE, EXPECTED SIDE - READY
+
+Built from the phase-6-validated oracle on the SAME input stage 1 consumes (token 0 of the reference's hc_init,
+carried through the oracle's hc_pre), and saved to /home/peb/moredata/glm5-kda-l0-t1/:
+
+    input.bin   (1, 4096)      the pre-norm hc_pre output, what kda_forward takes
+    result.bin  (1, 4096)      min -0.00368443666  max 0.00369193095  sum -0.120586747
+
+plus every intermediate the oracle exposes, which is what makes this a USABLE gate rather than a pass/fail one -
+each is a staged comparison point matching the phase-8 failure list:
+
+    xn    (1, 4096)       min -0.359747    max  0.424177     <- identical to stage 1's verified output
+    qc    (1, 8192)       min -0.0865774   max  0.0200543    conv q, pre-L2
+    kc    (1, 8192)       min -0.0104094   max  0.0993052
+    vc    (1, 8192)       min -0.0139548   max  0.0347515
+    g     (1, 64, 128)    min -4.383       max -4.701e-05    the gate, before exp
+    beta  (1, 64)         min  0.41576     max  0.625428
+    q     (1, 64, 128)    min -0.958223    max  0.783057     after l2_norm
+    k     (1, 64, 128)    min -0.631265    max  0.997239
+    v     (1, 64, 128)    min -0.0139548   max  0.0347515
+    attn  (1, 64, 128)    min -0.000196751 max  0.000282776  the recurrence output
+    o     (1, 8192)       min -0.00430178  max  0.00552851
+    (one intermediate is None - a state-related key the oracle does not populate for want_state=False)
+
+xn matching stage 1's number exactly is the useful cross-check: the KDA gate's input is stage 1's verified output,
+so a failure at the first comparison point (qc) would be a conv/weight issue, not a chain-wiring one.
+
+WHAT REMAINS: the driver side - read wq/wk/wv from a fixture file as floats, take the other eleven KDA weights from
+the engine's own binding, call kda_forward on input.bin, and compare stage by stage against these files. F32
+attention weights are needed only because the engine has no dequantizer for the 22-byte type those three use.
