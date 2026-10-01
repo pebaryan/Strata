@@ -2002,3 +2002,41 @@ BLOCK 0 OF GLM-5.3 IS NOW VERIFIED END TO END - attention and FFN, and both hype
     hc_post  residual combination       2.551e-07 of rms
 Seven gates, all passing, all committed.  The chain can now move to block 1 - and the dump carries activations for
 every one of the 45 blocks.
+
+########  THE KDA FIXTURE BUILDER: WEIGHTS VERIFIED EXACT, INPUT SOURCE UNRESOLVED AND NOT BLOCKING  ########
+
+tools/make_kda_fixture.py <block> <outdir> [tokens] now builds a KDA gate fixture for any block.  It is a saved
+tool because block 0's was built inline, and reconstructing a recipe from memory is how this port lost time twice.
+
+WHAT IS VERIFIED: the weight path is EXACT.  Run against block 0, all 16 w_*.bin files match the working fixture
+with worst relative difference 0.000e+00 - including the three conv tensors, which required the repack the engine
+documents in src/core/glm_bind.cpp ("from the artifact's (d_inner, 1, d_conv) to (d_conv, d_inner)", i.e.
+reshape(d_inner, d_conv).T).  Three artifact names also had to be corrected against the artifact rather than guessed:
+ssm_a (no .weight suffix), ssm_dt.bias (not dt_bias.weight), and ssm_norm.weight (the oracle calls it o_norm).
+
+The repack is the one that mattered.  Without it the conv weights come out permuted, which min/max cannot see - the
+fixture and a raw dump share the range [-0.398438, 0.210938] exactly while their elements differ - and
+kda_binding_check.py already warns it cannot detect "a permutation inside ssm_conv1d_*.weight".  Had this reached a
+gate, it would have looked like a KDA kernel failure in a kernel that passes 8/8 stages at two token counts.
+
+WHAT IS NOT RESOLVED: the fixture's INPUT.  Two independent pieces of evidence disagree, and both are recorded
+rather than one being chosen:
+  * the working block-0 fixture's input has min -0.0162118 / max 0.0226507, which are the VERIFIED hc_pre layer_in
+    values for block 0 - so it looks like layer_in;
+  * but the same file is NOT parallel to the fixture's own inter_xn: input/(xn * attn_norm) comes out with mean
+    0.513 and std 4.9e-02 rather than a constant, and xn = rms_norm(input)*attn_norm forces those to be parallel.
+    So the fixture's input.bin and its activations are not consistently related to each other.
+
+No candidate reproduces it: hc_pre's layer_in token 0 and hc_attn_pre-0 row 0 both sit at relative distance 1.12
+from it.
+
+WHY THIS DOES NOT BLOCK ANYTHING: a gate requires the SAME input on both sides, not the TRUE input.  The builder
+writes input.bin and then hands that same array to the oracle, so every fixture it produces is self-consistent, and
+kda_gate compares the engine against the oracle on it.  The unresolved question is only whether the block-0 fixture
+was built from the real chain input, which affects realism, not validity.  For blocks after 0 the input is
+hc_attn_pre-<block>, a real per-block activation - and it is explicitly NOT the chain's true input, because that is
+block N-1's output and needs the chain to run.
+
+THE TEST THAT SETTLES IT: build a block-1 fixture and run kda_gate on it.  If the engine matches the oracle there,
+the builder is good enough for its purpose regardless of block 0's provenance.  That is the next action, and it is
+cheaper than another round of archaeology on a file whose only job is to be the same on both sides.
