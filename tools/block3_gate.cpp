@@ -25,6 +25,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -101,6 +102,19 @@ void add(strata::core::GlmBoundBlock& b, const char* name, std::vector<float>& v
     t.ne0 = (int) v.size();
     t.ne1 = 1;
     b.tensors.push_back(t);
+}
+
+/// Collects the loop's stage reports for the LAST token run.  Each call with the same name overwrites, so after the
+/// token sequence the map holds exactly the stages of the token the comparison is about.
+struct Stages {
+    std::map<std::string, std::vector<float> > by_name;
+};
+
+void stage_cb(void* ctx, int layer, const char* name, const float* data, int n) {
+    Stages* st = (Stages*) ctx;
+    if (layer != LAYER) return;
+    std::vector<float>& v = st->by_name[name];
+    v.assign(data, data + (size_t) n);
 }
 
 struct Ctx {
@@ -271,15 +285,65 @@ int main(int argc, char** argv) {
     st.kda_index = mla_index;   // never consulted for an MLA layer
     st.mla_index = mla_index;
 
+    Stages stages;
     std::vector<float> out((size_t) HC * N_EMBD, 0.0f);
     for (int t = 0; t < tokens; ++t) {
         const float* x = x_all.data() + (size_t) t * N_EMBD * HC;
         if (!strata::core::glm::glm_trunk_forward(x, 1, provider, &ctx, ctx.kda_g, ctx.mla_g, 1e-5f, st, out.data(),
-                                                  nullptr, err, LAYER)) {
+                                                  nullptr, err, LAYER, &stage_cb, &stages)) {
             std::printf("BLOCK3 GATE: FAIL - the loop returned false at token %d: %s\n", t, err.c_str());
             return 1;
         }
         std::printf("    token %d done; MLA cache now holds %d latent(s)\n", t, mla_len[0]);
+    }
+
+    // ---- the bisection: which half of the block is wrong?
+    //
+    // The oracle's stages come from the SAME runner that produces the token gate, so comparing against them is not
+    // circular.  Each file holds every token; the token axis is ne[2] when it is not 1 (the hc stages, one block of
+    // streams per token) and ne[1] otherwise (the attention and FFN stages, one row per token) - the same container
+    // rule the dump format uses, applied to pick THIS token out of it.
+    if (argc >= 5 && !stages.by_name.empty()) {
+        const std::string sd = argv[4];
+        const char* names[] = {"attn_output", "hc_attn_post", "ffn_norm", "ffn_out"};
+        std::printf("  --- stage-by-stage, token %d ---\n", tokens - 1);
+        for (size_t k = 0; k < sizeof(names) / sizeof(names[0]); ++k) {
+            std::map<std::string, std::vector<float> >::const_iterator it = stages.by_name.find(names[k]);
+            if (it == stages.by_name.end()) {
+                std::printf("    %-13s the loop reported no such stage\n", names[k]);
+                continue;
+            }
+            const std::vector<float>& got = it->second;
+            std::vector<float> file;
+            int ne[4] = {0, 0, 0, 0};
+            const std::string path = sd + "/" + names[k] + "-" + std::to_string(LAYER) + ".bin";
+            if (!read_dump(path, file, ne, names[k])) {
+                std::printf("    %-13s no reference\n", names[k]);
+                continue;
+            }
+            size_t off = 0, len = 0;
+            if (ne[2] == 1) {
+                off = (size_t) ne[0] * (size_t) (tokens - 1);
+                len = (size_t) ne[0];
+            } else {
+                off = (size_t) ne[0] * (size_t) ne[1] * (size_t) (tokens - 1);
+                len = (size_t) ne[0] * (size_t) ne[1];
+            }
+            if (len != got.size() || off + len > file.size()) {
+                std::printf("    %-13s extent mismatch: engine %zu, reference slice %zu (file %zu)\n", names[k],
+                            got.size(), len, file.size());
+                continue;
+            }
+            double worst_s = 0.0, ss = 0.0, ws = 0.0;
+            for (size_t j = 0; j < len; ++j) {
+                worst_s = std::max(worst_s, std::fabs((double) got[j] - (double) file[off + j]));
+                ss += (double) got[j] * got[j];
+                ws += (double) file[off + j] * file[off + j];
+            }
+            const double gr = std::sqrt(ss / (double) len), wr2 = std::sqrt(ws / (double) len);
+            std::printf("    %-13s engine rms %.6g  oracle rms %.6g  worst %.6g  = %.4g of rms\n", names[k], gr,
+                        wr2, worst_s, worst_s / (wr2 > 0.0 ? wr2 : 1.0));
+        }
     }
 
     double worst = 0.0, ssum = 0.0, wsum = 0.0;

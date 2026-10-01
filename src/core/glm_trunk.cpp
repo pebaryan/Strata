@@ -32,7 +32,7 @@ void copy_floats(float* dst, const float* src, size_t n) {
 bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, void* provider_ctx,
                        const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
                        float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
-                       int first_layer) {
+                       int first_layer, GlmStageFn stage_fn, void* stage_ctx) {
     if (!x || !provider || !l_out) {
         err = "glm_trunk_forward: null argument";
         return false;
@@ -96,6 +96,13 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
             err = "glm_trunk_forward: layer " + std::to_string(layer) + " attention site: " + err;
             return false;
         }
+        // Report each stage as it is produced.  Defaulted to nullptr, so a caller that does not ask for the
+        // stream is unaffected - the loop's behaviour must not change because a test is watching.
+        auto stage = [&](const char* nm, const float* data, int n) {
+            if (stage_fn != nullptr) stage_fn(stage_ctx, layer, nm, data, n);
+        };
+        stage("hc_attn_pre", cur, (int) (hc * (size_t) ne));
+        if (is_mla) stage("attn_norm", xn.data(), ne);
         if (is_mla) {
             const int slot = state.mla_index ? state.mla_index[layer] : -1;
             if (slot < 0 || !state.mla_cache || !state.mla_len) {
@@ -124,10 +131,13 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
                 return false;
             }
         }
+        stage("attn_output", attn_out.data(), ne);
         if (!glm_stage_hc_post(attn_out.data(), cur, mix_a[0], ne, mid.data(), err)) {
             err = "glm_trunk_forward: layer " + std::to_string(layer) + " attention hc_post: " + err;
             return false;
         }
+
+        stage("hc_attn_post", mid.data(), (int) (hc * (size_t) ne));
 
         // ---- the FFN site ----
         if (!glm_stage_hc_norm(mid.data(), ne, w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm, ffn_in.data(),
@@ -135,6 +145,8 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
             err = "glm_trunk_forward: layer " + std::to_string(layer) + " FFN site: " + err;
             return false;
         }
+        stage("hc_ffn_pre", mid.data(), (int) (hc * (size_t) ne));
+        stage("ffn_norm", ffn_in.data(), ne);
         if (is_dense) {
             if (!glm_stage_ffn(ffn_in.data(), w.ffn_gate, w.ffn_up, w.ffn_down, *w.moe_g, ffn_out.data(),
                                w.clamp_limit, err)) {
@@ -148,6 +160,7 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
                 return false;
             }
         }
+        stage("ffn_out", ffn_out.data(), ne);
         if (!glm_stage_hc_post(ffn_out.data(), mid.data(), mix_f[0], ne, nxt, err)) {
             err = "glm_trunk_forward: layer " + std::to_string(layer) + " FFN hc_post: " + err;
             return false;

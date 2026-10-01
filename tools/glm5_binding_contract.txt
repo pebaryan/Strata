@@ -4591,3 +4591,43 @@ loop needs an optional stage callback - the same shape as the weight provider it
 (layer, name, data, n) for each stage and compare against the files above.  With that, block 3's 6% splits into "before
 the FFN" or "the FFN" in one run: compare attn_output-3 to separate the attention site, and ffn_out-3 to separate the
 routed MoE.
+
+THE BISECTION: BLOCK 3'S ERROR IS ENTIRELY INSIDE THE ROUTED MoE STAGE
+
+A stage callback was added to glm_trunk_forward - GlmStageFn, with the two new parameters DEFAULTED to nullptr so a
+caller that does not ask for the stream is unaffected, and that is verified rather than asserted: with the callback in
+place and unused, trunk_gate and block3_gate reproduced their previous numbers exactly (worst 7.35745e-08, ratio 1;
+worst 0.00354951, ratio 0.999768634).  The reference stages come from glm5_full_run.py - the SAME runner that produces
+the token gate - so this comparison is not circular.
+
+    attn_output   engine rms 0.387098    oracle rms 0.387099    worst 1.06692e-05  = 2.756e-05 of rms
+    hc_attn_post  engine rms 0.0254039   oracle rms 0.0254039   worst 8.33534e-08  = 3.281e-06 of rms
+    ffn_norm      engine rms 0.353804    oracle rms 0.353804    worst 9.37283e-06  = 2.649e-05 of rms
+    ffn_out       engine rms 0.957992    oracle rms 0.958332    worst 0.0438659    = 4.577e-02 of rms      <- FAILS
+
+READ IT AS FOUR SEPARATE VERDICTS, which is the whole point of building the stream:
+
+  * THE MLA BRANCH IS CORRECT AT THE FP32 FLOOR.  attn_output agrees to 2.8e-05 of rms, with the cache accumulated
+    across five tokens.  That is the first numerical verification of the is_mla branch - and of the latent-threading
+    fix - against the authoritative reference, and it closes the branch that had never executed before this session.
+  * BOTH hc SITES ARE CORRECT: hc_attn_post to 3.3e-06 of rms.
+  * THE NORM IS CORRECT: ffn_norm to 2.6e-05 of rms.
+  * THE ROUTED MoE STAGE IS THE ONLY WRONG THING in this block.  Its INPUT is verified correct, so the fault is
+    inside the stage or in what the loop hands it - and the numbers say which KIND of fault: the rms agrees to 0.04%
+    while elements differ by 4.6%, so the mixture has the right magnitude and the wrong members or the wrong weights.
+    That is the signature of a routing difference (different experts selected) or of the clamp, NOT of a scale or a
+    layout error.
+
+The candidates that remain, in the order worth testing, given that glm_moe_parity already passes for this layer with
+the pack's own descriptor matching blob_bytes to the byte (so the kernel, the descriptor and the pack reading are all
+verified in isolation):
+
+  1. THE EXPERT IDS.  If the router picks a different top-8 for the block's real input than the oracle does, the
+     output has the right kind of magnitude from the wrong experts - exactly what is observed.  The MoE fixture gate
+     compared ids EXACTLY, but for the oracle's own input, so a router disagreement on this input would show up here
+     and nowhere else.  Testing it needs the engine's ids, which the stage does not currently report.
+  2. THE CLAMP.  The oracle's own four-block run counts exp_up 1 and shexp_up 1 - the clamp is active once per
+     sixty-odd calls at this depth, and it is the one term whose mis-wiring changes a few elements while leaving the
+     rms alone.
+  3. THE SHARED EXPERT.  It is added unweighted with its own geometry (2048 wide in this block, not the dense FFN's
+     12288) and its own clamp, and it is the part of the stage the parity fixture exercised least.

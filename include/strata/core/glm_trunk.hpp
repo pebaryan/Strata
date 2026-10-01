@@ -83,9 +83,17 @@ struct GlmTrunkState {
 /// (glm_attention_is_mla / glm_ffn_is_dense), the weight provider and the state maps are all keyed by the artifact's
 /// layer number, so a run that starts at layer 3 must say so or it would be dispatched as layer 0 - KDA instead of
 /// MLA, dense instead of routed.  Defaults to 0 for a run over the whole trunk.
+/// Reports one stage of one layer: the name, the buffer, and its length.  This exists so a block whose l_out
+/// disagrees can be SPLIT - compare the attention site's output to decide whether the error is before the FFN, and
+/// the FFN's output to decide whether it is inside it - instead of arguing about which half is at fault.  The names
+/// are the ones the reference drivers use ("hc_attn_pre", "attn_norm", "attn_output", "hc_attn_post", "hc_ffn_pre",
+/// "ffn_norm", "ffn_out"), so a dump and this stream are directly comparable.  Lengths: the hc_* stages are n_embd
+/// times the stream count, the rest are n_embd.
+typedef void (*GlmStageFn)(void* ctx, int layer, const char* name, const float* data, int n);
+
 bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, void* provider_ctx,
                        const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
                        float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
-                       int first_layer = 0);
+                       int first_layer = 0, GlmStageFn stage_fn = nullptr, void* stage_ctx = nullptr);
 
 }  // namespace strata::core::glm
