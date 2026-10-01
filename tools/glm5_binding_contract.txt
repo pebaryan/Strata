@@ -948,3 +948,34 @@ REVERTED to the last verified state: the driver binds block 0 and stage 1 prints
 (-0.359747499 / 0.424176991 / 3.25002776) with STRATA_HC_DEQUANT=1.  The KDA gate therefore needs either this
 branch finished properly, or - much cheaper - a KDA fixture whose weights can be read as floats without it, since
 attn_q/k/v are the only KDA inputs that are quantized.
+
+THE WIDENED CONDITION BREAKS A TENSOR IT DOES NOT TOUCH - MEASURED, NOT GUESSED
+
+Measured this time instead of theorised, and the result is the opposite of what the earlier theory predicted:
+
+    probe (no dequant, no allocation) for blk.0.attn_q.weight:
+        plan ne=4096,8192 -> n=33554432 | pack bytes=0 -> n=0 | ttype=8 | native=0x7f1e66000000
+
+so the plan row's element count is right, ttype=8 says Q8_0, native_data is a live device pointer, and the pack
+legitimately holds zero bytes for a natively-served tensor.  Every quantity the branch uses is therefore sound, and
+the earlier "wrong element count" theory is DEAD.
+
+Then, running with the condition widened to attn_q:
+
+    STRATA_HC_DEQUANT=1 STRATA_DEQUANT_ATTN_Q=1   -> cudaMalloc failed for blk.0.hc_attn_fn.weight
+    STRATA_HC_DEQUANT=1                           -> 0 failures
+
+hc_attn_fn is the FIRST tensor this branch handles - nothing dequantizes before it - so a change to the CONDITION
+cannot have poisoned anything upstream of it.  The failure did not move later in the bind order as a poisoning
+theory requires; it appeared on a tensor the widening does not even select, and without the widening that same
+tensor allocates fine (the stage runs and prints its verified number).
+
+WHAT THAT RULES OUT: every "something earlier faults" explanation, including the two tried earlier (the experts,
+a null native_data).  WHAT IT POINTS TO: the added clause itself.  The concrete next test, in isolation and with
+nothing else changed, is to make the clause trivially true (e.g. widen to a name that certainly is not bound, or
+replace the find() with a constant) and see whether hc_attn_fn still fails - which separates "the clause is
+evaluated wrongly" from "any change to this condition shifts something else".  Note also that the condition calls
+std::getenv twice and std::string::find on every row; neither is obviously dangerous, which is exactly why this
+needs a clean measurement rather than a story.
+
+REVERTED.  Verified state: 0 build errors, exit 0, stage 1 = -0.359747499 / 0.424176991 / 3.25002776.
