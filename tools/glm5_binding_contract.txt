@@ -225,3 +225,15 @@ are F32 resident).  So chain stage 1 - hc_pre(hc_init) -> attn_norm -> hc_post -
 arguments, the layouts and the comparator (the reference's hc_attn_pre-0 / attn_norm-0, which the bisect already
 showed matching at 1.76e-05 and 1.121e-04 respectively) are all in hand.  Stages 2+ are the KDA/MLA call, the
 ffn stage (dense below block 3, moe_forward above), and the head, each with the same shape of contract.
+
+The norm between hc_pre and the attention call:
+
+    elementwise.hpp:  void rms_norm_weighted(float* x, const float* w, int64_t rows, int64_t cols,
+                                             float eps, void* stream);
+
+eps is 1e-5 for attn_norm - the reference's `attention.layer_norm_rms_epsilon`, NOT
+`hyper_connection.epsilon` (1e-6), which glm_hc.hpp:30 warns about explicitly, and NOT a folded (1+w): the
+reference is `ggml_rms_norm` then a plain multiply.
+
+So chain stage 1 is fully specified end to end: hc_pre -> rms_norm_weighted -> hc_post, with every argument,
+weight, layout and comparator in hand and written down.  Nothing to measure before writing it.
