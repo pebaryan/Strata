@@ -334,3 +334,53 @@ pack, which is how the engine's existing parity tests are already structured.
 
 It does not make GLM-5 servable on this box. The capacity arithmetic above is the whole answer to that
 question, and it is a hardware fact, not an engineering one: 93 GB of weights, 63 GB of memory.
+
+
+# Phase 9 - the engine trunk (wiring GLM-5.3 into Strata's own forward pass)
+
+Phases 0-8 delivered a verified SEMANTIC port: every operator matches llama.cpp against the reference
+activations, and the 45-block trunk reproduces its logits end to end in tools/glm5_full_run.py (argmax 12089,
+top-5 identical).  What does NOT exist yet is the model inside the engine: src/core/ holds a complete Qwen4Exp
+implementation (layer.cpp, graph.cpp, session.cpp, weights.cpp, native_dense.cpp, native_head.cpp) and the GLM
+kernels sit outside it, exercised only by parity tests.  Phase 9 is that wiring.
+
+## The pieces that already exist and are verified
+
+  kernels:  glm_hc (mHC pre/post, hc_mean), glm_kda (conv/gate/beta/recurrence/norm/gate/wo), glm_mla,
+            glm_indexer, glm_moe (top-8 router + shared expert + swiglu clamps), glm_mtp
+  parity:   0 failures each; KDA now passes multi-token fixtures after the contraction fix (bd75a1c)
+  pack:     strata-pack-glm5 (dense.bin + index.txt + experts.bin + native_experts.txt + tokenizer)
+  guard:    check_glm5next_architecture() in the gguf reader; --experts-bin loads expert blobs
+  oracle:   tools/glm5_*_reference.py, all validated against llama.cpp's own activations
+  test:     tools/glm5_e2e_test.py - verified oracle side (reference logits -> 12089), hard pass/fail
+
+## Ordered steps, each with its own pass criterion
+
+  9.1  Weight binding for one GLM block.  New src/core/glm_bind.cpp (or a branch in layout.cpp) that maps the
+       pack's 26 per-block tensors onto the kernel structs, one block, layer 0.  THE RULE THAT COST THIS PHASE:
+       ssm_conv1d_{q,k,v}.weight is stored (d_inner, 1, d_conv) with d_conv FASTEST, so the (d_conv, d_inner)
+       array the kernels index as conv_w[k*d_inner + ch] is reshape(d_inner, d_conv).T - a TRANSPOSE, not a
+       reshape.  Also: this kernel must be re-checked for every other tensor whose GGUF shape is not 2-D.
+       PASS: binding layer 0 reproduces tools/glm5_full_run.py's block-0 outputs.
+
+  9.2  The block chain in the engine.  hc_pre -> attn_norm -> (KDA | MLA by the per-layer table in
+       attention.head_count_kv) -> hc_post, twice per block, with the dense stem for blocks 0-2 and MoE after.
+       PASS: 45 blocks reproduce the Python trunk's hidden state to fp32 noise.
+
+  9.3  State and session.  KDA state per layer (34 layers x 64 heads x 128 x 128 fp32 = ~143 MB) and the MLA KV
+       cache; the engine's session/cell machinery is built for Qwen4Exp's pools, so this needs its own
+       allocation path rather than a reuse.
+       PASS: two consecutive prefill calls give the same logits as one call over the concatenation.
+
+  9.4  Head and sampler.  output_norm -> output.weight (the artifact HAS output.weight; do not fall back to the
+       tied token_embd).  PASS: argmax 12089 on the golden prompt, matching tools/glm5_e2e_test.py.
+
+  9.5  Serving path.  Only after 9.1-9.4: endpoint, tokenizer, sampling.
+
+## Discipline carried over from phase 8, and it is not optional
+
+  * Every gate ships with a known-bad fixture it must REJECT (see STRATA_BAD_CONV_FIXTURE in the KDA oracle).
+  * Before comparing two tensors, establish by construction that they are the same quantity - the guard that
+    finally worked for rms_norm (6e-08), the gate (0.88%) and the KDA block (5e-06).
+  * Four gates passed while the model was wrong in phase 8 (swiglu clamp, router bias, double norm, conv
+    layout).  Every one had its inputs derived from the implementation under test.
