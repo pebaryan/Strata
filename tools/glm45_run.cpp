@@ -112,7 +112,19 @@ struct Provider {
     K::MlaGeometry mla_g;
     K::MoeGeometry dense_g, moe_g, shexp_g;
     C::ExpertSource* src = nullptr;
+    /// ONE STAGED TENSOR, AND HOW TO PUT IT BACK.  The staging does not merely add a buffer: it MUTATES the bound block,
+    /// re-pointing a tensor at a host buffer and clearing its quantized flag so it is not dequantized twice.  Both
+    /// mutations outlive the buffer, which is freed when the next layer is asked for - so on the next token the block
+    /// holds a dangling pointer and, the flag having been cleared, never re-stages.  Token 0 passes (each layer visited
+    /// once, so nothing reads the freed pointers) and token 1 faults on the first dereference.
+    struct StagedRecord {
+        C::GlmBoundBlock* block;
+        size_t idx;
+        const float* ptr;
+        bool quantized;
+    };
     std::vector<float*> staged;      ///< this layer's host floats; freed when the next layer is asked for
+    std::vector<StagedRecord> records;
 };
 
 /// Dequantize one quantized bound tensor to HOST floats.  The kernels are device kernels (dequant_q5_K was gated
@@ -169,6 +181,13 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
     //
     // Every quantized tensor is staged EXCEPT the dense FFN's three on blocks 0..2: those are consumed by the GPU path,
     // which wants the quantized device blocks as they are, so they keep them.
+    // RESTORE BEFORE FREEING.  A bound block must go back to the state the binder left it in, because the next visit
+    // has to see a quantized tensor it can stage again - not one that claims already to be host floats.
+    for (const Provider::StagedRecord& r : p->records) {
+        r.block->tensors[r.idx].ptr = r.ptr;
+        r.block->tensors[r.idx].quantized = r.quantized;
+    }
+    p->records.clear();
     for (float* f : p->staged) std::free(f);
     p->staged.clear();
     {
@@ -182,11 +201,12 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
             // expert_ffn, so the crash simply moved from kda_forward to expert_ffn when the rest were staged.  Every
             // quantized tensor is staged, and the per-layer lifetime is what keeps it affordable.
             (void) dense;
+            p->records.push_back(Provider::StagedRecord{&B, i, t.ptr, t.quantized});
             float* h = dequant_to_host(t, err);
             if (h == nullptr) return false;
             p->staged.push_back(h);
             t.ptr = h;
-            t.quantized = false;      // never re-dequantize the same layer twice
+            t.quantized = false;      // for the remainder of THIS visit; restored when the buffers are freed
         }
         // re-map: glm_fill_layer_weights is pure assignment, so doing it per layer costs nothing
         if (!C::glm::glm_fill_layer_weights(B, layer, p->kda_g, p->mla_g, p->kda[(size_t) layer],

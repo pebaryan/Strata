@@ -5664,3 +5664,40 @@ input, with all eleven MLA caches at the right depth.  What stands between that 
 computation - and the remaining numerical question, whether the seven-digit agreement between input and output rms is
 the residual structure or a pass-through, is answered by running the head next, because argmax is not permutation- or
 scale-invariant the way an rms is.
+
+THE LIFETIME FIX WORKS: ALL FIVE TOKENS RUN ALL FORTY-FIVE BLOCKS, AND ONLY THE HEAD REMAINS
+
+    token 0: |l_out| 0.008270, MLA cache depths 1 1 1 1 1 1 1 1 1 1 1
+    token 1: |l_out| 0.008270, MLA cache depths 2 2 2 2 2 2 2 2 2 2 2
+    token 2: |l_out| 0.008270, MLA cache depths 3 3 3 3 3 3 3 3 3 3 3
+    token 3: |l_out| 0.008270, MLA cache depths 4 4 4 4 4 4 4 4 4 4 4
+    token 4: |l_out| 0.008270, MLA cache depths 5 5 5 5 5 5 5 5 5 5 5
+    head: glm_stage_head_mean_norm: null argument
+
+The restore-before-free fix did exactly what it was written to do: five tokens, forty-five blocks each, with the eleven MLA
+caches advancing one cell per token.  The cache depths are the proof the state threading is right - they grow 1, 2, 3, 4,
+5 and they grow in every layer - and this is the first time the engine has carried its own state across a token boundary.
+
+AND TWO THINGS REMAIN, ONE WIRING AND ONE NUMERICAL.
+
+  * THE HEAD STAGE.  glm_stage_head_mean_norm reports a null argument - and note that it NAMES ITSELF, so the next step is
+    already specified: print its arguments by name the way glm_stage_kda now does, since the last round showed that a
+    refusal naming its argument costs one read instead of one build (and that reasoning about which of several candidates
+    is null, when one of them is a reference that cannot be, wastes a round).
+
+  * |l_out| IS IDENTICAL TO SIX DIGITS ACROSS FIVE TOKENS, AND THAT IS SUSPICIOUS.  Five different token inputs - the
+    oracle's hc_init is not replicated, which was established structurally earlier ("oracle hc_init: 4096-stride copies
+    False, distinct 4096-blocks 20") - produce an output whose aggregate magnitude agrees to 0.008270 on every token.
+    A residual chain can leave a magnitude in the same neighbourhood, but agreement to six digits across five different
+    inputs is not a neighbourhood, it is a constant, and it means the output is either not depending on the input or not
+    depending on the state.  The KDA recurrence is the obvious candidate: it is the only stage whose output should change
+    materially from token to token, and its state pointer was the argument that was null one round ago - a state that is
+    now correctly addressed but possibly not correctly written.
+
+    THIS IS EMITTED AS A CONCERN RATHER THAN A CONCLUSION, deliberately: an rms is invariant to permutation and broadly
+    tolerant of magnitude structure, so it cannot distinguish "the trunk is right and the aggregate is stable" from "the
+    trunk is repeating itself".  The instrument that CAN distinguish them is the head, because argmax is neither - which
+    is why fixing the head is the right next step rather than investigating this number directly.
+
+STATE: the engine runs the entire chain - forty-five of forty-five blocks, five of five tokens - from the real pack, and
+stops at the last stage with a named refusal.
