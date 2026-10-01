@@ -2142,3 +2142,41 @@ NEXT MEASUREMENT, one line and no new build: report() prints only the ENGINE's s
 min/max/sum beside them.  The ratio would then be visible directly instead of inferred from rel, and a clean factor
 would name the cause - 1/sqrt(hd), a missing conv normalisation, or a g/beta-shaped scaling are the candidates that
 fit an order of magnitude on a step that is a matmul followed by a convolution.
+
+########  BLOCK 1: NOT A BROKEN PATH BUT AN AMPLIFIED ONE - qc SITS IN silu's FLAT REGION  ########
+
+The measurement that reframes it, taken from the fixture and the gate's own output:
+
+    stage   ORACLE (fixture)                  engine                      engine/oracle
+    xn      [-0.39369, +0.506206]             identical                   1.0     PASS at 1.177e-07
+    qc      [-0.00966, +0.031766]             [-0.239512, +0.063593]      7.5
+    kc      [-0.02325, +0.023255]             [-0.049464, +0.082915]      3.6
+    vc      [-0.00545, +0.005200]             [-0.263415, +0.176064]      48
+
+    xn @ wq.T recomputed from the fixture:  [-7.95, +2.52]   rms 0.384
+    oracle qc, its output after conv+SiLU:  [-0.0097, +0.0318]  rms 0.00149
+
+qc COMPRESSES BY A FACTOR OF 257, and the reason is that its pre-activation is mostly NEGATIVE, where SiLU is
+approximately zero.  Block 0's oracle qc reaches +/-0.086; block 1's only reaches +0.03.  Block 1 therefore sits
+much deeper into SiLU's flat region, and any absolute difference in the pre-activation is amplified enormously in
+relative terms.  Block 1 is not exercising a different code path - it is the same path at an operating point where
+the output is near zero and the relative error is therefore large.
+
+WHAT THIS MEANS FOR THE DIAGNOSIS.  The fault is a SMALL absolute difference in the pre-SiLU conv output.  That is a
+much more specific statement than "qc is wrong": it says the engine and the oracle differ somewhere in
+xn @ wq.T -> conv1d, at a magnitude that block 0 does not expose, and that no amount of staring at qc's relative
+error will size.  It also means an absolute-tolerance comparison would have shown this as a small number - the
+gate's relative-to-scale tolerance is what surfaced it, which is the opposite of the usual complaint.
+
+AND IT NARROWS THE SUSPECT TO THE CONVOLUTION ITSELF, because everything else on that step is now pinned:
+        xn        matches the oracle to 1.177e-07 (compared directly)
+        wq        the SAME ARRAY on both sides - kda_gate hands the fixture's weights to kda_forward
+        conv_q    the same array too, from the same fixture file
+        geometry  both blocks (8192, 1, 4)
+So the matmul and the weights agree by construction, and what remains is conv1d_causal - four taps, causal padding,
+zero state at t=0 - exercised at a magnitude block 0 never reaches.
+
+NEXT: probe the pre-SiLU conv output directly rather than inferring it.  The engine's qc is silu(conv(...)), so the
+conv's own output is recoverable in one line - invert SiLU numerically on the engine's qc, or better, have the
+kernel emit it.  Comparing that against the recomputed xn @ wq.T, convolved by hand in numpy from the same
+fixture's conv_q, puts the conv's absolute error on the table as a single number.
