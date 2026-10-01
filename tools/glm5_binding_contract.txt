@@ -3058,3 +3058,41 @@ WHY THIS IS WORTH DOING NEXT AND IS THE LAST THING NEEDED: the kernel now has a 
 the oracle on a real activation, while passing twelve of twelve on the oracle's seed.  The twelve-intermediate gate is
 already built, already proven, and already has its failure mode demonstrated; pointing it at this input converts "the
 kernel is wrong by a factor somewhere" into "this operation is wrong", in one run.
+
+########  RETRACTION: THE 1.391 WAS NOT A KERNEL BUG.  THE KERNEL PASSES ON A REAL INPUT.  ########
+
+The previous entry claimed a real engine bug - the KDA disagreeing with the oracle by 1.391x on a real activation.  That
+claim is WITHDRAWN.  The twelve-intermediate gate, pointed at this input, passes every one:
+
+    result 3.025e-06  xn 7.302e-08  qc 1.238e-06  kc 3.356e-06  vc 4.339e-07  g 2.396e-06
+    beta 4.204e-07  q 1.150e-06  k 8.151e-07  v 4.339e-07  attn 1.224e-07  o 8.501e-07
+    KDA GATE: PASS
+
+WHAT THE 1.391 ACTUALLY WAS - a comparison artefact, and the mistake was mine, in the driver:
+
+  * make_oracle_stages.py computes the oracle's attn_output as kda_block(w, hc_attn_pre_token0, 1).  kda_block
+    NORMALISES ITS INPUT INTERNALLY, so that call is "norm, then attend" - the same thing the engine's stage 1 + KDA
+    do together.
+  * the driver, in the run that produced 1.391, fed the ENGINE's KDA the ORACLE's attn_norm - already normalised -
+    and the engine's KDA does NOT normalise.  So the engine's kernel attended the normed vector while the oracle's
+    attn_output had come from the pre-norm vector.
+  * two different inputs, hence two different outputs.  The engine was right in both cases; kda_gate proves it for
+    whichever input it is given.
+
+The lesson is the same one this file keeps recording, in its fourth form: a comparison is only meaningful when both
+sides consume the SAME input, and "the same input" has to be verified rather than assumed - particularly when one side
+normalises internally and the other splits that into two stages.  I checked the type of the input and its shape and
+its magnitude, and never its provenance.
+
+WHAT REMAINS TRUE, and is now the actual suspect: hc_pre - the FIRST stage - is already 4.266e-03 of rms from the
+oracle's own hc_attn_pre on this input (worst 1.760e-05, engine rms 4.122e-03 vs 4.125e-03), and the norm inherits it
+at 1.384e-03.  Those are small in absolute terms but the gate amplifies them: an exponential decay over the sequence
+turns a 0.14% input difference into the 39% output difference observed.  So the chain is correct in structure and
+every kernel matches its oracle; the residual is a small difference in the very first stage, and its magnitude being
+~1e-5 on a 4e-3-rms vector is consistent with a precision difference or a slightly different eps rather than a wrong
+operation.  Stage 1's own verification was against the phase-6 oracle and its own input, so the next question is
+whether hc_pre agrees on THIS input specifically - which the oracle for hc_pre (glm5_hc_reference.py) can answer.
+
+THE HONEST STATE: no demonstrated engine bug.  Every kernel that has been pointed at a real input matches its oracle,
+and the one apparent counterexample was my own comparison error.  The chain's remaining discrepancy is in stage 1 and
+is small in absolute terms.
