@@ -949,3 +949,15 @@ add_executable(head_gate tools/head_gate.cpp src/core/glm_trunk.cpp src/core/glm
 target_include_directories(head_gate PRIVATE /include)
 target_compile_options(head_gate PRIVATE -O2)
 target_link_libraries(head_gate PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
+
+# block3_gate (branch glm5next-port): the first execution of the is_mla AND routed branches of the trunk loop.
+# Block 3 is the first MLA layer and it is routed, so both branch conditions differ from every block this
+# port has run so far.  Input and reference come from the oracle's full run (l_out-2 / l_out-3).
+add_executable(block3_gate tools/block3_gate.cpp src/core/glm_trunk.cpp src/core/glm_layer.cpp
+                   src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_bind.cpp
+                   src/core/native_dense.cpp src/core/expert_source.cpp src/core/expert_cache.cpp
+                   src/core/remote_experts.cpp src/kernels/glm_kda.cpp
+                   src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp
+                   src/kernels/cuda/quantize_act.cu)
+target_include_directories(block3_gate PRIVATE /include)
+target_link_libraries(block3_gate PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)

@@ -4391,3 +4391,36 @@ routed branch, neither of which has ever executed.  Everything that run needs is
 dense tensors fetched and shape-checked, the routed descriptor matching the pack's blob_bytes to the byte for layer 3,
 FileExpertSource's interface read, the oracle's l_out-2 as input and l_out-3 as reference, and the ggml link line
 recorded (build-glm5/ggml/src/libggml-{cpu,base}.a).
+
+THE BLOCK-3 GATE EXISTS AND ITS FIRST BLOCKER IS A REAL ONE: THE PACK'S LAYER NUMBERING
+
+tools/block3_gate.cpp + a CMake target.  It binds block 3's 21 fetched tensors, opens FileExpertSource on the pack,
+builds the descriptor with native_fmt from the pack's OWN types, runs glm_trunk_forward with first_layer = 3, and
+compares against the oracle's l_out-3.  Three things it establishes before it stops:
+
+    layer 3 experts: gu_type 16, d_type 18, pack blob_bytes 7536640, descriptor bytes 7536640  (MATCH)
+
+so the type reading and the descriptor are right, and it gets far enough to open the pack.
+
+THE BLOCKER, and it is the kind that has to be decided rather than tuned:
+
+    the pack's native_experts.txt lists layers 3..45 with ABSOLUTE layer numbers (GLM's first three blocks are dense
+    and have no experts), while expert_layout_load wants a dense 0..n_layers-1 set.
+
+        n_layers = 46  -> parses, then "the native expert layout is invalid at layer 0"   (0, 1, 2 have no entry)
+        n_layers = 43  -> "native_experts.txt: a malformed line: 43 16 18 ..."            (layer 43 > 43 layers)
+
+Both refusals are correct given their premise.  So this is a decision about how the pack REPRESENTS a layer with no
+experts - a row with blob_bytes 0, a flag, or a leading-dense offset in the loader - and not a number to try until
+something runs.
+
+AND THE TEMPTING SHORTCUT IS THE DANGEROUS ONE.  Passing 43 would make the layout index ROW ORDER rather than layer
+number, so layer 3 would be served layer 6's experts: valid pointers, correctly-sized blobs, plausible numbers,
+silently wrong - and the gate would even be able to produce a comparison to argue about.  It is refused here for the
+same reason the port refuses every other plausible-wrong answer.  46 is what the tool passes, because that value
+reaches the real blocker instead of a parse error, and the gate halts on it rather than proceeding on a guess.
+
+WHAT IS *NOT* BLOCKED, and it is most of the gate: the 21 tensors are fetched and shape-checked, the MLA geometry is
+set from the artifact's own numbers, the descriptor matches the pack's blob_bytes exactly, FileExpertSource's interface
+is wired, the oracle's l_out-2 and l_out-3 are the input and reference, and the tool builds and runs.  One decision
+about representing expertless layers stands between this and the first execution of the is_mla and routed branches.
