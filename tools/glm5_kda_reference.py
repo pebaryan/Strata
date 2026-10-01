@@ -148,6 +148,22 @@ def kda_block(w: dict, x: np.ndarray, tokens: int, want_state: bool = False):
                     "v": v, "attn": attn, "o": o, "state": S if want_state else None}
 
 
+def _conv(m, name):
+    """The (d_conv, d_inner) conv array the kernel indexes as conv_w[k*d_inner + ch].
+
+    The artifact stores (d_inner, 1, d_conv) with d_conv FASTEST, so this is reshape(d_inner, d_conv).T.
+    reshape(d_conv, d_inner) instead interleaves four channels' taps: measured on block 0 it takes
+    attn_output-0 from corr +1.00000 / 0.02% to corr +0.52073 / 90.56%.
+
+    NOTE for whoever builds the missing regression: flipping the order HERE does not produce a usable
+    known-bad fixture, because the oracle's own reference outputs are computed with the same weights - the
+    fixture would then hold wrong weights and wrong expected values, which the gate would pass.  That
+    self-consistency is exactly why the original defect was invisible.  The flip belongs at the fixture
+    WRITER, so the expected outputs stay correct while the weights are wrong.
+    """
+    return np.ascontiguousarray(m.tensor(name).reshape(D_INNER, D_CONV).T)
+
+
 def load_weights(m: Model, layer: int) -> dict:
     p = f"blk.{layer}."
     w = {
@@ -160,9 +176,9 @@ def load_weights(m: Model, layer: int) -> dict:
         # interleaves four different channels' taps and is silently wrong.  Measured on block 0:
         # reshape(d_inner,d_conv).T -> attn_output-0 corr +1.00000, 0.02% error
         # reshape(d_conv,d_inner)   -> attn_output-0 corr +0.52073, 90.56% error
-        "conv_q": np.ascontiguousarray(m.tensor(p + "ssm_conv1d_q.weight").reshape(D_INNER, D_CONV).T),
-        "conv_k": np.ascontiguousarray(m.tensor(p + "ssm_conv1d_k.weight").reshape(D_INNER, D_CONV).T),
-        "conv_v": np.ascontiguousarray(m.tensor(p + "ssm_conv1d_v.weight").reshape(D_INNER, D_CONV).T),
+        "conv_q": _conv(m, p + "ssm_conv1d_q.weight"),
+        "conv_k": _conv(m, p + "ssm_conv1d_k.weight"),
+        "conv_v": _conv(m, p + "ssm_conv1d_v.weight"),
         "ssm_a": m.tensor(p + "ssm_a"),
         "dt_bias": m.tensor(p + "ssm_dt.bias"),
         "ssm_f_a": m.tensor(p + "ssm_f_a.weight"),
