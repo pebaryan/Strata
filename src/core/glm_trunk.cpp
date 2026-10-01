@@ -154,11 +154,19 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
                 return false;
             }
         } else {
+            int moe_ids[64];
+            for (int k = 0; k < 64; ++k) moe_ids[k] = -1;
             if (!glm_stage_moe_native(ffn_in.data(), w.moe_router, w.moe_probs_b, *w.moe_g, layer, *w.moe_fmt,
-                                      w.blob_fn, w.blob_ctx, w.shexp_g, w.shexp, w.shexp_clamp, ffn_out.data(), err)) {
+                                      w.blob_fn, w.blob_ctx, w.shexp_g, w.shexp, w.shexp_clamp, ffn_out.data(), err, moe_ids)) {
                 err = "glm_trunk_forward: layer " + std::to_string(layer) + " routed FFN: " + err;
                 return false;
             }
+            // the ids as floats, so the one stage stream carries them: the callback is float-based because it carries
+            // activations, and these are small integers that survive the round trip exactly
+            const int n_report = w.moe_g->n_used < 64 ? w.moe_g->n_used : 64;
+            float ids_f[64];
+            for (int k = 0; k < n_report; ++k) ids_f[k] = (float) moe_ids[k];
+            stage("moe_ids", ids_f, n_report);
         }
         stage("ffn_out", ffn_out.data(), ne);
         if (!glm_stage_hc_post(ffn_out.data(), mid.data(), mix_f[0], ne, nxt, err)) {

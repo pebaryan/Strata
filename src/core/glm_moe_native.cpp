@@ -34,7 +34,7 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
                           const kernels::cpu::NativeFmt& fmt,
                           const uint8_t* (*blob_fn)(void*, int, int), void* blob_ctx,
                           const kernels::glm::MoeGeometry* shexp_g, const float* const* shared, float shexp_clamp,
-                          float* out, std::string& err) {
+                          float* out, std::string& err, int* ids_out) {
     if (!xn || !router || !out || !blob_fn) {
         err = "glm_stage_moe_native: null argument";
         return false;
@@ -59,6 +59,11 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
     int32_t ids[64];
     float weights[64];
     kernels::glm::moe_route(router, probs_b, g, xn, ids, weights);
+    // Reported for the caller's benefit: which experts were chosen is otherwise invisible, and a mixture of
+    // the right magnitude from the wrong experts looks exactly like a numerical error from the outside.
+    if (ids_out != nullptr) {
+        for (int i = 0; i < g.n_used && i < 64; ++i) ids_out[i] = (int) ids[i];
+    }
 
     std::vector<float> parts((size_t) g.n_used * g.n_embd);
     std::vector<uint8_t> act(fmt.act_bytes), hq(fmt.h_bytes);

@@ -203,6 +203,18 @@ int main(int argc, char** argv) {
     // MlaGeometry's defaults are the artifact's own MLA geometry, and the fetched tensor sizes agree with them
     ctx.mla_g.n_embd = N_EMBD;
     ctx.moe_g.n_embd = N_EMBD; ctx.moe_g.n_expert = N_EXPERT; ctx.moe_g.n_used = N_USED; ctx.moe_g.ff = FF;
+    // THE CLAMPS MUST COME FROM THE ARTIFACT, and this gate had left them at their defaults - which are 0, which
+    // DISABLES them.  The header warns about precisely this: "0 disables it, and that is a real behaviour difference,
+    // not a neutral default: with a limit of 10 it is invisible until a pre-activation exceeds 10, so a caller that
+    // forgets it will still look right on tame inputs.  Callers must set both from the artifact."  It was not tame
+    // here: the oracle's own four-block run counts exp_up 1 and shexp_up 1, so the clamp fires in this block - which
+    // is exactly why ffn_out had the right rms and elements off by 4.6%, the signature of a few values moving.
+    // swiglu_clamp_exp / swiglu_clamp_shexp are 10.0 for every layer of this model.
+    const float CLAMP_EXP = 10.0f;
+    ctx.moe_g.clamp_exp = CLAMP_EXP;
+    ctx.moe_g.clamp_shexp = CLAMP_EXP;
+    ctx.shexp_g.clamp_exp = CLAMP_EXP;
+    ctx.shexp_g.clamp_shexp = CLAMP_EXP;
     ctx.shexp_g.n_embd = N_EMBD; ctx.shexp_g.ff = FF;
     ctx.shexp[0] = fx.shexp_gate.data(); ctx.shexp[1] = fx.shexp_up.data(); ctx.shexp[2] = fx.shexp_down.data();
 
@@ -343,6 +355,41 @@ int main(int argc, char** argv) {
             const double gr = std::sqrt(ss / (double) len), wr2 = std::sqrt(ws / (double) len);
             std::printf("    %-13s engine rms %.6g  oracle rms %.6g  worst %.6g  = %.4g of rms\n", names[k], gr,
                         wr2, worst_s, worst_s / (wr2 > 0.0 ? wr2 : 1.0));
+        }
+    }
+
+    // ---- is the engine routing to the same experts?
+    //
+    // The ids the stage ACTUALLY used come out on the stream; the top-8 is then computed HERE, independently, from the
+    // same input (ffn_norm, itself verified against the oracle) with the same fixture weights.  Two separate
+    // implementations of the reference's rule agreeing is the point - and if they disagree, the mixture has the right
+    // magnitude from the wrong experts, which is exactly what ffn_out's matching-rms-with-4.6%-error looks like.
+    if (argc >= 5) {
+        std::map<std::string, std::vector<float> >::const_iterator it = stages.by_name.find("moe_ids");
+        std::map<std::string, std::vector<float> >::const_iterator ix = stages.by_name.find("ffn_norm");
+        if (it != stages.by_name.end() && ix != stages.by_name.end() && ix->second.size() == (size_t) N_EMBD) {
+            std::printf("    engine ids   :");
+            for (size_t k = 0; k < it->second.size(); ++k) std::printf(" %d", (int) (it->second[k] + 0.5f));
+            std::printf("\n");
+            std::vector<float> sel((size_t) N_EXPERT, 0.0f);
+            for (int e = 0; e < N_EXPERT; ++e) {
+                double s = 0.0;
+                for (int j = 0; j < N_EMBD; ++j) {
+                    s += (double) fx.router[(size_t) e * N_EMBD + (size_t) j] * (double) ix->second[(size_t) j];
+                }
+                sel[(size_t) e] = (float) (1.0 / (1.0 + std::exp(-s)) + (double) fx.probs_b[(size_t) e]);
+            }
+            std::printf("    top-8 by hand:");
+            for (int k = 0; k < N_USED; ++k) {
+                int best = -1;
+                float bv = -1e30f;
+                for (int e = 0; e < N_EXPERT; ++e) {
+                    if (sel[(size_t) e] > bv) { bv = sel[(size_t) e]; best = e; }
+                }
+                std::printf(" %d", best);
+                sel[(size_t) best] = -1e30f;
+            }
+            std::printf("\n");
         }
     }
 

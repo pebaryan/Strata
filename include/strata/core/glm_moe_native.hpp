@@ -26,6 +26,6 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
                           const kernels::cpu::NativeFmt& fmt,
                           const uint8_t* (*blob_fn)(void*, int, int), void* blob_ctx,
                           const kernels::glm::MoeGeometry* shexp_g, const float* const* shared, float shexp_clamp,
-                          float* out, std::string& err);
+                          float* out, std::string& err, int* ids_out = nullptr);
 
 }  // namespace strata::core::glm

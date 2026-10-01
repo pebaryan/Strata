@@ -4631,3 +4631,37 @@ verified in isolation):
      rms alone.
   3. THE SHARED EXPERT.  It is added unweighted with its own geometry (2048 wide in this block, not the dense FFN's
      12288) and its own clamp, and it is the part of the stage the parity fixture exercised least.
+
+ROUTING VERIFIED, CLAMP RULED OUT - AND THE ONE LINK NEVER TESTED IS THE PACK'S OWN BLOB
+
+THE ENGINE'S EXPERT IDS ARE CORRECT.  glm_stage_moe_native now hands its chosen ids back (an optional ids_out, since
+which experts were picked is otherwise invisible and a mixture of the right magnitude from the wrong experts looks
+exactly like a numerical error from the outside), the loop reports them on the stage stream, and the gate computes the
+top-8 independently from the same verified input (ffn_norm) and the same fixture weights:
+
+    engine ids   : 178 15 53 1 10 29 147 273
+    top-8 by hand: 178 15 53 1 10 29 147 273
+
+Identical, so the routing rule, the router weight and probs_b are all right on this input.
+
+THE CLAMPS WERE A REAL LATENT BUG AND ARE NOT THIS ONE.  MoeGeometry's clamp_exp / clamp_shexp default to 0.0f, which
+DISABLES them, and the header says so in as many words: "0 disables it, and that is a real behaviour difference, not a
+neutral default: with a limit of 10 it is invisible until a pre-activation exceeds 10, so a caller that forgets it
+will still look right on tame inputs.  Callers must set both from the artifact."  This gate had left both at the
+default.  Setting them to the artifact's 10.0 changed NOTHING - byte-identical numbers on every stage - so no routed
+pre-activation in block 3 reaches 10 and the clamp is not what block 3 is wrong about.  The gate is nonetheless fixed,
+because relying on a default that silently disables a term is how the next block gets misread.
+
+SO THE REMAINING CANDIDATE IS THE PACK'S BLOB CONTENT, and it is the one link in this chain that has never been
+tested.  glm_moe_parity passed for layer 3 - ids exact, moe 1.699e-06, out 1.490e-06 - but it fed the stage blobs from
+a RAW FIXTURE FILE built by glm5_moe_reference.py, not through FileExpertSource.  The engine has therefore never been
+asked whether the bytes the PACK serves for (layer 3, expert 178) are the bytes the GGUF holds for expert 178.  A pack
+whose expert order or per-expert stride differs from the artifact's would produce exactly the observed signature: a
+mixture of the right magnitude drawn from the wrong members, with the routing, the input, the norms, the hc sites and
+the MLA branch all independently verified correct.
+
+THE TEST, for whoever picks this up: take one selected id (178), pull its blob via FileExpertSource for (3, 178), and
+dequantize it against the same expert's tensor read straight from the GGUF.  Equal bytes settle it; unequal bytes are
+the bug.  Pack row for layer 3 for reference: offset 0, blob_bytes 7536640, and the descriptor's bytes match that
+exactly, so the STRIDE is right even if the content is not - which is why the mismatch would not show up as a size
+error anywhere.
