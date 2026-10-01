@@ -2825,3 +2825,43 @@ NEXT AND LAST: the driver.  It fills GlmBlockWeights from glm5-block-l0 (the eig
 sixteen), and the FFN fixture (the three raw block sets, through the two proven dequantizers), reads x.bin, runs
 glm_block_forward for one token, and prints each stage beside its dump family - hc_attn_pre, attn_norm, attn_output,
 hc_attn_post, hc_ffn_pre, ffn_norm, ffn_out, l_out.  Nothing has run the loop yet.
+
+########  block_gate: 29 OF 29 INPUTS SHAPE-VERIFIED - AND THE TOOL'S FIRST RUN CAUGHT 10 WRONG ASSUMPTIONS  ########
+
+    block_gate: 29 of 29 inputs loaded and shape-checked  -> fixture is loadable and shape-consistent
+    NOTE: this version loads only.  The run and the per-stage comparison against the dump come next -
+          the loop has not been executed yet, and loading being right does not make it right.
+
+The tool is load-and-check only, deliberately: nothing computes on a fixture until the fixture is proven
+shape-consistent.  That decision paid for itself on the very first run, which reported 10 of 29 inputs BAD and
+refused to proceed.  Every one was a size I had INFERRED from the geometry rather than measured:
+
+    w_wq        134,217,728 B  vs my 268,435,456   I assumed 2x; it is ne x d_inner = 4096 x 8192
+    w_ssm_a             256 B  vs my 32,768        it is per-head (nh=64), not d_inner
+    w_ssm_f_a     2,097,152 B  vs my 32,768        d_inner x 64
+    w_ssm_f_b     4,194,304 B  vs my 32,768        d_inner x 128
+    w_ssm_beta    1,048,576 B  vs my 32,768        d_inner x 32
+    MISSING w_ssm_dt / w_ssm_norm / w_input_norm   the fixture names them dt_bias and o_norm, and has no
+                                                   separate input_norm because attn_norm serves that role
+
+Errors of 2x to 128x.  Any of them would have produced a plausible wrong answer whose blame would have fallen on
+kernel code that already has passing gates - the most expensive kind of false lead this port has produced.  The
+sizes now come from listing the fixture and dividing by four, because the oracle's writer is the authority on what
+it emits, not my reading of the geometry.
+
+FOUR INSTRUMENTS, AND WHAT EACH CAUGHT:
+
+  * the load-and-check STRUCTURE caught the 10 wrong sizes, by refusing to run rather than proceeding;
+  * the compiler caught six guessed identifiers at once (nh, hd, d_inner() - not n_heads, head_dim, MoE_dense);
+  * the patch tool fixed the table in ONE call after four rounds of python string surgery - all four of which
+    aborted, not on the edit, but on my own over-strict asserts: a bare "n_heads" inside a printf LABEL, then a
+    bare "ssm_dt" inside a COMMENT I had just written, then a count of `{"attn_norm"` that is legitimately 2
+    because attn_norm appears in two tables.  The rule: assert on the string you are CHANGING, never on the bare
+    word, and prefer the patch tool over string surgery for files with repeated identifiers;
+  * the LSP diagnostics were right twice, after I had spent the session treating them as noise - a placeholder I
+    had left in (ne_hack) and a declaration the patch duplicated.  Reading them costs nothing.
+
+STATE: the fixture is proven, the loop is written and links, and NOTHING HAS RUN IT.  The remaining work is the
+run plus the per-stage comparison - the driver half of this tool, comparing hc_attn_pre, attn_norm, attn_output,
+hc_attn_post, hc_ffn_pre, ffn_norm, ffn_out and l_out against their dump families, then feeding l_out-0 back in as
+block 1's input.

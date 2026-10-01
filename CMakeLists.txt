@@ -911,3 +911,8 @@ if(STRATA_BUILD_TESTS)
     add_subdirectory(tests)
   endif()
 endif()
+
+add_executable(block_gate tools/block_gate.cpp src/core/glm_layer.cpp src/core/glm_bind.cpp
+                   src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp src/kernels/glm_hc.cpp
+                   src/kernels/cuda/quantize_act.cu)
+target_link_libraries(block_gate PRIVATE strata_kernels CUDA::cudart)
