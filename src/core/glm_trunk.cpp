@@ -108,7 +108,7 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
             // next slot as part of the call rather than afterwards
             kernels::glm::MlaIntermediates want;
             want.kv = cache + (size_t) cells * (size_t) mla_g.kv_lora;
-            if (!glm_stage_mla(*w.mla, mla_g, xn.data(), cells + 1, cache, attn_out.data(), err)) {
+            if (!glm_stage_mla(*w.mla, mla_g, xn.data(), cells + 1, cache, attn_out.data(), err, &want)) {
                 err = "glm_trunk_forward: layer " + std::to_string(layer) + " MLA: " + err;
                 return false;
             }

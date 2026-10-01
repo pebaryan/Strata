@@ -186,7 +186,8 @@ bool glm_block_forward(const float* x, int tokens, const GlmBlockWeights& w, flo
 /// a caller must apply the indexer's selection before calling.  Stated rather than assumed, since the reference
 /// makes the same statement.
 bool glm_stage_mla(const kernels::glm::MlaWeights& w, const kernels::glm::MlaGeometry& g, const float* x,
-                   int n_cache, const float* cache, float* out, std::string& err) {
+                   int n_cache, const float* cache, float* out, std::string& err,
+                   kernels::glm::MlaIntermediates* want) {
     if (!x || !cache || !out) {
         err = "glm_stage_mla: null argument";
         return false;
@@ -195,7 +196,11 @@ bool glm_stage_mla(const kernels::glm::MlaWeights& w, const kernels::glm::MlaGeo
         err = "glm_stage_mla: geometry and n_cache must be positive";
         return false;
     }
-    kernels::glm::mla_forward(w, g, x, n_cache, cache, out);
+    if (want != nullptr) {
+        kernels::glm::mla_forward(w, g, x, n_cache, cache, out, *want);
+    } else {
+        kernels::glm::mla_forward(w, g, x, n_cache, cache, out);
+    }
     return true;
 }
 

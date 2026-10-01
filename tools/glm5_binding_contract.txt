@@ -4460,3 +4460,37 @@ So the fix is in the gate and it is small: run the five tokens in order, threadi
 exactly as the oracle's does, and compare the LAST token's output against l_out-3.  The oracle dump already holds every
 token, every input and every reference, so nothing new is needed - and this is also the first exercise of the MLA cache
 across tokens, which is the remaining untested mechanism even in the KDA-verified blocks.
+
+THE MLA CACHE WAS NEVER POPULATED - AND FIXING IT COLLAPSED THE BLOCK-3 ERROR BY 16x
+
+    before:  engine rms 0.0571010654   oracle 0.0583536194   worst 0.0582634   (99.8% of rms)
+    after:   engine rms 0.0583401184   oracle 0.0583536194   worst 0.00354951  (6.1% of rms)  ratio 0.999768634
+
+THE BUG, and the evidence that found it was the identical numbers rather than the failing comparison: running five
+tokens with a cache that grew 1 -> 2 -> 3 -> 4 -> 5 produced output BIT-IDENTICAL to the one-token run.  That is only
+possible if the attention sees the same latents either way, and attending over N identical ZERO latents gives the same
+answer for any N - so the cache was not being written at all.  The cause was in glm_trunk_forward's MLA branch:
+
+    kernels::glm::MlaIntermediates want;
+    want.kv = cache + cells * kv_lora;              // a place for this token's latent
+    glm_stage_mla(w, g, xn, cells + 1, cache, attn_out, err);   // ... which was never passed
+
+glm_stage_mla took no MlaIntermediates, so mla_forward ran without a destination and the latent it computes to attend
+with was discarded.  Every token therefore attended over a cache of zeros, and the KDA blocks could not have exposed
+it: KDA's state is a matrix the loop threads, MLA's is a cache the loop had to append to and could not.  Fixed by
+giving glm_stage_mla an optional MlaIntermediates* and passing &want from the loop.
+
+WHY IT WAS INVISIBLE UNTIL NOW, stated plainly: the MLA KERNEL is bit-exact - 5 stages, attn at 0.000e+00, the
+1-entry-cache invariant - because that gate passes a cache that ALREADY holds the token's latent, exactly as the
+oracle does.  Every kernel gate in this port hands the kernel the state it needs; none of them can see whether the
+ASSEMBLY builds that state.  This is the same lesson as the double-norm bug, in a different place: a test that verifies
+a part cannot see a wiring error.
+
+STILL NOT PASSING, and honestly: 6.1% of rms is far above the fp32 floor the KDA blocks reach (1.2e-05), so something
+else in this block is still wrong.  It is now a bisection rather than a search - the two candidates are the remaining
+MLA detail (whether mla_forward attends over the cache INCLUDING the latent it just wrote, or only the entries already
+there) and the routed expert path (blob selection per expert).  The dump holds every intermediate the oracle computed
+for this block, so the next step is to compare the MLA stage's own output against the oracle's.
+
+REGRESSION CHECK: the change touched only the MLA path, so the KDA blocks do not call it - but the two verified gates
+were re-run rather than assumed, and both are unchanged.

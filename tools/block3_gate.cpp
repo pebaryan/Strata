@@ -249,10 +249,13 @@ int main(int argc, char** argv) {
         std::printf("BLOCK3 GATE: FAIL - the dump is too small\n");
         return 2;
     }
-    const float* x = x_all.data() + (size_t) (tokens - 1) * N_EMBD * HC;   // the last prompt token
     const float* want = want_all.data() + (size_t) (tokens - 1) * N_EMBD * HC;
-    std::printf("  %d token(s) in the dump; running token %d (the last), block %d, MLA + routed\n", tokens, tokens - 1,
+    std::printf("  %d token(s) in the dump; running ALL of them in order through block %d (MLA + routed),\n", tokens,
                 LAYER);
+    std::printf("  threading the MLA cache, and comparing the LAST token - because that is the sequence the oracle\n");
+    std::printf("  ran: its token %d attends to the latents of tokens 0..%d.  Feeding only the last token to a fresh\n",
+                tokens - 1, tokens - 1);
+    std::printf("  cache is what made the first attempt fail with a 0.998-of-rms error at a 0.978 rms ratio.\n");
 
     // one MLA cache with room for this token; the loop writes the latent into slot `cells` then attends with cells+1
     std::vector<float> cache((size_t) 8 * ctx.mla_g.kv_lora, 0.0f);
@@ -269,11 +272,14 @@ int main(int argc, char** argv) {
     st.mla_index = mla_index;
 
     std::vector<float> out((size_t) HC * N_EMBD, 0.0f);
-    const bool ok = strata::core::glm::glm_trunk_forward(x, 1, provider, &ctx, ctx.kda_g, ctx.mla_g, 1e-5f, st,
-                                                         out.data(), nullptr, err, LAYER);
-    if (!ok) {
-        std::printf("BLOCK3 GATE: FAIL - the loop returned false: %s\n", err.c_str());
-        return 1;
+    for (int t = 0; t < tokens; ++t) {
+        const float* x = x_all.data() + (size_t) t * N_EMBD * HC;
+        if (!strata::core::glm::glm_trunk_forward(x, 1, provider, &ctx, ctx.kda_g, ctx.mla_g, 1e-5f, st, out.data(),
+                                                  nullptr, err, LAYER)) {
+            std::printf("BLOCK3 GATE: FAIL - the loop returned false at token %d: %s\n", t, err.c_str());
+            return 1;
+        }
+        std::printf("    token %d done; MLA cache now holds %d latent(s)\n", t, mla_len[0]);
     }
 
     double worst = 0.0, ssum = 0.0, wsum = 0.0;

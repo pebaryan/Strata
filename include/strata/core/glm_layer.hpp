@@ -95,8 +95,13 @@ bool glm_block_forward(const float* x, int tokens, const GlmBlockWeights& w, flo
 /// Stage 3b: the MLA site, for blocks whose attention is latent rather than KDA (the artifact declares the kind
 /// per layer in glm5next.attention.head_count_kv).  `cache` is [n_cache][kv_lora] of latents, the current
 /// position included, since the reference appends before attending.
+/// `want` is how the caller gets this token's LATENT out.  mla_forward computes it to attend with, but without a
+/// place to put it the caller cannot append it to the cache - and the cache is how MLA carries state across tokens,
+/// so a caller that drops it gives every token a cache of the same value it started with.  Optional because a
+/// single-token parity check does not need it; a sequence does.
 bool glm_stage_mla(const kernels::glm::MlaWeights& w, const kernels::glm::MlaGeometry& g, const float* x,
-                   int n_cache, const float* cache, float* out, std::string& err);
+                   int n_cache, const float* cache, float* out, std::string& err,
+                   kernels::glm::MlaIntermediates* want = nullptr);
 
 /// Stage 4b: the MoE site - route, weighted expert sum, and the unweighted shared expert, all inside moe_forward.
 /// Takes pointers to the expert weights rather than owning them, because the experts are streamed from the pack.
