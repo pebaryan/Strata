@@ -2566,3 +2566,36 @@ remembering: hc_post, for instance, was verified with the attn site's mix.
 NEXT: implement the block assembly in glm_layer.cpp against that order, then verify it stage by stage against the
 dump's per-block activations - which exist for all 45 blocks and were read successfully for block 1 (attn_norm-1,
 ne=[4096,5,1,1]), so the chain can be gated one stage at a time rather than only end to end.
+
+########  THE DUMP CARRIES EVERY STAGE OF THE CHAIN, INCLUDING THE BLOCK OUTPUT  ########
+
+Distinct per-block families in glm5-ref-dump5, block 0:
+
+    l_out          the BLOCK OUTPUT                    attn_output    the attention's output
+    hc_attn_pre    the attn site's hc_pre              hc_attn_post   the attn site's hc_post
+    hc_ffn_pre     the ffn site's hc_pre               ffn_out        the FFN's output
+    attn_norm      the attention's RMS norm            ffn_norm       the FFN's RMS norm
+    kda_gate, kda_beta                                 hc_attn_base/scale, hc_ffn_base/scale
+
+So the reference data covers the ENTIRE block sequence, not just isolated stages:
+
+    hc_attn_pre -> attn_norm -> [attention] -> attn_output -> hc_attn_post
+      -> hc_ffn_pre -> ffn_norm -> ffn_out -> l_out
+
+Two consequences that together make the chain tractable:
+
+  1. IT CAN BE GATED STAGE BY STAGE.  Every step has expected values, so a partially assembled block can be checked
+     at each point rather than only when finished - which matters because a chain failure is otherwise hard to
+     localise, and this port has just spent hours learning what that costs.
+
+  2. THE CHAIN'S INPUTS EXIST PER BLOCK.  l_out-N is block N's output and therefore block N+1's input, so the real
+     hidden state is available for every block without running anything.  A gate can feed block N+1 its true input
+     rather than the oracle's seed, which is what separates "the kernel handles these weights" from "the block
+     computes the right answer from the real state" - the distinction this file has been careful to draw.
+
+Note also attn_output-0 has (cont) and (cont) (reshaped) variants, i.e. the token-major layout with continuations,
+the same shape convention as attn_norm-N.  Read the header, as always: hc_attn_pre-1 measured ne=[4096,5,1,1].
+
+WHAT THIS MEANS FOR THE ASSEMBLY WORK: implement the order above in glm_layer.cpp, then check each stage against the
+matching dump family, then check l_out against the next block's real input by feeding it back in.  No new arithmetic
+and no new reference data are needed - both halves already exist.
