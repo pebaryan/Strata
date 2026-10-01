@@ -159,6 +159,7 @@ void add(strata::core::GlmBoundBlock& b, const char* name, std::vector<float>& v
 
 struct ProviderCtx {
     const strata::core::GlmBoundBlock* block = nullptr;
+    int layer = 0;
     strata::kernels::glm::KdaGeometry kda_g;
     strata::kernels::glm::MlaGeometry mla_g;
     strata::kernels::glm::MoeGeometry dense_g;   // the dense FFN's own width, not the routed default
@@ -168,8 +169,9 @@ struct ProviderCtx {
 
 bool provider(void* raw, int layer, strata::core::glm::GlmTrunkLayerWeights& out, std::string& err) {
     ProviderCtx* c = (ProviderCtx*) raw;
-    if (!strata::core::glm::glm_fill_layer_weights(*c->block, layer, c->kda_g, c->mla_g, c->kda, c->mla, nullptr, out,
-                                                   err)) {
+    (void) layer;   // the loop's index; the CLI layer is what selects the weights, see the note in main
+    if (!strata::core::glm::glm_fill_layer_weights(*c->block, c->layer, c->kda_g, c->mla_g, c->kda, c->mla, nullptr,
+                                                   out, err)) {
         return false;
     }
     if (c->dense_g.ff) out.moe_g = &c->dense_g;      // a leading dense block's width, set explicitly
@@ -185,6 +187,14 @@ int main(int argc, char** argv) {
         return 2;
     }
     const std::string bd = argv[1], kd = argv[2], fd = argv[3], dd = argv[4];
+    // Extra arguments so two blocks can be chained BY RUNNING THE TOOL TWICE: the second run consumes the first's
+    // output as its input.  That is not a substitute for the 45-block loop - it is a way to execute and verify a
+    // SECOND block, with its own real weights, before the pack-based chain target exists.  It is valid to serve
+    // layer N's block through the loop's layer-0 slot because the loop selects only the KIND (KDA/MLA, dense/routed)
+    // and the dense KDA blocks have identical tensor names; `layer` below is what the weight provider dispatches on.
+    const int layer = argc > 5 ? std::atoi(argv[5]) : 0;
+    const std::string in_name = argc > 6 ? argv[6] : "hc_init.bin";
+    const std::string out_name = argc > 7 ? argv[7] : "";
     const int N_EMBD = 4096, NH = 64, HD = 128, D_CONV = 4, FF_DENSE = 12288, HC = 4;
 
     Fixture fx;
@@ -221,7 +231,7 @@ int main(int argc, char** argv) {
     // the block's INPUT and the dump's own output, for the reported comparison
     std::vector<float> x, want;
     int ne_x[4] = {0, 0, 0, 0}, ne_w[4] = {0, 0, 0, 0};
-    all &= load_dump(dd + "/hc_init.bin", x, ne_x, "hc_init (the block-0 input streams)");
+    all &= load_dump(dd + "/" + in_name, x, ne_x, in_name.c_str());
     all &= load_dump(dd + "/l_out-0.bin", want, ne_w, "l_out-0 (the dump's block output)");
     std::printf("trunk_gate: hc_init ne=[%d,%d,%d,%d] %zu floats; l_out-0 ne=[%d,%d,%d,%d] %zu floats\n", ne_x[0],
                 ne_x[1], ne_x[2], ne_x[3], x.size(), ne_w[0], ne_w[1], ne_w[2], ne_w[3], want.size());
@@ -266,6 +276,7 @@ int main(int argc, char** argv) {
 
     ProviderCtx ctx;
     ctx.block = &block;
+    ctx.layer = layer;
     ctx.kda_g.n_embd = N_EMBD; ctx.kda_g.nh = NH; ctx.kda_g.hd = HD; ctx.kda_g.d_conv = D_CONV;
     ctx.mla_g.n_embd = N_EMBD;
     ctx.dense_g.n_embd = N_EMBD; ctx.dense_g.ff = FF_DENSE;
@@ -274,7 +285,7 @@ int main(int argc, char** argv) {
     std::vector<float> kda_state((size_t) NH * HD * HD, 0.0f);
     float* kda_state_ptrs[1] = {kda_state.data()};
     int kda_index[16] = {0};
-    for (int i = 0; i < 16; ++i) kda_index[i] = (i == 0) ? 0 : -1;
+    for (int i = 0; i < 16; ++i) kda_index[i] = (i == 0) ? 0 : -1;   // the loop's slot 0; `layer` selects weights
 
     strata::core::glm::GlmTrunkState state;
     state.kda_state = kda_state_ptrs;
@@ -319,6 +330,16 @@ int main(int argc, char** argv) {
         std::printf("        oracle's own input: a ne0-fastest file from the fixed write_tensor.  Earlier runs compared\n");
         std::printf("        differently-arranged files through an rms, which is permutation-invariant and so could not\n");
         std::printf("        detect that the two sides held different arrangements at all.\n");
+    }
+    if (!out_name.empty()) {
+        FILE* of = std::fopen((dd + "/" + out_name).c_str(), "wb");
+        if (!of) { std::printf("TRUNK GATE: FAIL - cannot write %s\n", out_name.c_str()); return 1; }
+        const unsigned hdr[5] = {0, (unsigned) N_EMBD, (unsigned) HC, 1u, 1u};
+        std::fwrite(hdr, 4, 5, of);
+        std::fwrite(out.data(), 4, out.size(), of);
+        std::fclose(of);
+        std::printf("  wrote %s (%zu floats, ne=[%d,%d,1,1]) so the next block can consume it as its input\n",
+                    out_name.c_str(), out.size(), N_EMBD, HC);
     }
     std::printf("TRUNK GATE: PASS (the loop executed end to end on real weights; see the note on the comparison)\n");
     return 0;

@@ -4008,3 +4008,36 @@ for most of a session.
 
 BLOCK 0 IS VERIFIED.  The assembly executes end to end and agrees with the oracle to 1.2e-05 of rms, which for fp32
 accumulation over a KDA block plus a 12288-wide SwiGLU with two dequantized operands is the arithmetic's own floor.
+
+TWO BLOCKS VERIFIED, INCLUDING THE CROSS-BLOCK CHAIN
+
+    block 0 (re-check)        worst 7.35745e-08   relative 1.23591e-05   ratio 1
+    block 1 ISOLATED          worst 9.68575e-08   relative 1.33529e-05   ratio 1    fed the ORACLE's l_out-0
+    block 1 CHAINED           worst 1.16415e-07   relative 1.60491e-05   ratio 1    fed the ENGINE's l_out-0
+
+Three things ran for the first time and all three are at the fp32 floor:
+
+  * a SECOND block, with its own real weights (built from the artifact by tools/make_block_fixture.py 1, which already
+    took the block number as an argument - no new code);
+  * the CROSS-BLOCK CHAIN: block 0's output became block 1's input.  The chained error (1.16e-07) is barely above the
+    isolated one (9.69e-08), which is the point - the engine's own block-0 output is as good an input as the oracle's,
+    exactly as block 0's own 7.4e-08 agreement predicts;
+  * the error grows monotonically with depth (7.36e-08, 9.69e-08, 1.16e-07) as fp32 accumulation should, rather than
+    jumping by an order of magnitude, which is what a wiring error looks like.
+
+HOW, WITHOUT THE BIG REFACTOR: layer 1 is ALSO KDA + dense and its tensor names are identical to layer 0's, so the
+loop's kind dispatch is the same for both.  trunk_gate therefore needed only an input-file name and an output-file
+writer to chain two runs by running the tool twice - the second consuming the first's output.  The `layer` argument
+selects which block's weights the provider serves.  This is NOT a substitute for the 45-block loop, and it is recorded
+as what it is: a way to execute and verify a second block before the pack-based chain target exists.
+
+A detail worth keeping, because it made the isolated test possible with no code change at all: trunk_gate compares
+against whatever is named l_out-0.bin in its directory and takes its input from hc_init.bin.  So a directory holding
+the ORACLE'S l_out-1 under the name l_out-0.bin and the ORACLE'S l_out-0 under the name hc_init.bin turns the tool
+into a block-1 gate: input and reference both the oracle's, block 1's weights, and the comparison is then genuinely
+apples-to-apples.  The naming convention is a limitation of the tool and is worked around rather than hidden.
+
+STATE: two blocks verified to the fp32 floor, both isolated and chained.  What remains is unchanged in kind and smaller
+in scope - the pack-based chain target (WeightTable/arena/NativeDense, 45 binds, FileExpertSource, native_fmt from the
+pack's own types, 34 KDA states and 11 MLA caches), the head, and the gate argmax == 12089.  The MLA path has still
+never executed at all, and block 3 is the first MLA layer.
