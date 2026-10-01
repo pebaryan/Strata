@@ -2212,3 +2212,38 @@ NEXT, and it is a one-line diagnostic rather than a new probe: have report() pri
 difference, not just its magnitude.  A difference spread across all d_inner channels says the matmul; one
 concentrated at a boundary or at a single channel says the conv or an indexing slip.  That distinguishes the two
 remaining candidates with no kernel change and no new build.
+
+########  THE ANSWER: THE ENGINE IS RIGHT, THE BLOCK-1 FIXTURE IS INTERNALLY INCONSISTENT  ########
+
+Recomputing the oracle's own documented recipe - silu(conv1d_causal(xn @ wq.T, conv_q)) - from the FIXTURE'S OWN
+xn, wq and conv_q, and comparing against the fixture's inter_qc.bin:
+
+    block 0:  max|recipe - fixture_qc| rel 7.975e-08      the recipe reproduces the fixture
+    block 1:  max|recipe - fixture_qc| rel 8.540e+00      it does not
+
+And 8.540e+00 is the SAME NUMBER the engine was reported as failing by, to four significant digits.  The engine's
+qc and the fixture's inter_qc agree with each other and disagree with the arithmetic that the fixture's own inputs
+imply.  Therefore:
+
+    THE KDA KERNEL IS CORRECT ON BLOCK 1 TOO.  It has been computing what the fixture asks for.  Every stage of
+    this investigation that pointed at the kernel - the conv subgion, the matmul, the parameters - was looking at
+    code that reproduces the reference data it is given.
+
+The defect is in the FIXTURE: for block 1, inter_qc.bin is not the output of the recipe applied to that fixture's own
+xn, wq and conv_q.  A fixture whose parts do not imply each other cannot validate anything, and kda_gate was
+faithfully reporting a disagreement between two things that were never consistent.
+
+WHY BLOCK 0 WORKS AND BLOCK 1 DOES NOT is not yet established, and the difference has to be in the builder's
+block-1 path rather than in any kernel.  The candidates, none yet excluded:
+  * inter_qc is written from the oracle's returned dict, so a key/value mismatch in that dict would produce exactly
+    this - a named file that is some other tensor;
+  * the input differs in kind: block 0 gets hc_pre's layer_in, block 1 gets hc_attn_pre-1, and the intervening
+    quantities (xn) are consumed differently;
+  * the conv repack could be applied to the oracle's dict but not to the file, or vice versa.
+
+THE GENERAL LESSON, and it is the same one this file has recorded twice already in other forms: a gate cannot
+validate anything if its parts do not imply each other.  The check that found this was three lines of numpy
+recomputing the reference from the reference's own inputs - and it should have been the FIRST thing done, before
+reading matvec, before reading conv1d_silu, before two rounds of narrowing.  The right order is: does the fixture
+agree with itself, THEN does the engine agree with the fixture.  Asking the second question first cost most of a
+session and very nearly produced a "fix" to correct code.
