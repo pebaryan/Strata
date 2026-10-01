@@ -2688,3 +2688,28 @@ WHY THIS IS A GOOD PLACE TO STOP: the four stage functions are additive and inde
 they change no existing behaviour.  The loop is the first piece of the chain with real logic - the routing in steps 4
 and 7, and the shape alternation - so it deserves a fresh context rather than the tail of a long one.  Nothing is
 half-written: every function present compiles, links, and is a call into a kernel with its own gate.
+
+THE OPEN QUESTION IS CLOSED: glm_stage_hc_norm RETURNS THE NORMED VALUE
+
+    if (norm_w) {
+        double ss = 0; for (i) ss += layer_in[i]^2;
+        const float rms = 1/sqrt(ss/n_embd + eps);
+        for (i) layer_in[i] = layer_in[i] * rms * norm_w[i];       // IN PLACE
+    }
+
+So the same function yields either of the dump's two quantities depending on the argument:
+    norm_w = the site's norm weight   -> layer_in becomes attn_norm-N    (normed)
+    norm_w = nullptr                  -> layer_in remains hc_attn_pre-N  (pre-norm)
+which is how the driver printed both, and it means the seven-call loop spec needs NO separate norm step.  The
+ambiguity that worried me was in the naming, not in the arithmetic - and it was worth resolving before building on
+it, because a missing or duplicated norm is exactly the kind of "wrong against wrong" that this port has already been
+bitten by once.
+
+That closes the last unknown in the block loop.  The spec stands as recorded: seven calls, four stage functions,
+with the norm folded into the first of each site pair.
+
+NEXT AND ONLY NEXT: write the loop.  It is fully specified - the call sequence, the buffer shapes and the residual
+routing are all recorded above - and the dump provides an expected value for every intermediate, so it can be gated
+stage by stage rather than only end to end.  What it needs beyond the loop itself is a driver that runs it for block 0
+and prints each intermediate's statistics beside its dump family, in the same shape kda_gate and ffn_gate already
+use; then feed l_out-0 in as block 1's input and check the chain.
