@@ -4285,3 +4285,37 @@ wrote, which cost one failed lookup here.
 STATE: every kernel verified against the oracle; blocks 0 and 1 end to end, isolated and chained, at the fp32 floor; the
 head verified complete AND producing the correct token at full depth.  Unverified: the engine's own 45-block trunk,
 which needs the pack - the is_mla and routed branches of glm_trunk_forward have still never executed.
+
+BLOCK 3'S DENSE TENSORS ARE FETCHED - the MLA + routed block is now half-fixture
+
+21 of 21 tensors fetched from the artifact to /home/peb/moredata/glm5-block-l3 by name, and their SIZES independently
+confirm the MLA geometry that glm_mla_parity printed (64 heads x 256, kv_lora 512, q_lora 1536):
+
+    w_hc_attn_fn     393,216   = 24 x 16,384        w_hc_attn_base      24        w_hc_attn_scale  3
+    w_attn_norm        4,096                        w_hc_ffn_fn    393,216        w_hc_ffn_base   24
+    w_hc_ffn_scale         3                        w_ffn_norm       4,096
+    w_q_a          6,291,456   = 1,536 x 4,096      w_q_a_norm       1,536
+    w_q_b         25,165,824   = 16,384 x 1,536     w_kv_a       2,097,152   = 512 x 4,096
+    w_kv_a_norm          512                        w_k_b        8,388,608   = 64 x 512 x 256
+    w_v_b          8,388,608                        w_wo        67,108,864   = 4,096 x 16,384
+    w_router       1,179,648   = 288 x 4,096        w_probs_b          288
+    w_shexp_gate/up 8,388,608  = 2,048 x 4,096      w_shexp_down 8,388,608  = 4,096 x 2,048
+
+Every one matches a shape the engine's own structs declare, so the names in glm_fill_layer_weights' Names struct are
+not merely plausible for an MLA layer - they resolve, at the right widths, in the artifact.  The one that matters most is
+shexp: ff = 2,048 for the SHARED expert, the same width as a routed expert and NOT the dense block's 12,288, which is
+why GlmTrunkLayerWeights carries a separate shexp geometry rather than assuming one.
+
+WHAT IS STILL MISSING FOR BLOCK 3, and it is only the routed half: the QUANTIZED EXPERT BLOBS.  The dense tensors above
+are floats and come from the artifact; the experts are ggml blocks and come from the pack's experts.bin (86.41 GB) via
+FileExpertSource::open(pack_dir, n_layers, n_expert) - the interface whose blob(layer, expert), begin_layer(layer, ids,
+k) and pinned/reads members were read earlier.  With those, plus native_fmt(gu_type, d_type, 4,096, 2,048) built from the
+types the pack's own native_experts.txt carries for layer 3, glm_stage_moe_native has everything it needs.
+
+SO THE BLOCK-3 GATE IS: bind these 21 tensors to a GlmBoundBlock, run glm_fill_layer_weights with layer = 3 (which
+selects MLA + routed by itself - no forcing), fill in moe_g {n_embd 4,096, n_expert 288, n_used 8, ff 2,048}, shexp_g
+and the shexp triple, open FileExpertSource on the pack, set moe_fmt and blob_fn, and call glm_trunk_forward with 1
+layer.  Its input is the oracle's l_out-2 and its reference is the oracle's l_out-3 - both already on disk from the full
+45-block run, so no new oracle work is needed and the comparison is apples-to-apples by construction.  That single run
+would exercise BOTH branches of the loop that have never executed, and it is the last thing standing between this port
+and a 45-block run.
