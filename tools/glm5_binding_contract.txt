@@ -922,3 +922,29 @@ KDA STAGE - THE NAME MYSTERY IS SOLVED, AND WHAT THE TENSOR SHAPES ALREADY SAY
    which is what glm5_kda_reference's `xn @ w["wq"].T` expects, and attn_output as ne=4096,8192 = [n_embd,
    d_inner], which is what `w["wo"]` expects.  So the KdaWeights fill is a straight name mapping with NO
    transpose, and if the gate disagrees on the first run, transposition is not the first suspect.
+
+GENERALISING THE BIND-TIME DEQUANT - ATTEMPTED, MEASURED, REVERTED
+
+Goal: attn_q/k/v are Q8_0 natively and the KDA kernel wants floats, so the branch at glm_bind.cpp:120 that
+currently requires "_fn.weight" needed widening to any quantized tensor.  GlmTensorRow's quantized-ness is
+`ttype` (glm5_blocks_gen.hpp:7 - there is no `quantized` member; that was the first compile error).
+
+Three variants were tried and all three exit 1:
+
+  widened to `t.ttype != 0`                        -> cudaMalloc failed for blk.0.attn_output.weight
+  + `w->native_data != nullptr`                    -> same
+  + exclude names containing "_exps"               -> same
+
+so the poisoner is NOT the expert tensors (my first theory) and NOT a null pointer.  GPU memory is not exhausted
+(18 MiB in use when it fails), so this is a POISONED CONTEXT: something earlier in the bind loop faults, and the
+next cudaMalloc reports failure - the same signature as the host-pointer dequant fault found earlier today.
+The failure lands on blk.0.attn_output.weight, which in bind order comes after attn_q/k/v, so the candidate set is
+the tensors bound before it - the most likely being attn_q itself, i.e. the first tensor the widening newly
+affects.  Note the branch sizes its buffer as ne0*ne1 floats and calls dequant_q8_0 with that as an ELEMENT count;
+for a natively-served Q8_0 tensor the element count must come from the NATIVE tensor's own geometry, not the plan
+row, and that is the first thing to verify rather than assume.
+
+REVERTED to the last verified state: the driver binds block 0 and stage 1 prints its verified number
+(-0.359747499 / 0.424176991 / 3.25002776) with STRATA_HC_DEQUANT=1.  The KDA gate therefore needs either this
+branch finished properly, or - much cheaper - a KDA fixture whose weights can be read as floats without it, since
+attn_q/k/v are the only KDA inputs that are quantized.
