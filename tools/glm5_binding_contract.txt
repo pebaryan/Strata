@@ -2530,3 +2530,39 @@ print the byte count actually written at creation time and assert it against the
 
 FFN GATE STATUS: block 0 PASS at the fp32 floor with the clamp verified by a demonstrated failure (clamp disabled
 costs 15000x over 4092 elements); block 1 matches at the same floor with the clamp untested on a real activation.
+
+########  THE CHAIN IS GLUE, NOT MATH - AND THAT IS THE ACTIONABLE FINDING  ########
+
+src/core/glm_layer.cpp and its header contain EXACTLY ONE stage function:
+
+    glm_stage_hc_norm    hc_pre + the host RMS norm, i.e. stage 1
+
+So the engine cannot execute a whole block yet, and the chain - block N's output feeding block N+1's input - is not
+one function away.  But every piece the assembly needs already exists and has been independently verified:
+
+    hc_pre          verified against the oracle to 7 significant digits (block 0)
+    the RMS norm    5.4e-10
+    kda_forward     PASS on blocks 0, 1, 2 and 4, 12/12 stages each, plus T=5 on block 0
+    hc_post         2.551e-07, the tightest agreement in the port
+    expert_ffn      block 0 PASS at the fp32 floor with the clamp verified by a demonstrated failure;
+                    block 1 matches at the same floor
+    the binding     16/16 KDA weights bound to oracle values, plus every FFN tensor now readable as floats
+
+So the remaining work on block 0's chain is ASSEMBLY: calling the pieces in the right order with the right residual
+routing, and no new arithmetic.  That is a very different proposition from "the chain is unverified", and it is the
+single most useful thing to know before starting it.
+
+THE ORDER, from the reference and confirmed by the dump's own per-block stage names: each block has TWO
+hyper-connection sites, which is why the dump carries both hc_attn_pre-N and hc_ffn_pre-N for every N -
+
+    x -> hc_pre (attn site)  -> attn_norm -> attention (KDA, or MLA at block 3)
+      -> hc_post (attn site) -> hc_pre (ffn site) -> ffn_norm -> FFN (dense below block 3, MoE at and above)
+      -> hc_post (ffn site)  -> the block's output, which is the next block's input
+
+The two hc sites are why hc_attn_fn/base/scale and hc_ffn_fn/base/scale both exist per block, and why the dump has
+hc_ffn_pre-N alongside hc_attn_pre-N.  The gate fixtures built so far exercise the ATTN site only, which is worth
+remembering: hc_post, for instance, was verified with the attn site's mix.
+
+NEXT: implement the block assembly in glm_layer.cpp against that order, then verify it stage by stage against the
+dump's per-block activations - which exist for all 45 blocks and were read successfully for block 1 (attn_norm-1,
+ne=[4096,5,1,1]), so the chain can be gated one stage at a time rather than only end to end.
