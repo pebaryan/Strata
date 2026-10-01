@@ -253,11 +253,56 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
             // type -1 (attn_k_b.weight)": this branch was marking a FLOAT buffer quantized, with the sentinel type -1
             // carried over from a WeightRef that has no native blocks, so a dequantizer was handed floats.  Recording
             // quantized = false says what the data IS, and that is what makes the staging pass leave it alone.
-            got.ptr = (const float*) owner->tensor_data(*found);
-            got.quantized = false;
-            got.native_type = 0;
-            got.ne0 = t.ne0;
-            got.ne1 = t.ne1;
+            // AND THEY ARE Q8_0 BLOCKS, not floats - which is what the arithmetic says and what I had backwards for one
+            // commit.  These tensors are 64 x 512 x 256 = 8,388,608 elements; as floats that would be 33,554,432
+            // bytes, but the artifact declares 8,912,896, and 8,388,608 / 32 * 34 = 8,912,896 exactly - Q8_0 is 34
+            // bytes per 32 values.  The type is 8.  So tensor_data() hands back BLOCKS, the consumer is a CPU kernel,
+            // and the staging must dequantize them (type 8 is one of the three dequantizers gated bit-exact).
+            //
+            // AND THE ELEMENT COUNT MUST COME FROM THE ARTIFACT'S OWN SHAPE.  A product of two dimensions cannot
+            // express a three-dimensional tensor: the previous version sized its copy as ne0 * ne1 * 4 = 524,288
+            // bytes, fourteen times short of 8,912,896, and nobody noticed because nothing ever read it.  elements()
+            // multiplies every dimension the file declares.
+            // AND THE BLOCKS HAVE TO BE UPLOADED, because the dequantizer is a CUDA kernel and CUDA kernels cannot
+            // dereference host memory on this device.  Leaving the source in the artifact's mapping - which is what the
+            // previous commit did - produced "the kernel failed for attn_k_b.weight: an illegal memory access was
+            // encountered": the right blocks, the right type, and a pointer the kernel was never able to read.
+            //
+            // The byte count comes from ggml_row_size over the artifact's OWN type and element count, which is the
+            // whole point of taking it from found rather than from the bound tensor: 8,388,608 elements at type 8 is
+            // 8,912,896 bytes, and a two-dimensional ne0 * ne1 * 4 would have been 524,288 - fourteen times short.
+            // The block sizes are the ones the dequantizers themselves are gated on - Q8_0 34 bytes per 32 values,
+            // Q5_K 176 per 256, Q6_K 210 per 256 - and anything else is REFUSED rather than guessed, because the
+            // previous four versions of this line each assumed a size and each was wrong.  ggml_row_size would be the
+            // tidy answer and is not available to this translation unit, which is why the numbers are stated here with
+            // the sentence that pins them.
+            const size_t nelem = (size_t) found->elements();
+            size_t nbytes = 0;
+            switch (found->type) {
+                case 8:  nbytes = nelem / 32 * 34;  break;     // Q8_0
+                case 13: nbytes = nelem / 256 * 176; break;    // Q5_K
+                case 14: nbytes = nelem / 256 * 210; break;    // Q6_K
+                default:
+                    err = "glm_bind: " + full + ": type " + std::to_string(found->type) +
+                          " is not a block type this fetch can upload";
+                    return false;
+            }
+            float* dev3 = nullptr;
+            if (cudaMalloc(&dev3, nbytes) != cudaSuccess) {
+                err = "glm_bind: alloc failed for " + full + " (" + std::to_string(nbytes) + " bytes)";
+                return false;
+            }
+            if (cudaMemcpy(dev3, owner->tensor_data(*found), nbytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                cudaFree(dev3);
+                err = "glm_bind: upload failed for " + full;
+                return false;
+            }
+            out.owned.push_back(dev3);
+            got.ptr = (const float*) dev3;
+            got.quantized = true;
+            got.native_type = (int) found->type;           // 8 = Q8_0, read from the artifact rather than assumed
+            got.ne0 = (int) found->elements();             // the FULL element count; ne1 stays 1
+            got.ne1 = 1;
             out.tensors.push_back(got);
             continue;
         } else if (w->native_data) {

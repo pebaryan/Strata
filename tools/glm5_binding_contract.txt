@@ -5303,3 +5303,37 @@ and carry the FULL element count across all three dimensions - 8,388,608, not ne
 produces the right number of values.  Which means the bound Tensor needs either a third dimension or the total count
 recorded, since its ne0/ne1 pair cannot express a 3-D tensor; that is the same four-byte-shaped gap the native_type
 field closed one commit ago, and it is the last thing standing between the trunk and layer 3.
+
+THE FETCH NOW UPLOADS CORRECTLY-TYPED, CORRECTLY-SIZED BLOCKS - AND THAT IS WHERE THIS SESSION ENDS
+
+Three versions of one line, each trying to state a size, and the fourth is the one with an authority behind it:
+
+  1. ne0 * ne1 * 4                                  524,288 - two dimensions of three, and floats for blocks
+  2. (the host pointer, quantized = false)          the right blocks read as floats: SIGSEGV in mla_forward
+  3. the host pointer, quantized = true             the right blocks, but a host pointer a CUDA kernel cannot
+                                                    dereference: "an illegal memory access was encountered"
+  4. THIS ONE: upload at the artifact's own type and element count, using the block sizes the dequantizers are
+     themselves gated on - Q8_0 34 bytes per 32 values, Q5_K 176 per 256, Q6_K 210 per 256 - with anything else
+     REFUSED rather than guessed.  ggml_row_size would be the tidy answer; it is not reachable from this translation
+     unit, and rather than move a build dependency to satisfy one line, the numbers are stated where the sentence
+     pinning them can be read.
+
+    CHECK: 8,388,608 elements at type 8 -> 8,388,608 / 32 * 34 = 8,912,896 bytes, which is exactly the size the
+    artifact declares for blk.3.attn_k_b.weight.  The declared size and the computed size agree, which is the first
+    time in four attempts that a size in this branch was checked against the file it came from.
+
+AND THE RUN IS BACK TO A SIGSEGV, this time inside mla_forward with genuinely correct blocks - so what remains is not
+provenance, not type and not extent, but LAYOUT, and the fixture's own shapes say the layout should already be right:
+
+    artifact:  blk.3.attn_k_b.weight shape [256, 512, 64]   (ggml ne order, ne0 fastest)
+    reversing: (64, 512, 256) = (N_HEAD, KV_LORA, HEAD_DIM) = the fixture's wk_b exactly
+    so the raw ne0-fastest flattening IS the array the fixture feeds mla_forward, index (i,j,k) at (i*512 + j)*256 + k,
+    and a straight dequantization reproduces it.  That is an argument, not a measurement - and this port's record on
+    arguments about layout is that they have been wrong four times in a row, so the next step is to MEASURE it: dump
+    the dequantized attn_k_b for layer 3 and compare it elementwise against the fixture's own wk_b, which is the same
+    kind of check that caught the transposed dump writer and the double-normed KDA.
+
+STATE AT SESSION END: the trunk runs blocks 0, 1 and 2 fully from the real pack; layer 3 is entered and dies inside
+mla_forward on a tensor whose blocks are now the right type and the right size.  Four of my own assumptions were
+corrected by measurement this session - the misread index columns, the dense-FFN exception, owned/host_stage, and the
+floats-for-blocks error - which is the ratio to keep in mind when reading the layout argument above.
