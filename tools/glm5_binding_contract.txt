@@ -132,3 +132,32 @@ The only thing left that is NOT in this file is one engine API detail: the concr
 provides v.get(name) / v.name(name) (used in src/core/layer.cpp but not yet read out here).  Look that up,
 then glm_bind.cpp is a loop over kGlmBlock0[] with the two branches and these transforms - nothing to
 rediscover.  Pass criterion for 9.1 is unchanged: bound layer-0 tensors reproduce the Python block-0 outputs.
+
+## THE LAST UNKNOWN, FOUND: LayerView (include/strata/core/layout.hpp:77-78)
+
+    class LayerView {
+        std::string name(const char* suffix) const;                     // "blk.<layer>." + suffix
+        const WeightRef* get(const char* suffix) const;                 // table_->find(name(suffix))
+    };
+
+So the binding takes a LayerView and SUFFIXES - the "blk.0." prefix in kGlmBlock0[] is stripped at the call
+site, and a missing tensor is a null return that must be reported by name (layer.cpp does exactly this with
+`v.name(missing) + " is missing"`).
+
+glm_bind.cpp, therefore, in full:
+
+    bool bind_glm_block(LayerView& v, GlmBlockBind& out, std::string& err) {
+        for (const auto& t : tensors for this block) {              // kGlmBlock0[] for layer 0
+            const WeightRef* w = v.get(suffix_of(t.name));
+            if (!w) { err = v.name(suffix_of(t.name)) + " is missing"; return false; }
+            if (t.ttype == 0) out.slot(t.name) = (const float*) w->data;        // 12 F32, unmodified
+            else dequant_q8_0(blocks_of(*w), out.owned(t.name), n, stream);     // 14 Q8_0, then transpose
+        }
+        apply conv reshape(d_inner, d_conv).T;                       // trap 1, F32, shape fold only
+        apply the (in,out) -> (out,in) transpose for the 14;         // trap 7, uniform
+        return true;
+    }
+
+9.1's spec is now complete and verified: table generated, values checked (12/12 byte-identical, 14/14
+one uniform orientation rule), API read, signature fixed.  What remains for 9.1 is writing this function, the
+CMake entry, and the pass check against the Python block-0 outputs.
