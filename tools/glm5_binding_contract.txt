@@ -3463,3 +3463,51 @@ because a missing member cannot be silent.
 
 STILL TO DO on the plan: the trunk loop over blocks 0..44, the MLA latent cache, and the head (final norm, lm_head,
 greedy argmax, tokenizer decode) - then the gate, argmax == 12089.
+
+THE TRUNK LOOP EXISTS: glm_trunk_forward, 45 BLOCKS DISPATCHING ON KIND
+
+    src/core/glm_trunk.cpp + include/strata/core/glm_trunk.hpp
+    T strata::core::glm::glm_trunk_forward      verified by compiling the TU standalone and nm'ing the object
+
+Per layer, in the order the dump's own stage names confirm:
+
+    hc_pre -> attn_norm -> attention -> hc_post -> hc_pre -> ffn_norm -> FFN -> hc_post
+
+with the attention branching on glm_attention_is_mla(layer) - KDA via glm_stage_kda with a recurrent state slot, MLA
+via glm_stage_mla with a growing latent cache - and the FFN on glm_ffn_is_dense(layer) - the three matrices through
+glm_stage_ffn, or the router and streamed experts through glm_stage_moe_native.  Between the sites everything is HC
+rows; the attention and FFN outputs are one vector.  Both are float*, so the buffer names say which is which.
+
+FOUR DECISIONS THE LOOP MAKES EXPLICIT, each one a place a silent wrong answer could have lived:
+
+  * WEIGHTS ARE SUPPLIED BY A PROVIDER, never owned.  `GlmTrunkProvider(ctx, layer, out, err)` fills one layer's
+    weights, so the same loop runs from a bound artifact or from fixture files - the property every gate in this port
+    depends on.  A provider that returns false STOPS the trunk rather than skipping the layer, because a skipped layer
+    in a 45-layer chain produces a plausible answer rather than an error.
+  * A MISSING WEIGHT FOR THE KIND THE LAYER IS, IS AN ERROR.  An MLA layer with no MLA weights stops the loop; it is
+    not quietly run down the KDA path, because that would compute plausible numbers from the wrong weights - and the
+    dispatch table says twelve layers are MLA, which is exactly the mistake an earlier note in this file would have
+    caused.
+  * THE MLA LATENT IS WRITTEN INTO THE NEXT SLOT AS PART OF THE CALL.  The reference appends the current position's
+    latent BEFORE attending, so the loop passes `cells + 1` as the cache length and points MlaIntermediates::kv at
+    slot `cells`, then increments.  Doing it afterwards would attend to a cache that does not yet contain this token.
+  * UNKNOWN LAYER COUNTS AND MISMATCHED GEOMETRIES ARE REFUSED UP FRONT.  layers must be within the trunk, and the two
+    attention geometries must agree on n_embd, because a mismatch there is a wiring bug that would otherwise surface
+    as a wrong number 40 layers later.
+
+Errors carry the layer number, so a failure names a block rather than "the trunk".
+
+WHAT REMAINS, and it is now short:
+
+  1  THE PROVIDER: fill GlmTrunkLayerWeights per layer from the pack - bind_glm_block already binds every row of a
+     block generically, FileExpertSource::open already takes the pack dir, and native_fmt already takes the pack's own
+     gu_type/d_type.  Pure wiring.
+  2  A CHAIN TARGET: links strata_kernels_cpu (+ggml) for the routed blocks; glm_trunk.cpp and glm_moe_native.cpp are
+     deliberately their own TUs so the host-only binaries stay free of that dependency.
+  3  THE HEAD: final norm, lm_head, greedy argmax - and the pack's tokenizer/ for decode.
+  4  THE GATE: argmax(logits) == 12089 for the prompt 785 6722 315 9621 374, the same number tools/glm5_full_run.py
+     passes in Python today.
+
+Nothing is half-written: every file added this session compiles, and the four stage functions, the two MoE paths and
+the trunk loop each carry their own header contract.  The trunk has NEVER RUN - it has no provider yet - and the
+record says so rather than implying otherwise.
