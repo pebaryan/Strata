@@ -3199,3 +3199,43 @@ the artifact ever disagree the build fails, rather than the loop dispatching sil
 port follows, applied to a table that is easy to mistype and impossible to verify by eye.
 
 So the loop's dispatch input is now known and checked, and the remaining question for item 1 is only the wiring.
+
+########  THE TRUNK IS 45 BLOCKS, NOT 46 - block 45 IS THE MTP HEAD  ########
+
+The single most important structural correction so far, and three independent measurements agree:
+
+  * blk.45 carries nextn.eh_proj, nextn.enorm, nextn.hnorm and nextn.shared_head_norm, and no other block does;
+  * blk.45 is the ONLY block with no hc_* tensors - hyper-connections exist on 45 blocks, and a prediction head has
+    no use for them.  This is what first exposed the split: the generated table's hc rows number 45, not 46;
+  * glm5next.nextn_predict_layers = 1, and head_count_kv has twelve 1s of which only eleven are trunk layers.
+
+So the trunk is FORTY-FIVE blocks (0..44): 34 KDA and 11 MLA.  Block 45 is the multi-token-prediction head, whose
+attention happens to be MLA as well - which is exactly why the twelve-vs-eleven trap exists.  A loop that walked 46
+blocks would have run a prediction head as a trunk block and carried its output into the next layer, and everything
+downstream would have been plausible and wrong.
+
+glm_block_kinds.hpp now states glm_is_mtp_layer, glm_attention_is_mla and glm_ffn_is_dense, with the trunk's counts
+asserted at compile time: 11 MLA, 34 KDA, 45 total, and exactly one MTP layer.  The 34 is corroborated independently
+by the generated table's 34 rows each of ssm_a, ssm_conv1d_{q,k,v}, ssm_dt.bias, ssm_{f,g}_{a,b}, ssm_beta, ssm_norm,
+attn_q, attn_k, attn_v - i.e. the KDA layers are the ones carrying an ssm_* tensor set, and there are 34 of them.
+
+TENSOR INVENTORY, for the binding work still to come (counts from the generated table, all 46 blocks):
+
+    46 attn_norm / ffn_norm / attn_output                      per-block, every block
+    45 hc_{attn,ffn}_{fn,base,scale}                          every TRUNK block; missing on the MTP layer
+    43 ffn_gate_inp / exp_probs_b / ffn_{gate,up,down}_shexp   the routed blocks' router, bias and shared expert
+    34 ssm_a / ssm_conv1d_{q,k,v} / ssm_dt.bias / ssm_{f,g}_{a,b} / ssm_beta / ssm_norm / attn_{q,k,v}   the KDA set
+    12 attn_q_a / attn_q_b / attn_q_a_norm / attn_kv_a_mqa / attn_kv_a_norm / attn_k_b / attn_v_b         MLA set
+    12 indexer.proj / indexer.k_norm.{weight,bias} / indexer_compressor_{gate,ape} / indexer.attn_{q_b,k}
+     3 ffn_gate / ffn_up / ffn_down                           the leading dense blocks
+     1 nextn.{eh_proj,enorm,hnorm,shared_head_norm}            the MTP head
+
+Note what the inventory means for the MoE path: the router (ffn_gate_inp), the selection bias (exp_probs_b) and the
+shared expert (ffn_*_shexp) are all bindable per-block tensors, so ONLY the 288 routed experts per layer come from the
+streamed pack.  moe_forward already takes the shared expert as an argument, so the expert source has to supply eight
+{gate,up,down} triples per token and nothing else.
+
+GLM BINDING, stated accurately: glm_bind.cpp does not bind by tensor-name string at all - it selects rows from the
+generated table via glm_block_rows(block) (glm_bind.cpp:94).  So a grep for MLA tensor NAMES in it returns zero and
+means nothing; what matters is whether its per-block binding routine handles the MLA and MoE rows, which is the next
+thing to read rather than infer.
