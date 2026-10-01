@@ -4665,3 +4665,26 @@ dequantize it against the same expert's tensor read straight from the GGUF.  Equ
 the bug.  Pack row for layer 3 for reference: offset 0, blob_bytes 7536640, and the descriptor's bytes match that
 exactly, so the STRIDE is right even if the content is not - which is why the mismatch would not show up as a size
 error anywhere.
+
+THE PACK-VS-ARTIFACT BYTE TEST, AND THE ROADBLOCK THAT MEANS IT SHOULD USE THE FIXTURE INSTEAD
+
+tools/check_blob_bytes.py compares the bytes FileExpertSource serves for (layer, expert) with the artifact's own bytes
+for that expert.  The blob layout is now pinned by ARITHMETIC rather than assumed:
+
+    IQ2_XXS is 66 bytes per 256 weights; a 2048x4096 matrix is 8,388,608 weights = 32,768 blocks = 2,162,688 bytes
+    IQ3_XXS is 98 bytes per 256; the down matrix is the same weight count = 3,211,264 bytes
+    2,162,688 (gate) + 2,162,688 (up) + 3,211,264 (down) = 7,536,640  ==  the pack's declared blob_bytes, exactly
+
+so the per-expert stride is provably right (three independent numbers agreeing with a fourth), and only the CONTENT
+is in question.  Neither the pack nor the GGUF splits a 256-weight block across a row boundary - 4096 is a multiple of
+256 - so the byte streams are directly comparable.
+
+THE ROADBLOCK, recorded so the next attempt does not rediscover it: gguf-py's GGUFReader returns ZERO TENSORS for
+GLM-5.3-Flash-UD-IQ1_S-00001-of-00003.gguf - not "the names differ", an empty tensor list, because it is shard 1 of 3
+and the reader has no shard list.  This port already knew this in a different place (the oracles use their own
+multi-shard Model reader for exactly this reason).  So the comparison should NOT go through gguf-py.
+
+THE SHORTER PATH, which needs nothing new: glm5-moe-l3.raw is the ORACLE's own fixture for this very layer - 910,755,036
+bytes, built by glm5_moe_reference.py from the artifact, holding the blobs for the eight experts the oracle selected
+(45, 25, 117, 180, 98, 55, 9, 88).  Comparing the PACK's bytes for those same ids against the fixture's blobs is the
+same test as the GGUF one, is already on disk, and uses the reader that is known to work.  That is the next measurement.
