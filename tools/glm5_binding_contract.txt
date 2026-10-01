@@ -1488,3 +1488,21 @@ silently, which is the kind of trap this port has been caught by before.  get_sc
 So step 1 is a copy from this file, and the parity gate for step 2 can be built against
 tools/glm5_kda_reference.py's own dequantization of blk.0.attn_q.weight, which is an independent reference the
 engine already has - not against llama.cpp's C, which is what the source being transcribed would make circular.
+
+STEP 1 DONE: dequant_q5_K EXISTS AND COMPILES (src/kernels/cuda/quantize_act.cu)
+
+Transcribed get_scale_min_k4 and dequantize_row_q5_K from ggml-quants.c into the engine's own idiom - a __device__
+helper plus a block-per-thread kernel and a launcher shaped exactly like dequant_q8_0's, reading the 176-byte block
+as { half d; half dmin; u8 scales[12]; u8 qh[32]; u8 qs[128] } and writing 256 floats per block (QK_K = 256, the
+constant the engine already defines for the Q8_K path).
+
+DELIBERATELY UNWIRED.  Nothing calls it, so the build is the whole check and no behaviour can have changed.
+Verified after adding it: libstrata_kernels.a builds, glm5_bind_check and kda_gate link, stage 1 still prints
+-0.359747499 / 0.424176991 / 3.25002776, and the KDA gate still passes at T=1.
+
+STEP 2, the parity gate, and the exact shape it should take: the engine must be checked against the ORACLE's
+dequantization of blk.0.attn_q.weight, not against llama.cpp's C it was copied from (that would only test the
+copying).  Concretely: python dumps that tensor's raw GGUF bytes to a file, a small host tool runs dequant_q5_K
+over them and writes the floats, and the values are compared elementwise against
+glm5_kda_reference's own np.asarray(m.tensor('blk.0.attn_q.weight')) - which is the same oracle that has verified
+every other gate in this port.  A failure there is informative in a way a llama.cpp comparison cannot be.

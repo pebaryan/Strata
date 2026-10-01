@@ -278,6 +278,79 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     if (stream == nullptr) cudaDeviceSynchronize();
 }
 
+// ===================== Q5_K =====================
+//
+// `block_q5_K` = { ggml_half d; ggml_half dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; } = 176 bytes,
+// with a static_assert in ggml-common.h pinning that size (2*sizeof(half) + K_SCALE_SIZE + QK_K/2 + QK_K/8).  This
+// is the type the artifact uses for attn_q / attn_k / attn_v / attn_output / ffn_gate / ffn_up, i.e. everything the
+// KDA gate currently has to take from a fixture, so it is the one dequantizer standing between the engine and a
+// binding check that covers every KDA weight.
+//
+// Transcribed from ggml-quants.c's dequantize_row_q5_K and get_scale_min_k4 rather than rewritten, in the same
+// spirit as nearest_int below: the bit-packing is arbitrary and a "cleaner" formulation would be a new source of
+// disagreement.
+//
+// NOT YET WIRED INTO ANY PATH, and NOT YET GATED.  It must be checked against an INDEPENDENT reference - the
+// oracle's own dequantization of blk.0.attn_q.weight - before the bind-time dequant is widened to type 13.
+// Comparing it to llama.cpp's C, from which it was copied, would only confirm that the copy is faithful.
+constexpr int Q5K_SCALE_SIZE = 12;
+
+/// ggml's get_scale_min_k4: unpack one 6-bit scale and one 6-bit minimum from the 12-byte scales array.
+__device__ __forceinline__ void get_scale_min_k4_dev(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (uint8_t) ((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
+        *m = (uint8_t) ((q[j + 4] >> 4) | ((q[j - 0] >> 6) << 4));
+    }
+}
+
+__global__ void dequant_q5_K_kernel(const uint8_t* __restrict__ blocks, float* __restrict__ x,
+                                    long long n_blocks) {
+    const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const uint8_t* blk = blocks + b * 176;
+    const uint16_t dbits = (uint16_t) (blk[0] | (blk[1] << 8));
+    const uint16_t mbits = (uint16_t) (blk[2] | (blk[3] << 8));
+    const float d = f32_from_f16(dbits);
+    const float mn = f32_from_f16(mbits);
+    const uint8_t* scales = blk + 4;          // 12 bytes
+    const uint8_t* qh = blk + 16;             // 32 bytes
+    const uint8_t* ql = blk + 48;             // 128 bytes
+    float* y = x + b * 256;
+
+    int is = 0;
+    uint8_t sc = 0, m = 0;
+    uint8_t u1 = 1, u2 = 2;
+    for (int j = 0; j < 256; j += 64) {
+        get_scale_min_k4_dev(is + 0, scales, &sc, &m);
+        const float d1 = d * (float) sc, m1 = mn * (float) m;
+        get_scale_min_k4_dev(is + 1, scales, &sc, &m);
+        const float d2 = d * (float) sc, m2 = mn * (float) m;
+        for (int l = 0; l < 32; ++l) *y++ = d1 * (float) ((ql[l] & 0xF) + ((qh[l] & u1) ? 16 : 0)) - m1;
+        for (int l = 0; l < 32; ++l) *y++ = d2 * (float) ((ql[l] >> 4) + ((qh[l] & u2) ? 16 : 0)) - m2;
+        ql += 32;
+        is += 2;
+        u1 <<= 2;
+        u2 <<= 2;
+    }
+}
+
+void dequant_q5_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const long long nb = n / 256;
+    const int threads = 128;
+    const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
+    dequant_q5_K_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(blocks, x, nb);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "dequant_q5_K launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    if (stream == nullptr) cudaDeviceSynchronize();
+}
+
 void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     if (n <= 0) return;
     if (n % QK_K != 0) {
