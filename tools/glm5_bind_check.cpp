@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -38,7 +39,29 @@ int main(int argc, char** argv) {
     // pool_bytes/load decide which rows they own from what the table already knows is served natively.
     strata::core::NativeDense nd;
     if (shard.empty()) { std::fprintf(stderr, "usage: glm5_bind_check <pack_dir> <gguf_shard1> [block]\n"); return 2; }
-    if (!nd.load({shard}, table, err)) { std::fprintf(stderr, "native: %s\n", err.c_str()); return 1; }
+    // ALL shards, not just the first: this artifact's shard 1 is metadata-only, so a one-shard NativeDense
+    // sees an empty tensor list and reports that there are no supported GDN/QSA matrices.
+    std::vector<std::string> shards;
+    {
+        std::string fn = shard;
+        const size_t slash = fn.find_last_of('/');
+        const std::string dir = slash == std::string::npos ? "" : fn.substr(0, slash + 1);
+        const std::string base = slash == std::string::npos ? fn : fn.substr(slash + 1);
+        const size_t pos = base.find("-00001-of-");
+        if (pos != std::string::npos) {
+            const std::string stem = base.substr(0, pos);
+            const std::string tail = base.substr(base.find("-of-") + 4);
+            const int n = std::atoi(tail.substr(0, tail.find('.')).c_str());
+            for (int i = 1; i <= n; ++i) {
+                char buf[4096];
+                std::snprintf(buf, sizeof buf, "%s%s-%05d-of-%05d.gguf", dir.c_str(), stem.c_str(), i, n);
+                shards.emplace_back(buf);
+            }
+        } else {
+            shards.push_back(shard);
+        }
+    }
+    if (!nd.load(shards, table, err)) { std::fprintf(stderr, "native: %s\n", err.c_str()); return 1; }
     uint64_t bytes = 0;
     if (!table.pool_bytes(pack, bytes, err)) { std::fprintf(stderr, "pool_bytes: %s\n", err.c_str()); return 1; }
     void* arena = nullptr;

@@ -101,8 +101,15 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv, GlmB
             } else {
                 got.ptr = p;
             }
+        } else if (w->native_data) {
+            // Served straight from the GGUF, which is the orientation the verified oracle works in, so this
+            // must NOT be transposed.  Transposing it - which an earlier version of this file did - is trap 7
+            // misapplied: trap 7 is about the PACK's dense.bin rows, not the GGUF's own tensors.
+            got.ptr = (const float*) w->native_data;
+            got.ne0 = t.ne1;
+            got.ne1 = t.ne0;
         } else {
-            // transform 2: dequantize, then (in,out) -> (out,in)
+            // transform 2: a pack-resident quantized row: dequantize, then (in,out) -> (out,in)
             float* dev = nullptr;
             void* host = nullptr;
             if (!dequant_transposed(*w, t.ne0, t.ne1, stream, &dev, &host, err)) return false;

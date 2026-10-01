@@ -15,7 +15,30 @@
 
 namespace strata::core {
 namespace {
+/// GLM-5.3's natively-served matrices.  The two architectures name their projections differently, so the
+/// qwen4exp patterns below match nothing in a glm5next artifact and NativeDense declared it served nothing -
+/// which is how the binding driver came to be told "no supported GDN/QSA matrices in supplied shards".
+/// A glm5next name is eligible when it is one of these and, as before, the quant type has a native MMVQ
+/// kernel and the tensor is 2-D; the caller applies those two conditions.
+static bool glm5_eligible_name(const std::string& name) {
+    static const char* kGlm5[] = {
+        "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+        "ssm_beta.weight", "ssm_f_a.weight", "ssm_f_b.weight", "ssm_g_a.weight", "ssm_g_b.weight",
+        "hc_attn_fn.weight", "hc_ffn_fn.weight",
+        "ffn_gate.weight", "ffn_up.weight", "ffn_down.weight", "ffn_gate_inp.weight",
+    };
+    // strip the "blk.<n>." prefix and compare the remainder: blk.0.attn_q.weight -> attn_q.weight
+    const size_t first = name.find('.');
+    if (first == std::string::npos) return false;
+    const size_t second = name.find('.', first + 1);
+    if (second == std::string::npos) return false;
+    const std::string suffix = name.substr(second + 1);
+    for (const char* want : kGlm5) if (suffix == want) return true;
+    return false;
+}
+
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
+    if (glm5_eligible_name(tensor.name)) return true;
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
     // Match the native PLE kernel: Q2_0, IQ3_XXS and IQ4_XS. Other keys retain the packed BF16 fallback.
