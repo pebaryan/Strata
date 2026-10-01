@@ -975,3 +975,14 @@ add_executable(glm45_run tools/glm45_run.cpp src/core/glm_trunk.cpp src/core/glm
                src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu)
 target_include_directories(glm45_run PRIVATE /include)
 target_link_libraries(glm45_run PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
+
+# First-class GLM serving entrypoint. This is the same Strata trunk and weight
+# binding path as glm45_run, exposed under the engine-facing name used by
+# deployment scripts.
+add_executable(strata-glm tools/glm45_run.cpp src/core/glm_trunk.cpp src/core/glm_layer.cpp
+               src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_bind.cpp
+               src/core/native_dense.cpp src/core/expert_source.cpp src/core/expert_cache.cpp
+               src/core/remote_experts.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
+               src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu)
+target_include_directories(strata-glm PRIVATE /include)
+target_link_libraries(strata-glm PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
