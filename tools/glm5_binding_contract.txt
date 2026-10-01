@@ -2941,3 +2941,42 @@ The remaining work is unchanged and still unstarted: fill GlmBlockWeights, alloc
 nh*hd*hd = 1,048,576-float state, call glm_block_forward, compare l_out and then each stage against the dump, then
 feed l_out-0 back in as block 1's input.  With the field names now known to be identical to the fixture's, step 1 is
 a loop rather than a table, which is the last thing that could have been got wrong in the loading.
+
+########  THE ATTENTION SITE EXECUTES - AND THE COMPARISON IS BLOCKED BY THE DUMP, NOT BY A BUG  ########
+
+block_gate now runs the attention site end to end and compares four stages.  All four stages EXECUTE (every call
+returns true); the comparison reports four FAILs, and the numbers say why.
+
+    hc_attn_pre   worst 1.760e-05   of dump rms 4.125e-03   -> 4.266e-03
+    attn_norm     worst 1.121e-04   of dump rms 8.094e-02   -> 1.385e-03
+    attn_output   worst 2.586e-02   of dump rms 2.233e-04   -> 1.158e+02
+    hc_attn_post  worst 1.364e-02   of dump rms 5.660e-03   -> 2.409e+00
+
+FIRST, THE SLICING IS RIGHT.  The dump's hc_attn_pre-0 slice 0 measures min -0.0154 / max 0.0215 / rms 0.004125, and
+the contract's own record of that dump node is min -0.0154028935 max 0.0215204563 - identical.  So token 0 is the
+leading slice of each family, as the container layout says, and no alignment error remains in the reading.
+
+SECOND, AND THIS IS THE BLOCKER: the dump and the ORACLE disagree at attn_norm.  The engine's stage-1 output is
+min -0.359747499 / max 0.424176991, which was verified against the phase-6 oracle to seven significant digits.  The
+dump's attn_norm-0 token 0 is min -0.2749 / max 0.37, and NO slice of that file matches the oracle - the five slices
+run -0.2749/0.37, -0.3766/0.3435, -0.4941/0.4567, -0.3209/0.298, -0.2641/0.2757.  So the engine agrees with the oracle
+and disagrees with the dump, at a stage whose arithmetic has been independently verified.  This is the item ANOTHER
+part of this contract already flagged as unresolved: what hc_attn_pre-N actually holds, where the discrepancy is
+between the dump node and the oracle rather than in the engine.  The per-stage comparison has now made it precise.
+
+THIRD, EVIDENCE THE DUMP'S attn_output IS A DIFFERENT QUANTITY.  Its token-0 slice has rms 2.23e-04 with min -0.0186
+and max +0.00157 - an ASYMMETRY of 12x between the extremes, where a projected attention output should be roughly
+symmetric.  And its rms is 370x smaller than its own input's 0.081, which a projection through wo does not do.  So
+this family is not the same quantity the stage produces, and comparing against it tests the dump's semantics rather
+than the engine's arithmetic.
+
+WHAT THIS MEANS: the attention site RUNS, and produces every stage.  Its magnitudes are right (hc_attn_pre 4e-3,
+attn_norm 0.08 - the norm divides by an rms of ~0.004 and multiplies by weights of ~0.1, so 0.08 follows).  What it
+cannot yet do is CHECK itself against these dump families, because at least two of them hold something else.
+
+THE DECISIVE NEXT TEST: compare against the ORACLE rather than the dump.  kda_gate already verified block 0's KDA
+12/12, but it fed the KERNEL the oracle's own seed; this run feeds it hc_init's real token.  So the next step is to
+run the Python oracle on the same real input - hc_init's token 0 through hc_pre and the norm, then kda_block - and
+compare the engine's four stages against the oracle's, which removes the dump's semantics from the question entirely.
+That is one script using code that already exists, and it is the only way to separate "the engine is wrong" from
+"the dump is a different quantity" at these stages.

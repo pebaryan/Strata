@@ -15,6 +15,7 @@
 //
 // The run and the per-stage comparison come next, on top of a fixture whose shapes are known good.
 
+#include <cmath>
 #include <cstdio>
 #include <cstdint>
 #include <cstdlib>
@@ -22,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "strata/core/glm_layer.hpp"      // the four stages and glm_block_forward
 #include "strata/kernels/glm_kda.hpp"
 #include "strata/kernels/glm_moe.hpp"
 
@@ -198,7 +200,126 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::printf("  -> fixture is loadable and shape-consistent\n");
-    std::printf("NOTE: this version loads only.  The run and the per-stage comparison against the dump come next -\n");
-    std::printf("      the loop has not been executed yet, and loading being right does not make it right.\n");
+
+    // ---- RUN: the attention site, stages 1-3, compared against four dump families. ----------------------------
+    //
+    // Deliberately NOT glm_block_forward yet: that needs the FFN weights dequantized and its three buffers filled,
+    // whereas the attention site needs only arrays this tool has already loaded and verified.  So this runs the
+    // first half of the chain - which has never executed - and checks it stage by stage.  The four expected values
+    // exist on disk: hc_attn_pre-N is hc_norm with norm_w=nullptr (the pre-norm value), attn_norm-N is the same call
+    // with norm_w, attn_output-N follows the KDA call, and hc_attn_post-N follows hc_post.
+    {
+        std::vector<float> hc_fn, hc_base, hc_scale, attn_norm_w, xin, kda[16], dumpv;
+        const char* kda_names[16] = {"attn_norm", "wq", "wk", "wv", "conv_q", "conv_k", "conv_v", "ssm_a", "dt_bias",
+                                     "ssm_f_a", "ssm_f_b", "ssm_beta", "ssm_g_a", "ssm_g_b", "o_norm", "wo"};
+        const size_t kda_sizes[16] = {
+            // These MUST equal the sizes in the load table above - f_a/g_a are hd x n_embd = 128 x 4096 = 524,288
+            // floats (2,097,152 bytes), NOT d_inner x hd like f_b/g_b.  The first version of this run section got
+            // that wrong by copying the f_b row, and the loader refused to run; duplicating a table duplicates the
+            // chance of diverging from it, which is why the load above is the authority.
+            (size_t) N_EMBD,                 // attn_norm   [n_embd]
+            (size_t) N_EMBD * 8192,          // wq          [d_inner][n_embd]
+            (size_t) N_EMBD * 8192,          // wk
+            (size_t) N_EMBD * 8192,          // wv
+            (size_t) 4 * 8192,               // conv_q      [d_conv][d_inner]
+            (size_t) 4 * 8192,               // conv_k
+            (size_t) 4 * 8192,               // conv_v
+            (size_t) 64,                     // ssm_a       [nh]
+            (size_t) 8192,                   // dt_bias     [d_inner]
+            (size_t) 128 * N_EMBD,           // ssm_f_a     [hd][n_embd]      = 524,288
+            (size_t) 8192 * 128,             // ssm_f_b     [d_inner][hd]     = 1,048,576
+            (size_t) 64 * N_EMBD,            // ssm_beta    [nh][n_embd]      = 262,144
+            (size_t) 128 * N_EMBD,           // ssm_g_a     [hd][n_embd]      = 524,288
+            (size_t) 8192 * 128,             // ssm_g_b     [d_inner][hd]     = 1,048,576
+            (size_t) 128,                    // o_norm      [hd]
+            (size_t) 8192 * N_EMBD,          // wo          [n_embd][d_inner]
+        };
+        bool all = load_f32(bd + "/w_hc_attn_fn.bin", (size_t) N_EMBD * 96, hc_fn) &&
+                   load_f32(bd + "/w_hc_attn_base.bin", 24, hc_base) &&
+                   load_f32(bd + "/w_hc_attn_scale.bin", 3, hc_scale) &&
+                   load_f32(bd + "/w_attn_norm.bin", (size_t) N_EMBD, attn_norm_w) &&
+                   load_f32(bd + "/x.bin", (size_t) HC * N_EMBD, xin);
+        for (int i = 0; i < 16 && all; ++i) all = load_f32(kd + "/w_" + kda_names[i] + ".bin", kda_sizes[i], kda[i]);
+        if (!all) { std::printf("  RUN: could not load the attention site's inputs\n"); return 1; }
+
+        strata::kernels::glm::KdaWeights kw;
+        kw.attn_norm = kda[0].data();  kw.wq = kda[1].data();   kw.wk = kda[2].data();  kw.wv = kda[3].data();
+        kw.conv_q = kda[4].data();     kw.conv_k = kda[5].data(); kw.conv_v = kda[6].data();
+        kw.ssm_a = kda[7].data();      kw.dt_bias = kda[8].data();
+        kw.ssm_f_a = kda[9].data();    kw.ssm_f_b = kda[10].data(); kw.ssm_beta = kda[11].data();
+        kw.ssm_g_a = kda[12].data();   kw.ssm_g_b = kda[13].data();
+        kw.o_norm = kda[14].data();    kw.wo = kda[15].data();
+        strata::kernels::glm::KdaGeometry kg;
+        std::vector<float> state((size_t) kg.nh * kg.hd * kg.hd, 0.0f);   // zeroed: the recurrence starts fresh
+
+        std::vector<float> pre((size_t) N_EMBD), normed((size_t) N_EMBD);
+        // The KDA's output is d_inner = hd * nh = 8192 floats, NOT n_embd: the dump's attn_output is ne=[128,64,5,1]
+        // and the first version of this run allocated only 4096, which both mis-sliced the comparison (the token
+        // stride there is 8192, which is why it reported "token 0 of 10") and left hc_post reading a truncated input.
+        std::vector<float> attn_out((size_t) kg.hd * kg.nh);
+        std::printf("  run: attn_out is %zu floats (hd %d x nh %d); dump rms comparison uses the per-family stride\n",
+                    attn_out.size(), kg.hd, kg.nh);
+        std::vector<float> post((size_t) HC * N_EMBD);
+        strata::kernels::glm::HcMix mix;
+        std::string err;
+
+        // stage 1 twice: once without the norm weight to get hc_attn_pre, once with it to get attn_norm
+        if (!strata::core::glm::glm_stage_hc_norm(xin.data(), N_EMBD, hc_fn.data(), hc_base.data(), hc_scale.data(),
+                                                  nullptr, pre.data(), &mix, 1e-5f, nullptr, err)) {
+            std::printf("  RUN: stage 1 (pre-norm) failed: %s\n", err.c_str()); return 1;
+        }
+        if (!strata::core::glm::glm_stage_hc_norm(xin.data(), N_EMBD, hc_fn.data(), hc_base.data(), hc_scale.data(),
+                                                  attn_norm_w.data(), normed.data(), &mix, 1e-5f, nullptr, err)) {
+            std::printf("  RUN: stage 1 (normed) failed: %s\n", err.c_str()); return 1;
+        }
+        if (!strata::core::glm::glm_stage_kda(normed.data(), kw, kg, 1, attn_out.data(), state.data(), err)) {
+            std::printf("  RUN: stage 2 (kda) failed: %s\n", err.c_str()); return 1;
+        }
+        if (!strata::core::glm::glm_stage_hc_post(attn_out.data(), xin.data(), mix, N_EMBD, post.data(), err)) {
+            std::printf("  RUN: stage 3 (hc_post) failed: %s\n", err.c_str()); return 1;
+        }
+
+        struct { const char* family; const float* got; size_t n; } cmp[] = {
+            {"hc_attn_pre", pre.data(), (size_t) N_EMBD}, {"attn_norm", normed.data(), (size_t) N_EMBD},
+            {"attn_output", attn_out.data(), (size_t) kg.hd * kg.nh},
+            {"hc_attn_post", post.data(), (size_t) HC * N_EMBD},
+        };
+        int ran = 0;
+        for (const auto& c : cmp) {
+            int64_t ne[4];
+            std::vector<float> want;
+            if (!load_dump(dd + "/" + c.family + "-0.bin", want, ne)) { std::printf("  RUN: no dump for %s\n", c.family); continue; }
+            // The dump covers the whole prompt (five tokens here) while this run does ONE token, and the container
+            // has ne0 fastest - so token 0 is the LEADING slice, and the engine's output should equal it exactly.
+            // Slicing rather than requiring equal sizes is the point: the engine is right to produce one token, and
+            // a size mismatch here is a statement about the dump's extent, not about the maths.
+            if (want.size() < c.n) {
+                std::printf("  BAD      %-13s engine %zu floats, dump only %zu (ne=[%lld,%lld,%lld,%lld])\n", c.family,
+                            c.n, want.size(), (long long) ne[0], (long long) ne[1], (long long) ne[2], (long long) ne[3]);
+                continue;
+            }
+            if (want.size() % c.n != 0) {
+                std::printf("  BAD      %-13s dump %zu floats is not a whole number of %zu-float tokens\n", c.family,
+                            want.size(), c.n);
+                continue;
+            }
+            const size_t ntokens = want.size() / c.n;
+            double rms = 0.0, worst = 0.0;
+            for (size_t i = 0; i < c.n; ++i) { rms += (double) want[i] * want[i]; }
+            rms = std::sqrt(rms / (double) c.n);
+            for (size_t i = 0; i < c.n; ++i) {
+                const double d = std::fabs((double) c.got[i] - (double) want[i]);
+                if (d > worst) worst = d;
+            }
+            std::printf("  %-8s %-13s worst %.3e  of dump rms %.6g  -> %.3e   (token 0 of %zu)\n",
+                        (worst / (rms > 0 ? rms : 1) < 1e-3) ? "PASS" : "FAIL", c.family, worst, rms,
+                        worst / (rms > 0 ? rms : 1), ntokens);
+            ran++;
+        }
+        std::printf("  RUN: attention site executed, %d of 4 stages compared\n", ran);
+    }
+
+    std::printf("NOTE: this version loads, runs the ATTENTION SITE, and compares four stages.  The FFN site and the\n");
+    std::printf("      whole-block call (glm_block_forward) have still never executed.\n");
     return 0;
 }
