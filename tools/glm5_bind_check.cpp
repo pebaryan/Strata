@@ -185,6 +185,9 @@ int main(int argc, char** argv) {
             }
             const size_t want = count ? count : (size_t) d0 * (size_t) (d1 > 0 ? d1 : 1);
             dst.resize(want);
+            std::fprintf(stderr, "  hostcopy %-22s q=%p ne=%d,%d want=%zu dst=%p\n", n, (const void*) q, d0, d1,
+                         want, (void*) dst.data());
+            fflush(stderr);
             // The arena is cudaMalloc'd device memory (this driver allocates it that way), and the
             // dequantized hc_fn sits in a cudaMalloc buffer too, while the loader's own staging buffers are
             // cudaHostAlloc'd.  Rather than infer which is which - three earlier attempts did, and both

@@ -471,3 +471,26 @@ loop's - most plausibly that q is captured/derived differently than it appears, 
 "invalid argument" on a copy that looks correctly sized in the source).
 
 Everything else is committed and the default path is unchanged at the verified 9.1 state.
+
+FINAL STATE OF THE CONTRADICTION - and the one datum never collected
+
+    lambda:      hostcopy hc_attn_base.weight  q=0x7fe96c00c000  ne=24,0  want=24  dst=0x55aeee827d80
+                 -> cudaMemcpy(DeviceToHost) returns INVALID ARGUMENT
+    print loop:  blk.0.hc_attn_base.weight      ne=24,0  n=24
+                 -> the SAME call, same direction, same 96 bytes, produced -8 / 2.69234943 / -116.46156
+
+Same process, same run, same size, same direction, different outcome.  A device->host copy that returns
+"invalid argument" means CUDA did not accept the SOURCE as device memory - yet the print loop copied from it.
+
+THE MISSING DATUM: the print loop's pointer value has never been printed.  If it differs from the lambda's
+q, then bound.tensors holds TWO entries named hc_attn_base.weight - one whose ptr is the arena row (valid) and
+one whose ptr is something else (invalid) - and the lambda's loop takes the last match while the print loop
+walks them, printing one line per entry (and it printed one, which means either the second entry is not printed
+because... it should be, so this should be visible immediately).
+
+NEXT RUN, and it settles it: in the print loop, print t.ptr next to the value it copies, exactly as the lambda
+does.  One line of output, and the difference between "one entry" and "two entries" is immediately visible.  That
+is a read of the data, not another theory.
+
+NOT TO BE FORGOTTEN: everything above is about the DRIVER's readback.  The binding itself is verified in the
+default path (9.1's 12/12, re-measured at 24fca35), and stage 1 has still to print its first number.
