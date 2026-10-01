@@ -2980,3 +2980,45 @@ run the Python oracle on the same real input - hc_init's token 0 through hc_pre 
 compare the engine's four stages against the oracle's, which removes the dump's semantics from the question entirely.
 That is one script using code that already exists, and it is the only way to separate "the engine is wrong" from
 "the dump is a different quantity" at these stages.
+
+########  A REAL FINDING: THE KDA KERNEL DISAGREES WITH THE ORACLE ON A REAL INPUT, 1.391x  ########
+
+block_gate feeds the KDA the ORACLE's own attn_norm - byte-identical input, same weights, same eps - and the output
+is still 39% larger than the oracle's:
+
+    run: the KDA is fed the ORACLE's attn_norm, so any remaining difference is the kernel
+    FAIL  attn_output  worst 7.383e-03  ref rms 0.00450658  engine rms 0.00626758  ratio 1.391
+
+with the worst absolute difference UNCHANGED to four significant digits from the run where the engine used its own
+norm (7.383e-03 both times).  That is itself evidence: replacing the input with the oracle's changed nothing, because
+the engine's stage-1 norm and the oracle's agree to 1.4e-03 of rms - so the 0.14% input difference was never capable
+of producing the 39% output difference, and the disagreement is NOT inherited from upstream.
+
+THE BISECTION, which is what made this unambiguous:
+
+    hc_attn_pre   worst 1.760e-05   ref rms 4.125e-03   engine 4.122e-03   ratio 0.999   -> 4.266e-03
+    attn_norm     worst 1.121e-04   ref rms 8.094e-02   engine 8.092e-02   ratio 1.000   -> 1.384e-03
+    attn_output   worst 7.383e-03   ref rms 4.507e-03   engine 6.268e-03   ratio 1.391   -> 1.638e+00
+
+Stage 1 is sound: both quantities match the oracle's to 0.1% in magnitude.  The KDA is where it breaks, and it breaks
+by a FACTOR rather than by noise - 1.391 is a scale relationship, not a rounding error, and a factor is what a missing
+or duplicated operation produces.
+
+WHY THIS IS A REAL FINDING AND NOT A REGRESSION: kda_gate passes block 0 twelve of twelve at T=1 and T=5.  But it
+feeds the KERNEL the oracle's own fixture seed.  Here the kernel gets a real activation, and it disagrees.  So the
+existing gate does not cover this case - which is exactly the distinction this whole session has been drawing, now
+demonstrated on the engine's own code rather than on a fixture.
+
+THE NEXT STEP IS THE SAME TECHNIQUE ONE LEVEL DOWN: kda_gate already compares TWELVE intermediates (xn, qc, kc, vc, g,
+beta, q, k, v, attn, o, result) against the oracle.  Run that comparison on THIS input - the oracle's attn_norm for
+token 0 of block 0 - and the first deviating intermediate names the operation at fault.  Candidates worth having in
+mind, in the order the operations run and all of which produce a FACTOR rather than a shift if wrong: the L2
+normalisation of q and k (L2_EPS 1e-6, hard-coded in the reference), the gate's exp and the log-decay from ssm_a
+(which holds -exp(A_log)), the beta sigmoid, the per-head ssm_norm gain o_norm, and the final wo projection.  A 39%
+overshoot with the correct sign structure and the right order of magnitude points at a scale in one of those, not at a
+layout error - a layout error would typically decorrelate the output rather than scale it.
+
+ANALYSIS CAUGHT ONE THING WORTH RECORDING: the first version of this patch assigned the oracle's attn_norm INTO the
+buffer that the attn_norm comparison reads, which would have made stage 1 compare the oracle against itself - a gate
+that cannot fail, and precisely the wrong-against-wrong defect this port spent a session on.  It was changed to a
+separate kda_in buffer.  The check that caught it was following the data one step further than the edit.

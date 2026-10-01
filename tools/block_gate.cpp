@@ -109,17 +109,28 @@ int main(int argc, char** argv) {
     {
         std::vector<float> x;
         int64_t ne[4];
-        checked++;
-        if (!load_dump(dd + "/hc_init.bin", x, ne)) { bad++; }
-        else if (ne[0] != N_EMBD || ne[1] != HC) {
-            std::printf("  SHAPE    hc_init.bin: ne=[%lld,%lld,%lld,%lld], expected [%d,%d,...]\n", (long long) ne[0],
-                        (long long) ne[1], (long long) ne[2], (long long) ne[3], N_EMBD, HC);
-            bad++;
-        } else {
-            std::printf("  ok       x            %zu floats   %d streams x %d embd, %lld tokens available\n",
-                        x.size(), HC, N_EMBD, (long long) ne[2]);
+        // Advisory: hc_init is the provenance check on the value in x.bin, so a directory that holds oracle stages
+        // rather than a dump will not have one.  Its ABSENCE is not a fixture defect; a file that is present and the
+        // wrong shape is.  x.bin below is the authority on what the loop receives.
+        {
+            bool present = false;
+            { FILE* f = std::fopen((dd + "/hc_init.bin").c_str(), "rb"); if (f) { std::fclose(f); present = true; } }
+            if (!present) {
+                std::printf("  note     hc_init.bin absent here (this looks like an oracle-stages directory, not a "
+                            "dump); x.bin is the input the loop gets\n");
+            } else {
+                checked++;
+                if (!load_dump(dd + "/hc_init.bin", x, ne)) { bad++; }
+                else if (ne[0] != N_EMBD || ne[1] != HC) {
+                    std::printf("  SHAPE    hc_init.bin: ne=[%lld,%lld,%lld,%lld], expected [%d,%d,...]\n",
+                                (long long) ne[0], (long long) ne[1], (long long) ne[2], (long long) ne[3], N_EMBD, HC);
+                    bad++;
+                } else {
+                    std::printf("  ok       hc_init      %zu floats   %d streams x %d embd, %lld tokens available\n",
+                                x.size(), HC, N_EMBD, (long long) ne[2]);
+                }
+            }
         }
-        // and the array the loop actually gets: token 0's HC streams
         std::vector<float> x1;
         checked++;
         if (!load_f32(bd + "/x.bin", (size_t) HC * N_EMBD, x1)) bad++;
@@ -253,12 +264,11 @@ int main(int argc, char** argv) {
         std::vector<float> state((size_t) kg.nh * kg.hd * kg.hd, 0.0f);   // zeroed: the recurrence starts fresh
 
         std::vector<float> pre((size_t) N_EMBD), normed((size_t) N_EMBD);
-        // The KDA's output is d_inner = hd * nh = 8192 floats, NOT n_embd: the dump's attn_output is ne=[128,64,5,1]
-        // and the first version of this run allocated only 4096, which both mis-sliced the comparison (the token
-        // stride there is 8192, which is why it reported "token 0 of 10") and left hc_post reading a truncated input.
-        std::vector<float> attn_out((size_t) kg.hd * kg.nh);
-        std::printf("  run: attn_out is %zu floats (hd %d x nh %d); dump rms comparison uses the per-family stride\n",
-                    attn_out.size(), kg.hd, kg.nh);
+        // attn_out is n_embd, NOT hd*nh: the KDA's return value is o = attn @ wo.T, and attn is (T, d_inner) while
+        // wo is (d_inner, n_embd), so the result is (T, n_embd).  Confirmed against the oracle rather than reasoned
+        // from the dump: kda_block(w, x, 1) returns 4096 floats for this model, and the dump's attn_output at 8192 =
+        // hd*nh is the PRE-wo internal `attn` - a different quantity that only shares the name.
+        std::vector<float> attn_out((size_t) N_EMBD);
         std::vector<float> post((size_t) HC * N_EMBD);
         strata::kernels::glm::HcMix mix;
         std::string err;
@@ -272,7 +282,20 @@ int main(int argc, char** argv) {
                                                   attn_norm_w.data(), normed.data(), &mix, 1e-5f, nullptr, err)) {
             std::printf("  RUN: stage 1 (normed) failed: %s\n", err.c_str()); return 1;
         }
-        if (!strata::core::glm::glm_stage_kda(normed.data(), kw, kg, 1, attn_out.data(), state.data(), err)) {
+        // Feed the KDA the ORACLE's attn_norm when it is available, so the kernel's output can be compared against the
+        // oracle's attn_output with NO input difference between them.  A SEPARATE buffer, deliberately: overwriting
+        // `normed` would make the attn_norm comparison above compare the oracle against itself - a test that cannot
+        // fail, which is the wrong-against-wrong defect this port has already been bitten by once.
+        std::vector<float> kda_in = normed;
+        {
+            int64_t one[4];
+            std::vector<float> oracle_norm;
+            if (load_dump(dd + "/attn_norm-0.bin", oracle_norm, one) && oracle_norm.size() >= (size_t) N_EMBD) {
+                kda_in.assign(oracle_norm.begin(), oracle_norm.begin() + N_EMBD);
+                std::printf("  run: the KDA is fed the ORACLE's attn_norm, so any remaining difference is the kernel\n");
+            }
+        }
+        if (!strata::core::glm::glm_stage_kda(kda_in.data(), kw, kg, 1, attn_out.data(), state.data(), err)) {
             std::printf("  RUN: stage 2 (kda) failed: %s\n", err.c_str()); return 1;
         }
         if (!strata::core::glm::glm_stage_hc_post(attn_out.data(), xin.data(), mix, N_EMBD, post.data(), err)) {
@@ -281,7 +304,7 @@ int main(int argc, char** argv) {
 
         struct { const char* family; const float* got; size_t n; } cmp[] = {
             {"hc_attn_pre", pre.data(), (size_t) N_EMBD}, {"attn_norm", normed.data(), (size_t) N_EMBD},
-            {"attn_output", attn_out.data(), (size_t) kg.hd * kg.nh},
+            {"attn_output", attn_out.data(), (size_t) N_EMBD},   // the KDA returns n_embd, not hd*nh
             {"hc_attn_post", post.data(), (size_t) HC * N_EMBD},
         };
         int ran = 0;
@@ -304,16 +327,20 @@ int main(int argc, char** argv) {
                 continue;
             }
             const size_t ntokens = want.size() / c.n;
-            double rms = 0.0, worst = 0.0;
+            double rms = 0.0, worst = 0.0, grms = 0.0;
             for (size_t i = 0; i < c.n; ++i) { rms += (double) want[i] * want[i]; }
             rms = std::sqrt(rms / (double) c.n);
+            for (size_t i = 0; i < c.n; ++i) { grms += (double) c.got[i] * (double) c.got[i]; }
+            grms = std::sqrt(grms / (double) c.n);
             for (size_t i = 0; i < c.n; ++i) {
                 const double d = std::fabs((double) c.got[i] - (double) want[i]);
                 if (d > worst) worst = d;
             }
-            std::printf("  %-8s %-13s worst %.3e  of dump rms %.6g  -> %.3e   (token 0 of %zu)\n",
-                        (worst / (rms > 0 ? rms : 1) < 1e-3) ? "PASS" : "FAIL", c.family, worst, rms,
-                        worst / (rms > 0 ? rms : 1), ntokens);
+            // Both magnitudes, not just the error: if engine rms and reference rms disagree by a factor, the two are
+            // different quantities or a scale is missing, which is a different fault from a shape or offset error.
+            std::printf("  %-8s %-13s worst %.3e  ref rms %.6g  engine rms %.6g  ratio %6.3f  -> %.3e   (token 0 of %zu)\n",
+                        (worst / (rms > 0 ? rms : 1) < 1e-3) ? "PASS" : "FAIL", c.family, worst, rms, grms,
+                        grms / (rms > 0 ? rms : 1), worst / (rms > 0 ? rms : 1), ntokens);
             ran++;
         }
         std::printf("  RUN: attention site executed, %d of 4 stages compared\n", ran);
