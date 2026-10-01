@@ -1481,3 +1481,10 @@ static void quantize_row_q5_K_impl(const float * GGML_RESTRICT x, block_q5_K * G
     assert(n_per_row % QK_K == 0);
     const int64_t nb = n_per_row / QK_K;
 
+
+HANDOFF CHECK: the captured dequantize_row_q5_K is COMPLETE - 26 lines captured, 26 lines in ggml-quants.c.  The
+sed window I used (30 lines) happened to be enough; had the function been longer it would have been truncated
+silently, which is the kind of trap this port has been caught by before.  get_scale_min_k4 is captured with it.
+So step 1 is a copy from this file, and the parity gate for step 2 can be built against
+tools/glm5_kda_reference.py's own dequantization of blk.0.attn_q.weight, which is an independent reference the
+engine already has - not against llama.cpp's C, which is what the source being transcribed would make circular.
