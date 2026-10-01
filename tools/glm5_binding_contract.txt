@@ -2387,3 +2387,40 @@ mismatch is a hard error rather than a silently shifted read.
 
 THEN: build block 1's fixture from the oracle's raw output, run kda_gate, and the question of whether block 1's
 kernel path is correct gets answered by data that cannot be self-inconsistent.  That is the next action.
+
+########  BLOCK 1 PASSES - THE KERNEL WAS CORRECT ALL ALONG, AND THE FIXTURE WAS THE DEFECT  ########
+
+Against a fixture produced by the oracle's own --raw-fixture writer and split faithfully into the layout the gate
+reads (layout verified: 551273496 bytes = 24 + 4*137818368, exact):
+
+    xn    PASS  5.254e-08        g     PASS  7.706e-07        v     PASS  1.033e-06
+    qc    PASS  1.358e-06        beta  PASS  6.999e-07        attn  PASS  1.313e-06
+    kc    PASS  1.484e-06        q     PASS  1.478e-06        o     PASS  1.143e-06
+    vc    PASS  1.033e-06        k     PASS  1.244e-06
+    KDA GATE: PASS
+
+qc, kc and vc were failing by a factor of about one against the hand-rolled fixture.  Against reference output that
+is self-consistent by construction they pass at roughly 1e-06.  The kernel was never wrong; the previous fixture's
+inter_qc did not follow from that fixture's own xn, wq and conv_q, and no gate over it could have said anything
+either way.  This is the fourth independent confirmation that the engine is correct on this path - the others being
+the four-significant-digit match of the engine's qc to the inconsistent fixture's, the conv convention's own measured
+0.02%-vs-90.56%, and block 0's 12/12.
+
+xn PASSING at 5.254e-08 also validates the one non-copy step in the splitter: the writer emits x but not xn, so xn is
+derived as rms_norm(x, attn_norm) there, and the engine agrees with it.  A derivation that had been subtly wrong
+would have shown up here rather than being assumed.
+
+WHAT MADE THIS WORK, in the order it mattered:
+  1. recomputing the reference from the reference's own inputs - three lines of numpy that localised the problem to
+     the fixture and exonerated the kernel, after two rounds of narrowing had looked at kernel code;
+  2. using the oracle's own writer instead of hand-rolling a conversion, because that writer emits exactly the arrays
+     the loader handed kda_block and that call's return, so no step can introduce an inconsistency;
+  3. deriving sizes from the header AND asserting the aggregate consumes the file - which caught five wrong sizes
+     (ssm_f_a, ssm_f_b, ssm_beta, ssm_g_a, ssm_g_b were 128x to 4096x larger than the dimensions suggested) before a
+     single byte was written, rather than producing a fifth inconsistent fixture;
+  4. not trusting a reshape of a foreign in-memory array, which is what made the first self-consistency assertion
+     fire wrongly on block 0.
+
+TOOLS ADDED: tools/split_raw_fixture.py (raw fixture -> the 29-file layout, with the aggregate size assertion).
+FIXTURES: /home/peb/moredata/glm5-kda-l1-oracle (oracle-produced, block 1, PASS),
+/home/peb/moredata/glm5-kda-l0-t1 (block 0, 12/12 PASS), /home/peb/moredata/glm5-kda-badconv (known-bad, must FAIL).
