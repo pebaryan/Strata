@@ -178,6 +178,16 @@ int main(int argc, char** argv) {
             // cudaHostAlloc'd.  Rather than infer which is which - three earlier attempts did, and both
             // cudaMemcpyDeviceToHost and plain memcpy were wrong for some tensor - use cudaMemcpyDefault,
             // which resolves the direction under UVA.
+            cudaPointerAttributes pa{};
+            const cudaError_t ast = cudaPointerGetAttributes(&pa, q);
+            cudaGetLastError();
+            std::fprintf(stderr, "  probe %-22s ptr=%p want=%zu attr=%s%s\n", n, (const void*) q, want,
+                         ast == cudaSuccess ? "ok" : cudaGetErrorString(ast),
+                         ast == cudaSuccess ? (pa.type == cudaMemoryTypeDevice ? " device"
+                                             : pa.type == cudaMemoryTypeHost   ? " host"
+                                             : pa.type == cudaMemoryTypeManaged? " managed" : " other")
+                                            : "");
+            fflush(stderr);
             const cudaError_t cst = cudaMemcpy(dst.data(), q, want * sizeof(float), cudaMemcpyDefault);
             if (cst != cudaSuccess) {
                 std::fprintf(stderr, "stage1: copy %s failed: %s\n", n, cudaGetErrorString(cst));

@@ -304,3 +304,29 @@ NEXT DIAGNOSTIC, and it is one run: instrument host_copy to print, BEFORE any co
 and cudaPointerGetAttributes().type for that exact tensor, and to print the memcpy's returned cudaError_t
 separately from cudaGetLastError().  Three segfaults have been spent on a chain of inference; the next step is
 to make the failing call report itself.
+
+INSTRUMENTED RUN - THE ANSWER:
+
+    probe hc_attn_fn.weight    ptr=0x7fdf0c200000  want=393216  attr=ok device   copied fine
+    probe hc_attn_base.weight  ptr=0x7fe9c200c000  want=24      attr=ok OTHER    SEGFAULT
+
+"other" is cudaMemoryTypeUnregistered: the F32 arena pointer is not a CUDA-registered address, so no memcpy
+variant can touch it - which is exactly why memcpy, cudaMemcpyDeviceToHost and cudaMemcpyDefault each failed
+differently.  The pointer is invalid, not mis-typed.  That also retires the earlier hypothesis honestly: the
+pointer kind was never the question.
+
+THE SHARP DETAIL - and it indicts a change of mine: the bind print loop read these same F32 tensors SUCCESSFULLY
+before; that is how 12/12 against the oracle was measured.  The only thing added to the bind path since is the
+hc_*_fn dequant branch from 9ac5c58:
+
+    strata::kernels::dequant_q8_0((const uint8_t*) w->native_data, dev_f, n, stream);
+    if (stream) cudaStreamSynchronize((cudaStream_t) stream);
+
+which runs during bind, before stage 1 reads anything.  So the leading hypothesis is that the dequant writes past
+its buffer and corrupts the arena - plausibly because `n` was taken as t.ne0*t.ne1 element COUNT while the
+kernel may expect a block count, or because writing floats into a buffer sized for quantized bytes overruns.
+
+NEXT ACTION: check dequant_q8_0's `n` convention (elements or blocks) against its existing caller in
+glm_bind.cpp:49, which for its case passed the same element count.  If the convention is elements, the overrun
+is elsewhere and the next test is to bind WITHOUT the hc branch and confirm the F32 pointers read cleanly again
+- that isolates it to one line.
