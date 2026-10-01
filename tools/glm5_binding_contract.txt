@@ -4877,3 +4877,55 @@ so the remaining work is assembly against a verified inventory, not investigatio
 the MLA cache sizing (11 caches of 2048*4 cells would be enormous; the prompt needs 5), and the one numerical caveat is
 that the engine's own 45-block hidden state will differ from the oracle's by the accumulated quantization of 43 routed
 blocks - so the token, not a per-layer float match, is the gate, exactly as this port has said since the beginning.
+
+THE FINAL RUNNER: A COMPLETE SPEC, WITH EVERY NUMBER SOURCED RATHER THAN GUESSED
+
+This is the last artifact of the port and the only thing standing between the current state and a token.  Every input to
+it has been verified independently, so this is a specification to implement, not a puzzle to solve.
+
+THE TWO SIZING QUESTIONS ARE SETTLED AND BOTH ARE TRIVIAL:
+
+    KDA state   [nh][hd][hd] = 64 * 128 * 128 = 1,048,576 floats = 4.0 MB per block (glm_kda.hpp:79-80, and
+                trunk_gate.cpp:285 sizes it exactly so) times 34 KDA blocks = 142 MB
+    MLA cache   cells * kv_lora = 5 * 512 floats per layer for this prompt, times 11 MLA layers = 112 KB
+                (the reference appends one latent per token, so a five-token prompt needs five cells - the 2048*4 the
+                kernel's assert mentions is a ceiling, not an allocation)
+
+THE ASSEMBLY, in the order it has to happen:
+
+ 1. PACK.  The glm5_bind_check recipe, unchanged: table.pool_bytes(pack, bytes, err, &served) -> cudaMalloc(arena,
+    bytes) -> table.load(pack, arena, bytes, err, &served) -> NativeDense nd.load(shards, table, err).  45 binds then
+    succeed on that arena - measured, 28,716 tensors.
+ 2. WEIGHTS PER BLOCK.  For each layer 0..44: bind_glm_block(LayerView(table, layer), layer, d_inner = 8192,
+    d_conv = 4, shards, bound[layer], stream, err), then glm_fill_layer_weights(bound[layer], layer, kda_g, mla_g,
+    kda_storage[layer], mla_storage[layer], shexp_storage[layer], weights[layer], err).  Per-layer storage arrays must
+    outlive the run, since glm_fill_layer_weights assigns pointers into the bound block and the shexp slots.
+ 3. GEOMETRY.  kda_g {n_embd 4096, nh 64, hd 128, d_conv 4}; mla_g {4096, 64, 256, 512, 1536} - its defaults are
+    already these.  moe_g {4096, 288, 8, ff, w_scale 2.5, norm_w true, clamp_exp 10, clamp_shexp 10} and shexp_g with
+    the same n_embd and ff - SET THE CLAMPS EXPLICITLY: their defaults are 0 and 0 means DISABLED.
+ 4. THE ROUTED HALF of the provider, for the 43 routed layers: moe_g, shexp_g, shexp, moe_fmt (native_fmt from the
+    layer's own gu/d types in the pack's native_experts.txt - layer 3 is 16/18, layer 4 is 19/18), blob_fn, and the
+    shexp clamp.  The dense blocks 0..2 use glm_stage_ffn with ff = 12288 and the shexp clamp.
+ 5. BLOBS.  expert_layout_load(pack, 46, 288, err, 4096, 2048) BEFORE FileExpertSource::open(pack, 46, 288, err) -
+    open validates against the process-wide layout, and the layer count must cover the highest layer in the file
+    (45), which is why 43 fails as "malformed" while 46 loads.  Then blob_fn = a function pointer wrapping
+    src.blob(layer, expert).
+ 6. STATE.  kda_index[layer] = a slot for each of the 34 KDA layers, mla_index[layer] = a slot for each of the 11 MLA
+    layers, -1 elsewhere.  Both index arrays are keyed by the ARTIFACT's layer number.
+ 7. RUN.  For each of the five tokens in order, glm_trunk_forward(x_t, 45, provider, &ctx, kda_g, mla_g, 1e-5f, state,
+    l_out, nullptr, err, 0).  The layers are stateful, so the token loop is the OUTER loop and the state carries
+    across it - which is exactly what block 3 proved is wired correctly (the MLA cache grew 1..5).
+ 8. HEAD.  glm_stage_head_mean_norm over the last token's l_out (the mean over the four streams, then output_norm),
+    then the tied projection: 154,880 rows of 4,096 from glm5-head-gate/w_output.bin, argmax.
+ 9. GATE.  argmax == 12089 for prompt 785 6722 315 9621 374.  NOT a per-layer float match: the engine's own hidden
+    state accumulates the quantization of 43 routed blocks, each of which differs from a float reference by about 5%
+    of rms at the worst element (measured).  The token is the acceptance test and always has been.
+
+THE INPUT is the oracle's own hc_init from /home/peb/moredata/glm5-oracle-input/hc_init.bin - ne [4096, 4, 5, 1], five
+tokens of 16,384 floats, ne0 fastest.
+
+AND THE RULE FOR WHOEVER WRITES IT: the failure mode this session hit four separate times was a component that passed
+its own gate while the WIRING around it was wrong - the KDA normalised twice, the MLA cache never appended, the MoE
+stage never tested through the quantized path, the gate asking a 2-bit path to match float64.  So the runner should
+compare INTERMEDIATES, not just the token: the stage callback already exists (GlmStageFn), costs nothing when unused,
+and turns "the token is wrong" into "layer 17's FFN output is off".
