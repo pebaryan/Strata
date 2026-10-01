@@ -330,3 +330,25 @@ NEXT ACTION: check dequant_q8_0's `n` convention (elements or blocks) against it
 glm_bind.cpp:49, which for its case passed the same element count.  If the convention is elements, the overrun
 is elsewhere and the next test is to bind WITHOUT the hc branch and confirm the F32 pointers read cleanly again
 - that isolates it to one line.
+
+READ RESULT - the dequant call is EXONERATED, so my hypothesis was wrong:
+
+    src/kernels/cuda/quantize_act.cu:267
+        void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
+            const long long nb = n / QK8_0;                  // n is an ELEMENT count
+            dequant_q8_0_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(blocks, x, nb);
+        }
+    kernel (:129) reads blk = blocks + b*34 and writes x + b*32 .. +32
+
+With n = t.ne0*t.ne1 = 393216: nb = 12288 blocks = 417792 bytes read (exactly the Q8_0 tensor's size) and 393216
+floats = 1.57 MB written into a 1.57 MB cudaMalloc.  Source is device-resident (w->native_data).  So the
+arguments and the extent are all correct, and the overrun theory is dead.
+
+That leaves the corruption unexplained by the call, and the honest next test is narrow: with STRATA_HC_DEQUANT=1,
+disable only the part AFTER the kernel - do not push dev_f into out.owned and do not continue with dev_f in
+got.ptr - and see whether the arena still comes back unregistered.  That separates "the kernel write breaks the
+arena" from "something about holding this second allocation breaks it" (for instance, NativeDense's own
+bookkeeping or the WeightRef for hc_attn_fn being replaced rather than the two coexisting).
+
+Still not a reason to guess a fourth variant at runtime: the state that passed 9.1 is the default, and the
+opt-in branch is documented as unverified.
