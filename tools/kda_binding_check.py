@@ -46,20 +46,19 @@ ROW = re.compile(
 
 
 def parse(driver_output):
-    """Fields, per the byte dump of the real output: name \\t ne=.. \\t n=<digits> \\t min \\t max \\t sum \\t hash.
+    """Fields: name \\t ne=.. \\t n=<digits> \\t min \\t max \\t sum \\t hash, separated by REAL TABS.
 
-    Note the separator is two characters - a backslash and a 't' - because the driver's printf contains a literal
-    '\\t' rather than a tab.  Splitting on '\\t' in this file is that pair; a regex for the same thing has now
-    been got wrong several times, so it is not used.
+    The trap that cost seven attempts: repr() renders a real tab as '\\t' and so does od -c, so reading either and
+    concluding the file contains a literal backslash-t is wrong - a literal backslash-t shows as '\\\\t' in repr and
+    as two separate columns in od -c.  These lines use ordinary tabs; split on '\\t' in this file, which is one.
     """
     rows = {}
     for line in pathlib.Path(driver_output).read_text().splitlines():
-        parts = line.split("\\t")
+        parts = line.split("\t")
         if len(parts) < 6 or not parts[0].startswith("blk."):
             continue
-        name = parts[0].split(".", 2)[2]
         try:
-            rows[name] = (float(parts[3]), float(parts[4]), float(parts[5]))
+            rows[parts[0].split(".", 2)[2]] = (float(parts[3]), float(parts[4]), float(parts[5]))
         except ValueError:
             continue
     return rows

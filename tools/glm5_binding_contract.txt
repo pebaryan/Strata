@@ -1306,3 +1306,34 @@ STATE, unchanged and all committed: stage 1 PASS (hc_pre 7 significant digits, n
 T=1 and T=5, 8/8 stages each; the dequant root cause fixed (native_type == 8 guard) with the widened path exiting 0
 and 0 failures; binding verified by direct reading for attn_norm and ssm_conv1d_q, both exact.  tools/kda_gate.cpp
 and the two fixtures are committed and working - the broken artifact is the checker only.
+
+########  BINDING CHECK: 7 PASS, 0 FAIL - AND THE TAB THAT COST SEVEN ATTEMPTS  ########
+
+tools/kda_binding_check.py finally parses (14 float rows for block 0) and reports:
+
+    attn_norm  rel 3.2e-09  PASS        ssm_a    rel 1.3e-08  PASS
+    conv_q     rel 1.0e-11  PASS        dt_bias  rel 4.4e-09  PASS
+    conv_k     rel 1.1e-11  PASS        o_norm   rel 3.2e-10  PASS
+    conv_v     rel 1.6e-09  PASS
+    -> 7 PASS, 0 FAIL, 6 natively quantized (ssm_f_a, ssm_f_b, ssm_beta, ssm_g_a, ssm_g_b, wo)
+
+All three conv tensors matching at ~1e-11 matters most: the binding REPACKS ssm_conv1d_* into [d_conv][d_inner], and
+that is the one place a permuted or transposed copy would still have looked plausible.  ssm_a matching at 1.3e-08
+also confirms the -exp(A_log) convention agrees between the artifact, the kernel and the oracle.
+
+THE MISTAKE, recorded because it is now the most expensive single one of the session (seven attempts):
+repr() renders a real TAB as '\t', and od -c renders a real tab as '\t' as well.  I read both as the two-character
+sequence backslash-t, concluded the driver emitted a literal '\t', and wrote seven parsers to match that
+misreading.  A literal backslash-t would show as '\\t' in repr and as TWO separate columns in od -c.  The one
+command that would have ended it immediately - printing repr(line), len(line.split('\t')) and the parts list for a
+single known-good line - was written into this file as the next action and then skipped seven times in favour of
+editing the parser and re-running.  Both instruments were right; my reading of them was wrong.
+
+WHAT IS NOW COVERED: stage 1 (hc_pre 7 significant digits, norm 5.4e-10), the KDA kernel at T=1 and T=5 (8/8 stages
+each), the F32 binding of block 0's KDA weights (7/7 comparable tensors), the head of the dequant root cause
+(native_type == 8 guard).
+
+WHAT IS NOT: nine KDA-relevant tensors are natively quantized (wq, wk, wv plus the six above), so verifying them
+needs a dequantizer for their types - which is also what the KDA kernel gate needs before it can run on the
+engine's own bound weights rather than the oracle's files.  That single piece of work closes both gaps at once and
+is the clearest next step in this port.
