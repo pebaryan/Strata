@@ -4244,3 +4244,44 @@ routed experts with the clamp proven wired, dense FFN, hc_pre, hc_post, both deq
 0 and 1 verified end to end, isolated and chained; the head verified complete including its token.  What remains is
 WIRING THAT NEEDS THE PACK - the is_mla and routed branches of glm_trunk_forward, which have still never executed - and
 then the 45-block run and argmax == 12089, whose head half is now known to work.
+
+THE TOKEN GATE PASSES: THE ENGINE'S HEAD PRODUCES 12089 ON THE FULL 45-BLOCK HIDDEN STATE
+
+The full oracle run completed: blocks 0..44, MLA at 23, 27, 31, 35, 39, 43, and
+
+    logits argmax = 12089   expected 12089   MATCH
+    |hidden| 82.6806
+
+and head_gate, pointed at that run's l_out-44 with w_output.bin and its saved hidden state:
+
+    engine hidden: rms 1.29188498
+    oracle hidden: rms 1.29188499
+    worst absolute difference 4.76837e-07   relative to rms 3.69102e-07   ratio 0.999999987
+    [sensitivity] skipping the mean would give worst 3.06072 - this gate separates the two by 6418800x
+    projection: w_output.bin holds 154880 rows of 4096
+    engine argmax 12089 (logit 17.1146) over 154880 rows
+    expected      12089
+    token PASS
+    HEAD GATE: PASS
+
+THE CAVEAT, stated precisely because it is the whole distinction: the hidden state fed to the head came from the
+ORACLE's trunk (l_out-44), not the engine's.  So what this establishes is that the engine's head - mean over streams,
+output_norm, the 154,880-row projection, the argmax - is correct AT FULL DEPTH and produces the model's token.  What it
+does NOT establish is the engine's own trunk at 45 blocks, which still needs the pack.  The gate is now the real one,
+though: when the engine's trunk produces its own l_out-44, this exact command is the end-to-end test and no new code is
+needed for it.
+
+ALSO FROM THE FULL RUN, and it revises something recorded earlier: the clamps ARE exercised at depth -
+{'exp_gate': 5, 'exp_up': 3, 'shexp_gate': 2, 'shexp_up': 15, 'calls': 1890}.  Twenty-five crossings across 1,890
+calls.  So the earlier glm_moe_parity result - the fixture that could not reach the clamp - was a limitation of THAT
+FIXTURE, not evidence that the clamp is unreachable in this model.  The two runs together are what the port needed: the
+gate showed the clamp is WIRED (by lowering the limit and watching exactly the terms it governs move), and the full
+model shows the clamp is REACHED.  Neither alone would have said both things.
+
+SMALL GOTCHA WORTH RECORDING: np.save appends ".npy" when the filename does not already end in it, so
+--save-hidden <dir>/hidden.bin wrote <dir>/hidden.bin.npy.  The run reported the path it was given, not the path it
+wrote, which cost one failed lookup here.
+
+STATE: every kernel verified against the oracle; blocks 0 and 1 end to end, isolated and chained, at the fp32 floor; the
+head verified complete AND producing the correct token at full depth.  Unverified: the engine's own 45-block trunk,
+which needs the pack - the is_mla and routed branches of glm_trunk_forward have still never executed.
