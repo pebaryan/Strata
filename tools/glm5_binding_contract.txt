@@ -5495,3 +5495,32 @@ other layer's, so this is most likely one tensor the pack names differently than
 one that glm_fill_layer_weights leaves unset when a name is absent - which is exactly the kind of thing the next
 diagnostic answers, and it is the same diagnostic that just worked: print the KdaWeights fields for layer 4 by name, the
 way the eight MlaWeights pointers were printed for layer 3.  That diagnostic found the last defect in one run.
+
+THE DIFFERENTIAL, AND IT FINDS A REAL DEFECT: LAYER 4'S STRUCT POINTS AT LAYER 0'S ADDRESSES
+
+Two dumps, one per layer, of the same struct:
+
+  layer 0:  wq 0x7fd4f1fff010  wk 0x7fd503fff010  wv 0x7fd4e9ffe010  wo 0x7fd50cfe3010
+            ssm_f_a 0x5575e7eb7d90  ssm_f_b 0x5575e7db7d80  ssm_g_a 0x5575e80b7da0  ssm_g_b 0x7fd50c7e1010
+  layer 4:  wq 0x7fd4f1fff010  wk 0x7fd503fff010  wv 0x7fd4e9ffe010  wo 0x7fd50cfe3010
+            ssm_f_a 0x5575e7eb7d90  ssm_beta 0x5575e7db7d80  ssm_g_a 0x5575e84b7db0  ssm_g_b 0x5575e86b7dc0
+
+FOUR DEVICE POINTERS ARE IDENTICAL BETWEEN TWO DIFFERENT LAYERS - wq, wk, wv and wo all come back with exactly the same
+address in layer 0 and layer 4 - and the staged host pointers are not merely reused, they are SWAPPED BETWEEN FIELDS:
+layer 4's ssm_f_a equals layer 0's ssm_f_a, layer 4's ssm_beta equals layer 0's ssm_f_b, and layer 4's ssm_g_a equals
+layer 0's ssm_g_a.  Different layers of a 46-block model cannot share the same weight buffers, so this is not the pack
+and not the artifact: it is the per-layer mapping or the per-layer staging, and it is the first thing in this port found by
+differencing a working case against a failing one rather than by inspecting either alone.
+
+WHY THE DIFFERENTIAL WAS THE RIGHT INSTRUMENT AND A SINGLE DUMP WOULD HAVE BEEN MISLEADING: every one of layer 4's
+sixteen fields is a PLAUSIBLE POINTER - none is NULL, all are in ranges that look like the arena, the managed native
+allocations or the heap.  A dump of the failing layer alone would have reported "no null found", which is false and would
+have sent the search somewhere else entirely.  The control - layer 0, which runs - is what turns sixteen plausible values
+into one impossible relationship.
+
+THE TWO CANDIDATES, and the next diagnostic distinguishes them without a build: either the provider is re-mapping the
+WRONG BOUND BLOCK for layer 4 (so glm_fill_layer_weights reads layer 0's tensors and writes them into w[4]), or the
+staging's pointer arithmetic is reusing buffers across layers and the re-map is faithfully copying what it is given.
+Printing the bound block's own tensor pointers for layers 0 and 4 beside these answers it in one run - if the bound
+tensors differ and the mapped struct does not, the defect is in the mapping; if they are the same, the defect is that
+p->bound[4] was never distinct from p->bound[0].

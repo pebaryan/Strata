@@ -197,6 +197,20 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
         }
     }
     out = p->w[(size_t) layer];                      // assembled from the staged host weights
+
+    // ---- LAYER 0 BESIDE LAYER 4, because layer 0 runs and layer 4 stops on "null argument".  A dump of the failing
+    // layer says which field is NULL; a differential says which field DIFFERS, and the difference is the defect.
+    if ((layer == 0 || layer == 4) && out.kda != nullptr) {
+        const K::KdaWeights& kw = *out.kda;
+        const char* nm[16] = {"attn_norm", "wq", "wk", "wv", "conv_q", "conv_k", "conv_v", "ssm_a",
+                              "dt_bias", "ssm_f_a", "ssm_f_b", "ssm_beta", "ssm_g_a", "ssm_g_b", "o_norm", "wo"};
+        const float* pp[16] = {kw.attn_norm, kw.wq, kw.wk, kw.wv, kw.conv_q, kw.conv_k, kw.conv_v, kw.ssm_a,
+                               kw.dt_bias, kw.ssm_f_a, kw.ssm_f_b, kw.ssm_beta, kw.ssm_g_a, kw.ssm_g_b, kw.o_norm, kw.wo};
+        std::printf("  layer %d KdaWeights:\n", layer);
+        for (int i = 0; i < 16; ++i) {
+            std::printf("    %-10s %p%s\n", nm[i], (const void*) pp[i], pp[i] == nullptr ? "   <-- NULL" : "");
+        }
+    }
     const bool is_dense = (layer < 3);
     if (is_dense) {
         out.moe_g = &p->dense_g;
