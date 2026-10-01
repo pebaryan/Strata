@@ -5204,3 +5204,34 @@ branch evidently does not record the type it fetched - the same four-byte omissi
 either it should, or those tensors should be marked non-quantized once fetched and already floats.  Which of the two is
 right is a question the branch's own code answers; it is the next thing to look at, and it is one tensor family, not a
 category.
+
+THE ARTIFACT-FETCH BRANCH WAS MARKING FLOAT DATA AS QUANTIZED - FIXED, AND IT MOVED THE FAILURE ONE STAGE FURTHER
+
+The named defect is closed.  The branch that fetches the 3-D MLA tensors (attn_k_b, attn_v_b) from the artifact was
+doing three wrong things at once, and they were all the same mistake:
+
+    const size_t nbytes = w->ne0 * w->ne1 * 4;                 // FLOATS: four bytes per element
+    cudaMemcpy(dev3, owner->tensor_data(*found), nbytes, HostToDevice);   // ... uploaded to the DEVICE
+    got.quantized = true;                                     // ... and then called QUANTIZED
+    got.native_type = (int) w->native_type;                   // ... with the sentinel type -1
+
+tensor_data() hands back FLOATS out of the artifact's own mapping, the consumer is a CPU kernel (mla_forward), and the
+branch uploaded those floats to a device buffer the CPU cannot read while discarding the host copy it already had.  The
+"no dequantizer for type -1" error was the middle of that: a dequantizer was being handed a float buffer because the
+tensor claimed to be quantized.  The branch now keeps the host pointer from tensor_data and records quantized = false
+and native_type = 0 - which says what the data IS, and is what makes the staging pass leave it alone.
+
+AND IT MOVED THE FAILURE, which is how progress is measured here:
+
+    before:  trunk failed at token 0: layer 3: dequant_to_host: no dequantizer for type -1 (attn_k_b.weight)
+    after:   <SIGSEGV>
+
+A segfault is a WORSE diagnostic than a named error, and that is worth saying rather than dressing up: the refusal was
+more useful than the crash.  But it is also further along - the staging now completes for layer 3 and execution enters
+the layer's MLA stage, which is where the next defect is.  The old device upload never got tested at all (the staging
+refused the tensor before the kernel saw it), so the fetched tensor's layout under a host pointer is now being
+exercised for the first time, and the most likely next defect is exactly that: the old comment claimed the fetch
+produced "the layout the MLA kernel wants", but that claim was about a path whose consumer was assumed to be on the GPU.
+
+NEXT: gdb for the new site, then compare the fetched attn_k_b/attn_v_b layout against the MLA parity fixture's, which
+is the only verified statement of what mla_forward expects for those two tensors.

@@ -244,16 +244,20 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
                 if (found) break;
             }
             if (!found) { err = "glm_bind: " + full + " is in no shard"; return false; }
-            const size_t nbytes = (size_t) w->ne0 * (size_t) (w->ne1 > 0 ? w->ne1 : 1) * 4;
-            float* dev3 = nullptr;
-            if (cudaMalloc(&dev3, nbytes) != cudaSuccess) { err = "glm_bind: alloc failed for " + full; return false; }
-            if (cudaMemcpy(dev3, owner->tensor_data(*found), nbytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-                cudaFree(dev3); err = "glm_bind: upload failed for " + full; return false;
-            }
-            out.owned.push_back(dev3);
-            got.ptr = dev3;
-            got.quantized = true;
-            got.native_type = (int) w->native_type;
+            // KEEP THE HOST POINTER.  tensor_data() hands back FLOATS out of the artifact's own mapping, and these
+            // tensors are consumed by CPU kernels (mla_forward), so uploading them to a device buffer produced a copy
+            // the CPU could not read and the original - already in host memory - was thrown away.  The device upload
+            // is gone entirely.
+            //
+            // AND THEY ARE NOT QUANTIZED, which was the defect that surfaced as "dequant_to_host: no dequantizer for
+            // type -1 (attn_k_b.weight)": this branch was marking a FLOAT buffer quantized, with the sentinel type -1
+            // carried over from a WeightRef that has no native blocks, so a dequantizer was handed floats.  Recording
+            // quantized = false says what the data IS, and that is what makes the staging pass leave it alone.
+            got.ptr = (const float*) owner->tensor_data(*found);
+            got.quantized = false;
+            got.native_type = 0;
+            got.ne0 = t.ne0;
+            got.ne1 = t.ne1;
             out.tensors.push_back(got);
             continue;
         } else if (w->native_data) {
