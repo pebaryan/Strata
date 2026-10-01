@@ -611,3 +611,26 @@ Candidates for what a copy can do to break the next one, none of them establishe
 (ssm_f_b is 8192x128 = 4 MB), the last tensor in the table, or a copy count limit of some kind.  Whichever it is,
 it is a property of this driver's readback harness - the binding is verified and the stage's own code is proven
 correct by the in-loop test.
+
+BISECTION RESULT - ALIVE AT THE END OF EVERY ITERATION, DEAD IMMEDIATELY AFTER THE LOOP
+
+Inserted a 4-byte copy of the tensor just handled at the end of each print-loop iteration (line 100-137):
+
+    alive after ssm_norm.weight      no error        <- the LAST iteration's marker
+    postloop copy of hc_attn_base:   invalid argument
+    hostcopy hc_attn_base.weight:    invalid argument
+
+So every iteration ends with the state alive, and the first copy after the loop fails - with no statement in
+between.  That is not a property of any tensor, any size, any count, or any ordering: it is a property of being
+outside that loop.
+
+Which means the difference is not in the CUDA calls at all, and the honest conclusion is that the post-loop code
+I inserted is not what I think it is - five successive python edits have been made to this file, two of which
+silently failed on anchors, and the block I am reasoning about may not be the block that is compiled.  The right
+next action is therefore to STOP editing this file by string surgery and regenerate tools/glm5_bind_check.cpp
+cleanly from a known-good state (the 9.1 verification: bind + print, no stage code), then add the stage block in
+ONE write, and diff the two readbacks.  That is cheap and it removes the entire class of "the source I am reading
+is not the source that ran" errors that this session's last hour has been fighting.
+
+Nothing here affects the port: the binding is verified at 9.1's 12/12, glm_layer.cpp is written and compiling,
+and the kernel interface is recorded.  What is stuck is my own debug harness.

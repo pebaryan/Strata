@@ -134,6 +134,14 @@ int main(int argc, char** argv) {
         for (float f : host) { sum += f; if (f < mn) mn = f; if (f > mx) mx = f; }
         std::printf("blk.%d.%s\tne=%d,%d\tn=%zu\t%.9g\t%.9g\t%.9g\t%016llx\n", block, t.name.c_str(),
                     t.ne0, t.ne1, n, mn, mx, sum, (unsigned long long) fnv1a(host));
+        {
+            // BISECTION: a 4-byte copy of the tensor just handled.  The first iteration whose marker
+            // fails is the one whose copy broke the following state.
+            std::vector<float> probe(1);
+            const cudaError_t ps = cudaMemcpy(probe.data(), t.ptr, 4, cudaMemcpyDeviceToHost);
+            std::fprintf(stderr, "  alive after %-24s %s\n", t.name.c_str(), cudaGetErrorString(ps));
+            fflush(stderr);
+        }
     }
     cudaFree(arena);
     
