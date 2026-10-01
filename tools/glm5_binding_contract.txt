@@ -4163,3 +4163,48 @@ STATE NOW: every KERNEL in the chain is verified against the oracle - KDA (12/12
 1-entry-cache invariant), the routed expert path (this entry), the dense FFN, hc_pre, hc_post, dequant_q5_K and
 dequant_q6_K.  What remains unverified is WIRING, not arithmetic: the is_mla branch and the routed branch of
 glm_trunk_forward have still never executed, because a block that uses either needs the pack.
+
+THE HEAD EXISTS AND IS VERIFIED - AND THE GATE IS PROVEN SENSITIVE TO THE STEP IT TESTS
+
+The head had no implementation in this engine at all.  Two things were added:
+
+    glm_stage_head_mean_norm(hc, hc_streams, n_embd, output_norm, hidden, err)     src/core/glm_layer.cpp + header
+    tools/head_gate.cpp + a CMake target
+
+and the reference's own head sequence is (glm5_full_run.py:158-178):
+
+    cur = HC.hc_mean(np.transpose(inpL, (1, 0, 2)))      # the MEAN OVER THE FOUR HC STREAMS
+    cur = DRV.rms_norm_ne0(cur, output_norm.weight)
+    x   = cur[:, -1]                                     # the LAST prompt token
+    logits = output.weight @ x                           # the tied projection, then argmax
+
+    engine hidden: rms 1.3855285
+    oracle hidden: rms 1.3855285
+    worst absolute difference 4.76837e-07   relative to rms 3.44155e-07   ratio 1
+    [sensitivity] skipping the mean would give worst 0.659243 - this gate separates the two by 1382533x
+    HEAD GATE: PASS
+
+THE STEP WORTH TESTING IS NOT THE NORM, IT IS THE AVERAGING, and the gate says so in numbers.  The trunk's output is
+four hyper-connection streams and the reference consumes their MEAN; a head that omitted that line - one line, no shape
+change - would project a single stream and emit plausible logits from the wrong vector.  The sensitivity line measures
+exactly that alternative: 0.659243 against the 4.77e-07 the correct code produces, a separation of 1.4 million times.
+A gate that cannot distinguish the step it exists to test is not a gate, and this one can, by construction rather than
+by claim.
+
+The trunk does NOT have to be 45 blocks deep for this: the head consumes whatever the trunk produced, so a 3-block run
+verifies the same code and the oracle writes its hidden state for any --blocks value.  The 3-block run's own
+"argmax = 6196 expected 12089 MISMATCH" is therefore EXPECTED and meaningless - the head is being applied to a
+three-block hidden state - and it is recorded here so it is not mistaken for a defect, exactly as the 1-block run's
+mismatch was.
+
+WHAT THE HEAD STILL LACKS, and it is the last piece of it: the output projection (a 154,880 x 4,096 matvec against the
+tied output.weight) and the argmax.  Those can be verified INDEPENDENTLY of the engine's trunk, using the oracle's full
+45-block hidden state plus output.weight - which is worth doing because it would establish argmax == 12089 without
+waiting for the pack-based chain.  The full 45-block oracle run is in progress and writes both l_out-{0..44} and the
+hidden state.
+
+ALSO WORTH RECORDING for whoever picks this up: output_norm.weight is NOT in the first GGUF shard, and gguf-py's
+GGUFReader does not take a list of shards in this version.  The multi-shard reader that DOES work is
+glm5_kda_reference.Model, which make_block_fixture.py already uses -
+`import glm5_kda_reference as K; K.Model(sorted(glob('*.gguf'))[0])` - and it opens the sibling shards itself.  Both
+failures were hit here before finding it.

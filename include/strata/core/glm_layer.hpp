@@ -105,4 +105,9 @@ bool glm_stage_moe(const float* xn, const float* router, const float* probs_b,
                    const kernels::glm::MoeGeometry& g, const float* const* const* experts,
                    const float* const* shared, float* out, std::string& err);
 
+
+/// Stage 5 (first half): the head's mean-over-streams and output_norm.  The projection follows outside this file.
+bool glm_stage_head_mean_norm(const float* hc, int hc_streams, int n_embd, const float* output_norm, float* hidden,
+                              std::string& err);
+
 }  // namespace strata::core::glm

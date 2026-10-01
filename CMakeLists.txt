@@ -937,3 +937,15 @@ add_executable(trunk_gate tools/trunk_gate.cpp src/core/glm_trunk.cpp src/core/g
 target_include_directories(trunk_gate PRIVATE /include)
 target_compile_options(trunk_gate PRIVATE -O2)
 target_link_libraries(trunk_gate PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
+
+# head_gate (branch glm5next-port): the head's first half - mean over the HC streams, then output_norm -
+# verified against the hidden state the oracle saves with glm5_full_run.py --save-hidden.  The step under
+# test is the AVERAGING: a head that skipped it projects one stream instead of the mean, with no shape change
+# and plausible logits, so the gate also reports what skipping it would have produced.
+add_executable(head_gate tools/head_gate.cpp src/core/glm_trunk.cpp src/core/glm_layer.cpp
+                   src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_bind.cpp
+                   src/core/native_dense.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
+                   src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu)
+target_include_directories(head_gate PRIVATE /include)
+target_compile_options(head_gate PRIVATE -O2)
+target_link_libraries(head_gate PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)

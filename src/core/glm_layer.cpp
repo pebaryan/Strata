@@ -221,4 +221,40 @@ bool glm_stage_moe(const float* xn, const float* router, const float* probs_b,
     return true;
 }
 
+
+/// Stage 5: the head's first half.  The trunk's output is HC rows, so the head begins by AVERAGING them: the model
+/// reads four hyper-connection streams and the reference consumes their mean, per its own line
+/// `cur = HC.hc_mean(np.transpose(inpL, (1, 0, 2)))`, followed by `rms_norm_ne0(cur, output_norm.weight)`.
+///
+/// The averaging lives HERE rather than with the caller because it is the one step between the trunk and the
+/// projection that is easy to omit - it is a single line in the reference, it produces no shape change, and a head
+/// that skipped it would project one stream instead of their mean and emit plausible logits from the wrong vector.
+/// The projection itself is deliberately NOT here: it is a 154,880 x 4,096 matvec against a dequantized tensor, and
+/// keeping it out means this stage can be verified against the oracle's saved hidden state without it.
+///
+/// `hc` is the trunk output in the engine's layout, [hc_streams][n_embd], stream-major within the token.
+bool glm_stage_head_mean_norm(const float* hc, int hc_streams, int n_embd, const float* output_norm, float* hidden,
+                              std::string& err) {
+    if (!hc || !hidden || !output_norm) {
+        err = "glm_stage_head_mean_norm: null argument";
+        return false;
+    }
+    if (hc_streams <= 0 || n_embd <= 0) {
+        err = "glm_stage_head_mean_norm: hc_streams and n_embd must be positive";
+        return false;
+    }
+    const float inv = 1.0f / (float) hc_streams;
+    for (int e = 0; e < n_embd; ++e) {
+        float acc = 0.0f;
+        for (int s = 0; s < hc_streams; ++s) acc += hc[(size_t) s * n_embd + e];
+        hidden[e] = acc * inv;
+    }
+    // the same eps the rest of this port uses for the layer norms (attention.layer_norm_rms_epsilon)
+    double ss = 0.0;
+    for (int e = 0; e < n_embd; ++e) ss += (double) hidden[e] * hidden[e];
+    const float r = 1.0f / std::sqrt((float) (ss / (double) n_embd) + 1e-5f);
+    for (int e = 0; e < n_embd; ++e) hidden[e] = hidden[e] * r * output_norm[e];
+    return true;
+}
+
 }  // namespace strata::core::glm
