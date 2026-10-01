@@ -4688,3 +4688,44 @@ THE SHORTER PATH, which needs nothing new: glm5-moe-l3.raw is the ORACLE's own f
 bytes, built by glm5_moe_reference.py from the artifact, holding the blobs for the eight experts the oracle selected
 (45, 25, 117, 180, 98, 55, 9, 88).  Comparing the PACK's bytes for those same ids against the fixture's blobs is the
 same test as the GGUF one, is already on disk, and uses the reader that is known to work.  That is the next measurement.
+
+THE UNVERIFIED COMPONENT HAS BEEN FOUND, AND IT IS THE ONE THAT IS WRONG: glm_stage_moe_native HAS NO GATE
+
+This closes the question the last four entries have been narrowing.  glm_moe_parity does NOT test the path the trunk
+loop runs:
+
+    src/kernels/glm_moe_parity.cpp:87   glm::expert_ffn(wg.data(), wu.data(), wd.data(), g, x.data(), got.data(), ...)
+    src/kernels/glm_moe_parity.cpp:185  expert_ptrs[i * 3 + 0] = ex_gate[i].data();
+
+FLOAT weights, through moe_forward - and the file contains no call to glm_stage_moe_native, no blob_fn, and no
+native_* anything.  It is a pure FLOAT-path gate.  So the quantized, STREAMED, pack-reading path that the trunk loop
+uses for all 43 routed blocks has never been compared against a reference at all - not against the oracle, not against
+the artifact, not against the float path.
+
+EVERY OTHER PIECE OF BLOCK 3 IS INDEPENDENTLY VERIFIED, which is what makes this conclusive rather than suggestive:
+
+    the MLA branch        2.756e-05 of rms        (this session, and it had never executed before)
+    both hc sites         3.281e-06 of rms
+    the norm / MoE input  2.649e-05 of rms
+    the routing           engine ids identical to an independently computed top-8
+    the MoE geometry      w_scale 2.5, n_used 8, ff 2048 - matching what the parity gate read from the artifact
+    the blob descriptor   native_fmt bytes == the pack's blob_bytes, to the byte
+    the stride            2,162,688 + 2,162,688 + 3,211,264 == 7,536,640, from the quant types' own block sizes
+    the float MoE math    verified - by the very gate that does not cover the native path
+    the dense FFN path    verified, which is why blocks 0 and 1 pass
+
+and the one component with no gate is the one that is wrong, by 4.6% of rms with a matching rms: a mixture of the right
+magnitude drawn from the wrong members, which is what a blob read at a subtly wrong sub-offset looks like - the gate and
+up matrices are back to back inside a blob, so an off-by-one in either one yields valid quantized data from the wrong
+matrix and nothing complains.
+
+WHAT TO BUILD, precisely: a NATIVE-path parity gate.  glm5_moe_reference.py should also write the RAW QUANTIZED bytes of
+the eight selected experts for the layer (it currently writes them dequantized as float32 - see line 347,
+`np.ascontiguousarray(t, dtype=np.float32)`), and the gate should run glm_stage_moe_native against that fixture, so its
+output is compared with the reference's `out` in the same file.  That splits the remaining 4.6% into "the blob reading
+inside the stage" or "the quantized arithmetic", which is the last split left in this block.
+
+THIS IS THE SAME LESSON AS THE DOUBLE-NORM AND THE MLA CACHE, in its final and most expensive form: a test that
+verifies a part cannot see a wiring error - and here the part was never tested through the wiring the model uses.  Every
+gate in this port hands its kernel the state it needs in the form it wants; the trunk hands the MoE stage QUANTIZED
+BYTES FROM A PACK, and nothing had ever asked that path to reproduce a number.
