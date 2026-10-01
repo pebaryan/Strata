@@ -224,3 +224,32 @@ is exactly what a genuinely broken port looks like, hence two turns spent on the
 
 Next: bisect INSIDE the KDA block. hc_attn_pre-0 and attn_norm-0 are known-good inputs, so dump the KDA
 front end (kda_gate-0, kda_beta-0, the conv1d outputs, the q/k/v norms) and find the first wrong term.
+
+## Part 7: inside the KDA block - the decay gate and beta are wrong, the input is not
+
+Bisecting inside block 0's attention (the port and reference dumps both carry the KDA internals, so no new
+dump was needed):
+
+    attn_norm-0     1.121e-04  r +1.0000   the KDA input x is correct
+    kda_gate-0      2.777e+00  r +0.9856   FIRST DIVERGENCE - the decay gate g   [scale 4.95]
+    kda_beta-0      1.190e-01  r +0.9890   beta is wrong too                    [scale 0.98]
+    attn_output-0   2.077e-02  r +0.5136   inherits both
+
+Reading: both SSM front-end outputs are wrong while the x they are computed FROM is right, so the error is
+in the parameter path - ssm_a, ssm_dt.bias, ssm_f_a/ssm_f_b, ssm_beta - or in the formula itself. The
+correlation is +0.99 for both, so this is a systematic error (a wrong or missing term, a wrong constant, a
+wrong tensor), not a layout or indexing failure: a bad layout would decorrelate, as attn_output-0's +0.51
+shows further down.
+
+Next experiment, and it discriminates the two remaining possibilities: compute g and beta with the NUMPY
+ORACLE from the reference's own verified attn_norm-0 input and compare against the reference's kda_gate-0
+and kda_beta-0.
+
+  * oracle matches the reference  -> my FORMULA is right and the PORT KERNEL is wrong: fix in C++.
+  * oracle also disagrees         -> my formula or weight mapping is wrong: fix oracle and kernel together.
+
+Care before running it: the dump is in ggml memory order (i0 fastest) whereas the oracle's helpers use
+[tokens, dim] numpy arrays, so the input must be transposed deliberately - the exact class of mistake that
+cost two turns in parts 3-5. Verify the oracle's own convention first by checking that its internal
+rms_norm(hc_attn_pre-0) reproduces the reference's attn_norm-0, which the dump already contains: that is a
+free end-to-end check of the oracle's input path before any gate comparison is believed.
