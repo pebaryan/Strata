@@ -773,3 +773,26 @@ harness reads and compare its layer_in against both the engine's hc_pre output a
 the oracle agrees with the engine, then the dump row is not layer_in (B).  If the oracle agrees with the dump but
 not the engine, the difference is in x (A) - and then the only thing left to check is the harness's slice of
 hc_init, which is one print statement.
+
+########  STAGE 1's hc_pre IS VERIFIED  ########
+
+Ran the oracle's own hc_pre (the implementation validated in phase 6) on the SAME hc_init the harness reads:
+
+    oracle hc_pre layer_in token0 : min -0.016211817   max 0.0226506591  sum 0.182561547
+    engine hc_pre (stage 1)       : min -0.0162118152  max 0.0226506572  sum 0.182561572     MATCHES to 7 digits
+    dump's hc_attn_pre-0  token0  : min -0.0154028935  max 0.0215204563  sum 0.181364045
+    oracle vs the DUMP            : 5.252e-02 of scale   <- the SAME gap
+
+So the 5.6% "error" I attributed to the engine is reproduced by the oracle itself, which means hc_attn_pre-0 is not
+layer_in: the graph node between hc_init and attn_norm-0 is something else (almost certainly the NORMALIZED
+STREAMS x*rms - the value the mix consumes - rather than hc_pre's gated output).  Stage 1's hc_pre is correct, and
+it agrees with the phase-6-validated oracle to seven significant digits.
+
+WHAT THIS ALSO SETTLES: the four inputs were already bit-exact against the artifact, the constants match, and now
+the arithmetic matches the oracle.  Stage 1's hyper-connection front end is therefore verified end to end, by
+direct comparison rather than by inference - the earlier "NO MATCH" verdict at 1a6e0b3 was my comparison target
+being wrong, not the stage.
+
+NEXT, and it is now well-posed: identify what the dump's hc_attn_pre-0 actually is (test x*rms against it
+first), then compare attn_norm-0 against the stage's POST-norm output using the same node discipline - the last
+comparison mixed two different nodes and that, not the stage, produced the 20% figure.
