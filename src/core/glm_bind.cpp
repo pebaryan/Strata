@@ -190,8 +190,34 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
                 cudaFree(dev_f);
                 continue;
             }
-            out.owned.push_back(dev_f);
-            got.ptr = dev_f;
+            // HOST COPY, and this is the whole defect.  These dequantized floats are read by CPU kernels - hc_pre,
+            // rms_norm, kda_forward and mla_forward; the entire trunk is CPU-side, which is why its own parity gates
+            // link no CUDA at all.  Leaving the result in a CUDA buffer means the first host dereference is a
+            // SIGSEGV, and that is exactly what the engine's first 45-block run produced: hc_pre first (the hc stage
+            // precedes the KDA), then kda_forward (the KDA precedes the MLA).  Every previous caller of
+            // glm_trunk_forward was fed fixture arrays in ordinary host memory, so no amount of per-kernel testing
+            // could have found it - only a caller that builds its weights from the real pack.
+            //
+            // Dequantize on the device (the kernels exist and are bit-exact), copy back, and point the tensor at the
+            // host copy.  The host buffer is intentionally NOT freed: GlmBoundBlock::owned is released with cudaFree,
+            // so putting a host pointer there would be worse than leaking it, and a bind happens once per process.
+            {
+                float* host_f = (float*) std::malloc((size_t) n * sizeof(float));
+                if (host_f == nullptr) {
+                    err = "glm_bind: " + full + ": host dequant buffer allocation failed";
+                    return false;
+                }
+                const cudaError_t cp = cudaMemcpy(host_f, dev_f, (size_t) n * sizeof(float), cudaMemcpyDeviceToHost);
+                if (cp != cudaSuccess) {
+                    std::free(host_f);
+                    err = "glm_bind: " + full + ": host copy of the dequantized weights: " +
+                          cudaGetErrorString(cp);
+                    return false;
+                }
+                cudaFree(dev_f);
+                out.owned.push_back(host_f);
+                got.ptr = host_f;
+            }
             got.quantized = false;
             got.ne0 = t.ne0;                 // the artifact's orientation, NOT swapped
             got.ne1 = t.ne1;

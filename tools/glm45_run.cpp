@@ -256,45 +256,14 @@ int main(int argc, char** argv) {
     }
     std::printf("bound and mapped %d blocks\n", N_LAYERS);
 
-    // ---- THE hc WEIGHTS MUST BE HOST-READABLE, and this is measured rather than assumed.
+    // ---- the hc weights need no workaround any more.
     //
-    // Printed just below: hc_attn_fn comes back OUTSIDE the arena - a private allocation, whether from the GGUF-native
-    // path or from the dequant branch's own CUDA buffer - while hc_attn_base, hc_attn_scale and attn_norm are inside
-    // it.  glm_stage_hc_norm runs hc_pre on the CPU, so a device pointer there is a SIGSEGV, which is exactly what the
-    // first run of this tool did.  Every previous caller (trunk_gate, block3_gate, head_gate) passed FIXTURE arrays in
-    // ordinary host memory, which is why nothing before this ever touched it.
-    //
-    // A production loader would keep these small tensors in host memory from the start.  This harness copies them
-    // explicitly instead of pretending: hc_attn_fn and hc_ffn_fn are 393,216 floats each, so 45 blocks cost 67 MB.
-    std::vector<std::vector<float> > hc_host((size_t) 2 * N_LAYERS);
-    {
-        const char* want_name[2] = {"hc_attn_fn.weight", "hc_ffn_fn.weight"};
-        for (int b = 0; b < N_LAYERS; ++b) {
-            const float* dst[2] = {P.w[(size_t) b].hc_attn_fn, P.w[(size_t) b].hc_ffn_fn};
-            for (int k = 0; k < 2; ++k) {
-                for (const C::GlmBoundBlock::Tensor& t : P.bound[(size_t) b].tensors) {
-                    if (t.name != want_name[k]) continue;
-                    const size_t n = (size_t) t.ne0 * (size_t) (t.ne1 > 0 ? t.ne1 : 1);
-                    std::vector<float>& buf = hc_host[(size_t) b * 2 + k];
-                    buf.assign(n, 0.0f);
-                    const cudaError_t ce = cudaMemcpy(buf.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
-                    if (ce != cudaSuccess) {
-                        std::fprintf(stderr, "hc copy for %s (layer %d): %s\n", want_name[k], b, cudaGetErrorString(ce));
-                        return 1;
-                    }
-                    dst[k] = buf.data();
-                    break;
-                }
-            }
-            P.w[(size_t) b].hc_attn_fn = dst[0];
-            P.w[(size_t) b].hc_ffn_fn = dst[1];
-            if ((b % 15 == 0 || b == N_LAYERS - 1) && dst[0] != nullptr && dst[1] != nullptr) {
-                std::printf("  hc weights on host for layer %2d: %zu floats each\n", b,
-                            hc_host[(size_t) b * 2].size());
-                std::fflush(stdout);
-            }
-        }
-    }
+    // This block used to copy hc_attn_fn and hc_ffn_fn to host, because the pack's dequantized weights came back as
+    // device pointers while the trunk's kernels are CPU-side.  That copy moved the crash from hc_pre to kda_forward,
+    // which proved the diagnosis; the fix now lives in the LOADER (glm_bind.cpp), where the dequantized floats land in
+    // host memory for every tensor that needs it.  The runner no longer patches weights it did not load - and the
+    // cudaMemcpy it used to do now fails with "invalid argument", because its source is host memory, which is the
+    // signal that the loader is finally doing its job.
 
     // ---- DIAGNOSTIC: are the hc/norm weights the trunk's CPU stages read actually host-readable?
     //
