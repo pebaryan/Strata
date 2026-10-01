@@ -327,6 +327,33 @@ int main(int argc, char** argv) {
         }
     }
 
+    // ---- WHICH TENSORS CAN A CPU KERNEL NOT READ?
+    //
+    // This is the list the loader has to be fixed against: every tensor the pack serves QUANTIZED comes back as a
+    // device pointer, and the trunk's hc and KDA stages are CPU kernels.  Printed per tensor rather than inferred,
+    // because the fields the weight structs point at are exactly the ones that have to move to host memory.
+    {
+        const char* lo = (const char*) arena;
+        const char* hi = lo + bytes;
+        const int probe[2] = {0, 3};
+        for (int k = 0; k < 2; ++k) {
+            const int b = probe[k];
+            size_t outside = 0, inside = 0;
+            std::printf("  layer %d bound tensors outside the arena:", b);
+            for (const C::GlmBoundBlock::Tensor& t : P.bound[(size_t) b].tensors) {
+                const char* c = (const char*) t.ptr;
+                if (t.ptr != nullptr && (c < lo || c >= hi)) {
+                    ++outside;
+                    std::printf(" %s", t.name.c_str());
+                } else {
+                    ++inside;
+                }
+            }
+            std::printf("\n    (%zu outside, %zu inside the arena)\n", outside, inside);
+            std::fflush(stdout);
+        }
+    }
+
     // ---- state: one KDA state per KDA layer, one MLA cache per MLA layer, both keyed by the ARTIFACT's layer number
     std::vector<std::vector<float> > kda_state(N_LAYERS);
     std::vector<std::vector<float> > mla_cache(N_LAYERS);
