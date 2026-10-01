@@ -76,9 +76,9 @@ struct KdaIntermediates {
     float* o = nullptr;     ///< [tokens][d_inner] after the gated norm
 };
 
-/// Runs the block's operator over `tokens` inputs.  `state` is [nh][hd][hd], S[head][i][j]; it is read
-/// and written so that a decode step can continue from a prefill (pass nullptr for a fresh, zero state).
+/// Runs the block's operator over `tokens` inputs.  `state` is [nh][hd][hd], S[head][i][j]. `conv_state`, when
+/// supplied, is the three [d_conv-1][d_inner] projection histories. Both are updated for the next decode call.
 void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int tokens, float* out,
-                 float* state, const KdaIntermediates* mid = nullptr);
+                 float* state, const KdaIntermediates* mid = nullptr, float* conv_state = nullptr);
 
 }  // namespace strata::kernels::glm

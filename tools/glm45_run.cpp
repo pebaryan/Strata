@@ -74,10 +74,20 @@ static void stage_cb(void* ctx, int layer, const char* name, const float* data, 
     // hc_init - so the two runs are comparable stage by stage from block 0, which is the bisection that found block 0's
     // double-norm, block 1's chaining and block 3's four verdicts.  Token 0 only: that is where the lifetime and state
     // questions do not arise, so a disagreement there is a stage defect rather than a state one.
-    if (sc->token == 0 && data != nullptr && n > 0) {
+    const int dump_token = std::getenv("STRATA_STAGE_TOKEN") ? std::atoi(std::getenv("STRATA_STAGE_TOKEN")) : 0;
+    if (sc->token == dump_token && data != nullptr && n > 0) {
         double ss = 0.0;
         for (int i = 0; i < n; ++i) ss += (double) data[i] * (double) data[i];
         std::printf("STAGE %d %s %.9g %d\n", layer, name, std::sqrt(ss / (double) n), n);
+        // Optional raw stage capture for an exact, elementwise comparison with the oracle.  Keeping this behind an
+        // environment variable means the normal runner remains read-only and avoids hundreds of diagnostic files.
+        if (const char* dir = std::getenv("STRATA_STAGE_DUMP")) {
+            const std::string path = std::string(dir) + "/" + std::to_string(layer) + "-" + name + ".raw";
+            if (std::FILE* f = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(data, sizeof(float), (size_t) n, f);
+                std::fclose(f);
+            }
+        }
     }
 }
 
@@ -269,7 +279,7 @@ int main(int argc, char** argv) {
     }
     const std::string pack = argv[1];
     const std::string shard1 = argv[2];
-    const std::string in_path = argc > 3 ? argv[3] : "/home/peb/moredata/glm5-oracle-input/hc_init.bin";
+    const std::string in_path = argc > 3 ? argv[3] : "/home/peb/moredata/glm5-oracle-full/hc_init.bin";
     const std::string wout_path = argc > 4 ? argv[4] : "/home/peb/moredata/glm5-head-gate/w_output.bin";
     const std::string wnorm_path = argc > 5 ? argv[5] : "/home/peb/moredata/glm5-head-gate/w_output_norm.bin";
     std::string err;
@@ -446,8 +456,10 @@ int main(int argc, char** argv) {
 
     // ---- state: one KDA state per KDA layer, one MLA cache per MLA layer, both keyed by the ARTIFACT's layer number
     std::vector<std::vector<float> > kda_state(N_LAYERS);
+    std::vector<std::vector<float> > kda_conv(N_LAYERS);
     std::vector<std::vector<float> > mla_cache(N_LAYERS);
     float* kda_ptrs[N_LAYERS];
+    float* kda_conv_ptrs[N_LAYERS];
     float* mla_ptrs[N_LAYERS];
     int kda_len[N_LAYERS];
     int mla_len[N_LAYERS];
@@ -475,8 +487,10 @@ int main(int argc, char** argv) {
             ++n_mla;
         } else {
             kda_state[(size_t) b].assign((size_t) NH * HD * HD, 0.0f);
+            kda_conv[(size_t) b].assign((size_t) 3 * (P.kda_g.d_conv - 1) * P.kda_g.d_inner(), 0.0f);
             kda_index[b] = n_kda;
             kda_ptrs[n_kda] = kda_state[(size_t) b].data();
+            kda_conv_ptrs[n_kda] = kda_conv[(size_t) b].data();
             ++n_kda;
         }
     }
@@ -485,6 +499,7 @@ int main(int argc, char** argv) {
 
     C::glm::GlmTrunkState st;
     st.kda_state = kda_ptrs;
+    st.kda_conv = kda_conv_ptrs;
     st.kda_index = kda_index;
     st.mla_cache = mla_ptrs;
     st.mla_len = mla_len;
@@ -523,7 +538,8 @@ int main(int argc, char** argv) {
         }
         double ss = 0.0;
         for (float v : l_out) ss += (double) v * v;
-        std::printf("  token %d: |l_out| %.6f, MLA cache depths", t);
+        std::printf("  token %d: |l_out| %.6f, MLA cache depths", t,
+                    std::sqrt(ss / (double) l_out.size()));
         for (int b = 0; b < N_LAYERS; ++b) {
             if (mla_index[b] >= 0) std::printf(" %d", mla_len[mla_index[b]]);
         }

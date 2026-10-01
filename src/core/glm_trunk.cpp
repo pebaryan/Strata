@@ -102,6 +102,7 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
             if (stage_fn != nullptr) stage_fn(stage_ctx, layer, nm, data, n);
         };
         stage("hc_attn_pre", cur, (int) (hc * (size_t) ne));
+        stage("attn_input", xn.data(), ne);
         if (is_mla) stage("attn_norm", xn.data(), ne);
         if (is_mla) {
             const int slot = state.mla_index ? state.mla_index[layer] : -1;
@@ -126,7 +127,8 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
                 err = "glm_trunk_forward: layer " + std::to_string(layer) + " is KDA but has no state slot";
                 return false;
             }
-            if (!glm_stage_kda(xn.data(), *w.kda, kda_g, 1, attn_out.data(), state.kda_state[slot], err)) {
+            float* conv = state.kda_conv ? state.kda_conv[slot] : nullptr;
+            if (!glm_stage_kda(xn.data(), *w.kda, kda_g, 1, attn_out.data(), state.kda_state[slot], err, conv)) {
                 err = "glm_trunk_forward: layer " + std::to_string(layer) + " KDA: " + err;
                 return false;
             }
@@ -173,6 +175,7 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
             err = "glm_trunk_forward: layer " + std::to_string(layer) + " FFN hc_post: " + err;
             return false;
         }
+        stage("l_out", nxt, (int) (hc * (size_t) ne));
 
         float* swap = cur; cur = nxt; nxt = swap;   // this layer's output is the next layer's input
     }

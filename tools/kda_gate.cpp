@@ -115,6 +115,26 @@ int main(int argc, char** argv) {
 
     std::printf("kda gate: %s, %d token(s), weights and input from the oracle's fixture\n", dir.c_str(), tokens);
     int failures = 0;
+    if (tokens > 1) {
+        std::vector<float> split_out((size_t) tokens * n_embd, 0.0f);
+        std::vector<float> split_state((size_t) nh * hd * hd, 0.0f);
+        std::vector<float> split_conv((size_t) 3 * (d_conv - 1) * d_inner, 0.0f);
+        for (int t = 0; t < tokens; ++t) {
+            strata::kernels::glm::kda_forward(w, g, x.data() + (size_t) t * n_embd, 1,
+                                               split_out.data() + (size_t) t * n_embd,
+                                               split_state.data(), nullptr, split_conv.data());
+        }
+        double worst = 0.0, scale = 1e-30;
+        for (size_t i = 0; i < out.size(); ++i) {
+            worst = std::max(worst, std::fabs((double) split_out[i] - (double) out[i]));
+            scale = std::max(scale, std::fabs((double) out[i]));
+        }
+        const double rel = worst / scale;
+        const bool pass = rel < 1e-6;
+        std::printf("  split    %d one-token calls vs one %d-token call rel %.3e  %s\n",
+                    tokens, tokens, rel, pass ? "PASS" : "FAIL");
+        failures += pass ? 0 : 1;
+    }
     failures += report("result", out,   dir, "result.bin");
     failures += report("xn",     mxn,   dir, "inter_xn.bin");
     failures += report("qc",     mqc,   dir, "inter_qc.bin");

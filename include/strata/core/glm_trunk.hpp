@@ -63,11 +63,13 @@ using GlmTrunkProvider = bool (*)(void* ctx, int layer, GlmTrunkLayerWeights& ou
 
 /// The per-layer state the trunk carries between tokens, one entry per layer of each kind.
 ///
-/// KDA is recurrent: one S matrix per KDA layer, zeroed for a fresh sequence.  MLA is a growing cache of latents:
+/// KDA is recurrent: one S matrix and three convolution histories per KDA layer, zeroed for a fresh sequence.
+/// MLA is a growing cache of latents:
 /// the reference appends the current position's latent BEFORE attending, so the loop writes the latent mla_forward
 /// produces into the next slot and the caller's live count grows by one each token.
 struct GlmTrunkState {
     float* const* kda_state = nullptr;      ///< one nh*hd*hd buffer per KDA layer, caller-owned, zeroed to start
+    float* const* kda_conv = nullptr;       ///< one 3*(d_conv-1)*d_inner history per KDA layer, zeroed to start
     float* const* mla_cache = nullptr;      ///< one [max_cells][kv_lora] buffer per MLA layer, caller-owned
     int* mla_len = nullptr;                 ///< the live cell count per MLA layer (in: cells before this token)
     int* kda_index = nullptr;               ///< layer -> its slot in kda_state, or -1 (caller-supplied map)
@@ -87,7 +89,7 @@ struct GlmTrunkState {
 /// disagrees can be SPLIT - compare the attention site's output to decide whether the error is before the FFN, and
 /// the FFN's output to decide whether it is inside it - instead of arguing about which half is at fault.  The names
 /// are the ones the reference drivers use ("hc_attn_pre", "attn_norm", "attn_output", "hc_attn_post", "hc_ffn_pre",
-/// "ffn_norm", "ffn_out"), so a dump and this stream are directly comparable.  Lengths: the hc_* stages are n_embd
+/// "ffn_norm", "ffn_out", "l_out"), so a dump and this stream are directly comparable.  Lengths: the hc_* stages are n_embd
 /// times the stream count, the rest are n_embd.
 typedef void (*GlmStageFn)(void* ctx, int layer, const char* name, const float* data, int n);
 

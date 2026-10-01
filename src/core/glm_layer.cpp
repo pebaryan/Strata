@@ -51,7 +51,7 @@ bool glm_stage_hc_norm(const float* x, int n_embd, const float* hc_fn, const flo
 /// `state` is the recurrent S matrix, nh*hd*hd floats, and MUST be zeroed for a fresh sequence.  The gate fixtures
 /// are all T=1 or a fresh T=5, so nothing here carries state across calls yet; a real sequential decode would.
 bool glm_stage_kda(const float* xn, const kernels::glm::KdaWeights& w, const kernels::glm::KdaGeometry& g,
-                   int tokens, float* out, float* state, std::string& err) {
+                   int tokens, float* out, float* state, std::string& err, float* conv_state) {
     // NAMED, one per branch, because "null argument" cost a run and a differential over the WRONG struct: the message
     // listed three candidates and the diagnostic I wrote instrumented KdaWeights, which is not among them (it is a
     // reference, and a bad reference to a valid object is not null).  A refusal that names the argument is worth more
@@ -63,7 +63,7 @@ bool glm_stage_kda(const float* xn, const kernels::glm::KdaWeights& w, const ker
         err = "glm_stage_kda: tokens and n_embd must be positive";
         return false;
     }
-    kernels::glm::kda_forward(w, g, xn, tokens, out, state, nullptr);
+    kernels::glm::kda_forward(w, g, xn, tokens, out, state, nullptr, conv_state);
     return true;
 }
 

@@ -29,15 +29,30 @@ inline void matvec(const float* w, const float* x, float* out, int rows, int col
 /// d_conv-1 inputs per channel and is zero for a fresh sequence (the reference concatenates it as
 /// ggml_concat(conv_state, transpose(x_proj)) and then runs ggml_ssm_conv).
 void conv1d_silu(const float* conv_w, const float* proj /* [tokens][d_inner] */, float* out, int tokens,
-                 int d_inner, int d_conv) {
+                 int d_inner, int d_conv, float* history) {
     for (int t = 0; t < tokens; ++t) {
         for (int ch = 0; ch < d_inner; ++ch) {
             float acc = 0.0f;
             for (int k = 0; k < d_conv; ++k) {
                 const int src = t + k - (d_conv - 1);
-                if (src >= 0 && src < tokens) acc += conv_w[(size_t) k * d_inner + ch] * proj[(size_t) src * d_inner + ch];
+                const float v = src >= 0 ? proj[(size_t) src * d_inner + ch]
+                                         : (history ? history[(size_t) (d_conv - 1 + src) * d_inner + ch] : 0.0f);
+                if (src < tokens) acc += conv_w[(size_t) k * d_inner + ch] * v;
             }
             out[(size_t) t * d_inner + ch] = acc / (1.0f + std::exp(-acc));
+        }
+    }
+    if (history) {
+        for (int h = 0; h < d_conv - 1; ++h) {
+            const int src = tokens - (d_conv - 1) + h;
+            if (src >= 0) {
+                std::memcpy(history + (size_t) h * d_inner, proj + (size_t) src * d_inner,
+                            (size_t) d_inner * sizeof(float));
+            } else {
+                std::memmove(history + (size_t) h * d_inner,
+                             history + (size_t) (d_conv - 1 + src) * d_inner,
+                             (size_t) d_inner * sizeof(float));
+            }
         }
     }
 }
@@ -45,7 +60,7 @@ void conv1d_silu(const float* conv_w, const float* proj /* [tokens][d_inner] */,
 }  // namespace
 
 void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int tokens, float* out,
-                 float* state, const KdaIntermediates* mid) {
+                 float* state, const KdaIntermediates* mid, float* conv_state) {
     const int ne = g.n_embd, nh = g.nh, hd = g.hd, di = g.d_inner();
     const float scale = 1.0f / std::sqrt((float) hd);
 
@@ -72,7 +87,8 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
             matvec(proj_w[which], xn.data() + (size_t) t * ne, proj.data(), di, ne);
             std::memcpy(raw.data() + (size_t) t * di, proj.data(), (size_t) di * sizeof(float));
         }
-        conv1d_silu(conv_w[which], raw.data(), conv_dst[which], tokens, di, g.d_conv);
+        float* history = conv_state ? conv_state + (size_t) which * (g.d_conv - 1) * di : nullptr;
+        conv1d_silu(conv_w[which], raw.data(), conv_dst[which], tokens, di, g.d_conv, history);
     }
     if (mid && mid->qc) std::memcpy(mid->qc, qc.data(), qc.size() * sizeof(float));
     if (mid && mid->kc) std::memcpy(mid->kc, kc.data(), kc.size() * sizeof(float));

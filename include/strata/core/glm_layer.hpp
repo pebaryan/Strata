@@ -46,7 +46,7 @@ bool glm_stage_hc_norm(const float* x, int n_embd, const float* hc_fn, const flo
 /// arithmetic - it is the wiring that lets the chain call the kernel with a block's own bound weights.
 /// `state` must be zeroed for a fresh sequence (nh*hd*hd floats).
 bool glm_stage_kda(const float* xn, const kernels::glm::KdaWeights& w, const kernels::glm::KdaGeometry& g,
-                   int tokens, float* out, float* state, std::string& err);
+                   int tokens, float* out, float* state, std::string& err, float* conv_state = nullptr);
 
 /// Stage 3: the site's hc_post - the hyper-connection combination, which produces HC rows for the next site's
 /// hc_pre rather than a single vector.  `residual` is the block input `x` ([HC][n_embd]).

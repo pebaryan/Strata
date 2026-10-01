@@ -17,6 +17,7 @@
 #include <memory>
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -70,7 +71,10 @@ static bool dequant_transposed(const WeightRef& w, int ne0, int ne1, void* strea
 /// Repack ssm_conv1d_{q,k,v}.weight from the artifact's (d_inner, 1, d_conv) to (d_conv, d_inner).
 static float* repack_conv(const float* src, int d_inner, int d_conv) {
     float* dst = nullptr;
-    if (cudaMalloc(&dst, (size_t) d_conv * d_inner * sizeof(float)) != cudaSuccess) return nullptr;
+    // The KDA implementation is host-side, while GlmBoundBlock owns CUDA allocations.  Managed memory satisfies
+    // both requirements and can still be released by the block's cudaFree-based destructor.
+    if (cudaMallocManaged(&dst, (size_t) d_conv * d_inner * sizeof(float), cudaMemAttachGlobal) != cudaSuccess)
+        return nullptr;
     std::vector<float> tmp((size_t) d_conv * d_inner);
     for (int ch = 0; ch < d_inner; ++ch)
         for (int k = 0; k < d_conv; ++k) tmp[(size_t) k * d_inner + ch] = src[(size_t) ch * d_conv + k];
@@ -106,8 +110,30 @@ bool bind_glm_block(const LayerView& v, int block, int d_inner, int d_conv,
 
         if (t.ttype == 0) {
             const float* p = (const float*) w->data;
+            // dense.bin may hold an unquantized tensor as BF16.  The generated row's ttype says that no block
+            // dequantizer is needed; it does not imply four bytes per element.  In particular every MoE router is
+            // 4096*288*2 bytes.  Casting those pairs of BF16 values to float made the router consume every other
+            // oracle value as one invented float and consequently select an unrelated set of experts.
+            const size_t n = (size_t) t.ne0 * (size_t) (t.ne1 > 0 ? t.ne1 : 1);
+            if (w->bytes == n * sizeof(uint16_t)) {
+                float* expanded = nullptr;
+                if (cudaMallocManaged(&expanded, n * sizeof(float), cudaMemAttachGlobal) != cudaSuccess) {
+                    err = "glm_bind: BF16 expansion allocation failed for " + full;
+                    return false;
+                }
+                const uint16_t* src = (const uint16_t*) w->data;
+                for (size_t j = 0; j < n; ++j) {
+                    const uint32_t bits = (uint32_t) src[j] << 16;
+                    std::memcpy(&expanded[j], &bits, sizeof(float));
+                }
+                out.owned.push_back(expanded);
+                p = expanded;
+            }
             // transform 1: the conv kernel wants (d_conv, d_inner)
-            if (suffix.compare(0, 10, "ssm_conv1d") == 0 && t.ne0 == d_inner && t.ne1 == d_conv) {
+            // GGUF's ne0 is the fastest dimension.  These tensors are [d_conv, d_inner] in the generated table,
+            // but their flat payload is channel-major (src[ch*d_conv+k]); the kernel expects tap-major
+            // (dst[k*d_inner+ch]).  The old guard tested the dimensions backwards and silently skipped this repack.
+            if (suffix.compare(0, 10, "ssm_conv1d") == 0 && t.ne0 == d_conv && t.ne1 == d_inner) {
                 float* repacked = repack_conv(p, d_inner, d_conv);
                 if (!repacked) { err = "glm_bind: conv repack failed for " + full; return false; }
                 out.owned.push_back(repacked);
