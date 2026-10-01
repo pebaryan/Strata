@@ -146,8 +146,12 @@ def main() -> int:
         residual = inpL
         cur, post, comb = hc_pre_3d(inpL, hc_attn_fn, hc_attn_scale, hc_attn_base)
         write_tensor(dump, f"hc_attn_pre-{il}", cur)                 # [n_embd, T]
-        cur = rms_norm_ne0(cur, w.tensor(p + "attn_norm.weight"))
-        write_tensor(dump, f"attn_norm-{il}", cur)
+        # the normed value is dumped for comparison, but the KDA block gets the RAW residual: kda_block
+        # normalizes internally (`xn = rms_norm(x, attn_norm)`), so feeding it the normed tensor normalizes
+        # TWICE.  That cost 56% on the gate and inherited into every tensor downstream - measured, not
+        # reasoned: the double-normed gate is 56.07% off the reference and the driver's was 56.1%.
+        attn_normed = rms_norm_ne0(cur, w.tensor(p + "attn_norm.weight"))
+        write_tensor(dump, f"attn_norm-{il}", attn_normed)
 
         kind = "kda" if il not in (3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43) else "mla"
         if kind != "kda":
