@@ -1797,3 +1797,20 @@ void dequantize_row_q6_K(const block_q6_K * GGML_RESTRICT x, float * GGML_RESTRI
 }
 
 ## verified: 30 lines captured, 30 lines in ggml-quants.c
+
+STEP 1 OF THE Q6_K ROUND DONE: dequant_q6_K EXISTS AND COMPILES
+
+Transcribed from the verified source, in the engine's idiom, alongside dequant_q5_K.  Deliberately unwired, so the
+build is the whole check.  Verified after adding it: libstrata_kernels.a builds, all three executables link, stage 1
+still prints -0.359747499 / 0.424176991 / 3.25002776, the KDA gate passes at T=1 and T=5, and q5k_parity still
+reports min -0.374668121 / max +0.404712915.
+
+THE DIFFERENCE THAT COULD HAVE COST A CYCLE, recorded at the definition because it fails silently rather than
+loudly: block_q6_K puts its half at byte offset 208 (ql[128], qh[64], scales[16], d) - the LAST field - whereas
+block_q5_K has d and dmin FIRST.  Reading Q6_K's scale at offset 0 the way the Q5_K code does would produce a
+plausible wrong number, not a crash, so it would have shown up as a tolerance failure with no obvious cause.
+scales is also SIGNED here (int8_t) where Q5_K's are unsigned-packed 6-bit values.
+
+NEXT: the fixture (raw blocks + the oracle's values for blk.0.ffn_down.weight), then the same parity gate that made
+dequant_q5_K bit-exact, then the guard widened to {8, 13, 14}.  q5k_parity.cpp needs one small generalisation - its
+block size is hardcoded at 176 - before it can be pointed at a 210-byte tensor.

@@ -351,6 +351,63 @@ void dequant_q5_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
     if (stream == nullptr) cudaDeviceSynchronize();
 }
 
+// ===================== Q6_K =====================
+//
+// `block_q6_K` = { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; ggml_half d; } = 128+64+16+2 = 210 bytes,
+// with the static_assert in ggml-common.h pinning it.  This is the type of blk.0.ffn_down.weight - the one tensor
+// of the leading dense FFN that is not Q5_K - so it is what the ffn gate needs before it can be built.
+//
+// NOTE THE FIELD ORDER: unlike block_q5_K, whose d and dmin come FIRST, Q6_K puts the half at the END, at byte
+// offset 208.  Reading it at offset 0 (as the Q5_K code does) would silently produce a wrong scale rather than a
+// crash, so it is called out here rather than left to the reader.
+//
+// Transcribed from ggml-quants.c's dequantize_row_q6_K.  NOT YET WIRED and NOT YET GATED: it must be checked
+// bit-exact against the oracle's own dequantization of blk.0.ffn_down.weight first.
+__global__ void dequant_q6_K_kernel(const uint8_t* __restrict__ blocks, float* __restrict__ x,
+                                    long long n_blocks) {
+    const long long b = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (b >= n_blocks) return;
+    const uint8_t* blk = blocks + b * 210;
+    const uint16_t dbits = (uint16_t) (blk[208] | (blk[209] << 8));   // the half is LAST in this block
+    const float d = f32_from_f16(dbits);
+    const uint8_t* ql = blk;              // 128 bytes
+    const uint8_t* qh = blk + 128;        // 64 bytes
+    const int8_t* sc = (const int8_t*) (blk + 192);   // 16 bytes, SIGNED
+    float* y = x + b * 256;
+
+    for (int n = 0; n < 256; n += 128) {
+        for (int l = 0; l < 32; ++l) {
+            const int is = l / 16;
+            const int q1 = (int) ((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+            const int q2 = (int) ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+            const int q3 = (int) ((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+            const int q4 = (int) ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+            y[l + 0] = d * (float) sc[is + 0] * (float) q1;
+            y[l + 32] = d * (float) sc[is + 2] * (float) q2;
+            y[l + 64] = d * (float) sc[is + 4] * (float) q3;
+            y[l + 96] = d * (float) sc[is + 6] * (float) q4;
+        }
+        y += 128;
+        ql += 64;
+        qh += 32;
+        sc += 8;
+    }
+}
+
+void dequant_q6_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
+    if (n <= 0) return;
+    const long long nb = n / 256;
+    const int threads = 128;
+    const unsigned grid = (unsigned) ((nb + threads - 1) / threads);
+    dequant_q6_K_kernel<<<grid, threads, 0, (cudaStream_t) stream>>>(blocks, x, nb);
+    const cudaError_t e = cudaGetLastError();
+    if (e != cudaSuccess) {
+        std::fprintf(stderr, "dequant_q6_K launch: %s\n", cudaGetErrorString(e));
+        std::exit(1);
+    }
+    if (stream == nullptr) cudaDeviceSynchronize();
+}
+
 void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     if (n <= 0) return;
     if (n % QK_K != 0) {

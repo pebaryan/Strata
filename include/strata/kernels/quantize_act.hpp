@@ -37,6 +37,12 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream);
 /// note at its definition in quantize_act.cu, which also records that it is not yet gated against the oracle.
 void dequant_q5_K(const uint8_t* blocks, float* x, int64_t n, void* stream);
 
+/// Dequantize Q6_K (ggml type 14, 210-byte blocks of 256 elements) - the type of blk.0.ffn_down.weight, the one
+/// tensor of the leading dense FFN that is not Q5_K.  Note that this block puts its half at byte offset 208, not
+/// at the start as Q5_K does.  Transcribed from ggml-quants.c's dequantize_row_q6_K; not yet gated against the
+/// oracle - see the note at its definition in quantize_act.cu.
+void dequant_q6_K(const uint8_t* blocks, float* x, int64_t n, void* stream);
+
 // x (n floats) -> ggml's block_q8_K layout: 292 bytes per 256 elements
 //   { float d ; int8_t qs[256] ; int16_t bsums[16] }
 // n must be a multiple of 256.  `stream` may be null, in which case the call synchronises.
