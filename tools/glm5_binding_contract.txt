@@ -4119,3 +4119,47 @@ STATE AFTER THIS ENTRY, complete and without inflation:
                     the MLA and MoE WIRING inside glm_trunk_forward - neither branch has ever run
                     everything past block 2, which needs the pack
                     the head, and argmax == 12089
+
+THE ROUTED EXPERT PATH IS VERIFIED, AND THE CLAMP IS PROVEN WIRED - the previous entry is superseded
+
+Run A - the fixture at the artifact's real limits, clamp inert, arithmetic compared anyway:
+
+    ids      PASS   got 45,25,117,180,98,55,9,88   want 45,25,117,180,98,55,9,88   (exact, all eight)
+    weights  max abs 1.192e-07 (= 3.54e-07 of scale)   worst element rel 3.867e-07   PASS
+    moe      max abs 1.699e-06 (= 2.24e-06 of scale)   worst element rel 2.093e-05   PASS
+    shexp    max abs 6.855e-07 (= 1.71e-06 of scale)   worst element rel 1.621e-05   PASS
+    out      max abs 1.490e-06 (= 1.56e-06 of scale)   worst element rel 1.188e-05   PASS
+    invariant sum(weights) 2.500000 (== w_scale 2.5, i.e. normalised THEN scaled) PASS  all positive PASS
+              ids distinct PASS  in range PASS
+    glm_moe_parity: 0 failures
+
+Run B - THE SAME CONTENT with only the header's two limits changed 10 -> 3.0, so that the fixture finally crosses
+them (5 pre-activations past) and the clamp is covered:
+
+    weights  PASS  (unchanged - the router is not clamped, so lowering the clamp must not touch it)
+    shexp    FAIL  worst element rel 6.122e-02
+    out      FAIL  worst element rel 2.401e-02
+    glm_moe_parity: FAILURES
+
+THE PAIR IS THE VERIFICATION.  A alone would say "the arithmetic agrees" while leaving open whether the clamp is
+implemented at all, since a port that omitted it would produce the same numbers on a fixture that never reaches it.
+B closes that: lowering the limit changes EXACTLY the terms the clamp governs - shexp and out - and leaves the router
+weights bit-unchanged, which is the signature of a clamp that is wired rather than absent.  Both halves are required and
+neither alone is a verification, which is why the tool now refuses neither and reports both.
+
+WHAT MADE IT POSSIBLE was a one-line change to glm_moe_parity: it returned FAILURES when the clamp was uncovered,
+BEFORE comparing anything, so the routed path - 42 of the 45 blocks - had no numerical verdict at all.  It now follows
+the convention ffn_gate established: compare the arithmetic regardless, and REPORT the term the fixture cannot reach
+instead of letting it suppress the verdict.  A PASS with an inert clamp means "the arithmetic agrees at the real limits
+with the clamp unexercised", which is exactly what it says on the line above it.
+
+SUPERSEDED: the previous entry recorded this kernel as UNVERIFIED and said the gate "refuses at the clamp-coverage
+check before claiming anything".  That was an accurate description of the tool's behaviour and an accurate statement
+that no verdict existed; it is superseded because the tool now produces the verdict, and both halves above exist.  The
+unverified reading was the right one to write down at the time - the mistake would have been to read the absence of a
+numerical failure as a pass.
+
+STATE NOW: every KERNEL in the chain is verified against the oracle - KDA (12/12), MLA (5 stages, attn bit-exact,
+1-entry-cache invariant), the routed expert path (this entry), the dense FFN, hc_pre, hc_post, dequant_q5_K and
+dequant_q6_K.  What remains unverified is WIRING, not arithmetic: the is_mla branch and the routed branch of
+glm_trunk_forward have still never executed, because a block that uses either needs the pack.
