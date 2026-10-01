@@ -140,6 +140,20 @@ int main(int argc, char** argv) {
     // ---- chain stage 1: hc_pre -> rms_norm, on the REFERENCE's own hc_init -----------------------
     // Judged against hc_attn_pre-N / attn_norm-N rather than only end to end, so an error is localised
     // to a stage instead of to "the model".
+    // ORDER TEST: a copy of hc_attn_base immediately AFTER the print loop and BEFORE the stage block.  If this
+    // fails, the print loop itself breaks what follows; if it succeeds, the breakage is inside the stage block.
+    {
+        const float* q = nullptr; size_t nn = 0;
+        for (const auto& t : bound.tensors)
+            if (t.name == "hc_attn_base.weight") { q = t.ptr; nn = (size_t) t.ne0 * (size_t) (t.ne1 > 0 ? t.ne1 : 1); }
+        std::vector<float> post;
+        post.resize(nn);
+        const cudaError_t st = cudaMemcpy(post.data(), q, nn * sizeof(float), cudaMemcpyDeviceToHost);
+        std::fprintf(stderr, "  postloop copy of hc_attn_base: %s (q=%p n=%zu)\n", cudaGetErrorString(st),
+                     (const void*) q, nn);
+        fflush(stderr);
+    }
+
     if (refdump) {
         auto tensor_by_name = [&](const char* n) -> const float* {
             for (const auto& t : bound.tensors) if (t.name == n) return t.ptr;

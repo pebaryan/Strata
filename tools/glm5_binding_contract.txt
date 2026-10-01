@@ -590,3 +590,24 @@ lambda fails in the loop as well, then the loop's own two copies differ from the
 the source has not revealed, and the same disassembly question applies to those two.
 
 That is where this belongs now: stop reasoning about it from the source, and look at what was compiled.
+
+LOCATED - THE FLIP IS AT THE LOOP'S END, NOT IN THE STAGE
+
+    inloop 2nd copy of hc_attn_base: no error                     <- inside the loop
+    postloop copy of hc_attn_base: invalid argument (q=..., n=24) <- the next statement AFTER the loop
+    hostcopy hc_attn_base.weight:   invalid argument              <- the stage, same address, same 24 floats
+
+Same address throughout.  Every copy inside the loop reports success (the loop checks its status and prints
+"COPY FAILED" on failure - no such line appears), and the first copy after the loop fails.  So the flip is caused
+by something in the loop's REMAINING iterations, by the number of copies performed, or by the last tensor the
+loop copies - not by anything in the stage block, whose code is provably identical (inloop test).
+
+THE NEXT TEST IS A BISECTION, and it is cheap: print an "alive" marker after each loop iteration carrying the
+tensor's name, and the first iteration after which the state is dead names the culprit directly.  A good way to
+do it without touching the loop's shape is to have the marker run a tiny 4-byte copy of a KNOWN tensor and print
+whether it succeeded - the iteration whose marker first fails is the one that broke it.
+
+Candidates for what a copy can do to break the next one, none of them established yet: the largest tensor
+(ssm_f_b is 8192x128 = 4 MB), the last tensor in the table, or a copy count limit of some kind.  Whichever it is,
+it is a property of this driver's readback harness - the binding is verified and the stage's own code is proven
+correct by the in-loop test.
