@@ -695,3 +695,31 @@ device kernel.  That is a ten-line addition to src/core/glm_layer.cpp and it nee
 
 Alternatively the whole stage moves to the device, but that is the larger change and it contradicts how the
 reference splits this work.
+
+STAGE 1 BISECT - THE ERROR IS UPSTREAM OF hc_pre, NOT IN THE NORM
+
+    hc_attn_pre-0   engine (-0.0162118, 0.0226507, 0.182562)  ref (-0.0154029, 0.0215205, 0.181364)  rel 5.56e-02
+    attn_norm-0     engine (-0.359747,  0.424177,  3.25003)   ref (-0.274928,  0.369969,  3.90166)   rel ~2e-01
+
+hc_pre's output is already 5.6% off, and the norm amplifies it.  Phase 8 measured hc_attn_pre-0 at 1.76e-05 against
+the SAME dump (glm5-ref-dump5), so this is a ~3000x regression and it is in what the stage feeds hc_pre - the
+kernel call itself is the same one phase 8 validated.
+
+What is known-good, so the search is narrow:
+  * the token mapping is right: the engine's hc_attn_pre-0 sum (0.182562) is within 0.7% of the reference's
+    (0.181364) while attn_norm-0 is 20% off, so the pre-norm values line up as token 0 of both.
+  * x's layout is right: hc_init is [4096,4,5,1] with ne0 fastest, so token 0's [HC][n_embd] block is the first
+    4096*4 floats, hc-major - which is what hc_pre takes as row-major [HC][n_embd].
+  * fn's orientation checks out on paper: the artifact tensor is [16384, 24] with ne0=16384 fastest, and
+    glm_hc.cpp:71 reads mix m's row as `fn + m*16384` contiguous - i.e. exactly that layout, unswapped.
+
+THREE CANDIDATES LEFT, none yet tested:
+  1. the dequantized hc_attn_fn VALUES - dequant_q8_0 is proven correct as a call, but the packing path that put
+     those blocks behind w->native_data has not been compared against the GGUF's own bytes for this tensor;
+  2. hc_attn_base / hc_attn_scale - both 24-ish floats, both read straight from the arena, and both copied
+     successfully but never VALUE-checked against the artifact;
+  3. hc_init as the reference wrote it versus as the stage reads it - the dump row is 4096*4*5 = 81920 floats
+     plus, as attn_norm-0 showed, possibly a few extra, and the harness slices rather than trusting file size.
+
+The cheapest discriminator: compare all four bound tensors' values against the artifact directly (the same
+byte-comparison used for the F32 twelve at 9.1), which either clears 2 entirely or names it immediately.

@@ -161,6 +161,15 @@ int main(int argc, char** argv) {
                 if (st != cudaSuccess) return 1;
             }
         }
+        {
+            // BISECT: run hc_pre on its own and print its output, so an error is localised to hc_pre or to the norm.
+            std::vector<float> pre(n0);
+            strata::kernels::glm::HcMix mix0;
+            strata::kernels::glm::hc_pre(hc_init.data(), fn.data(), base.data(), scale.data(), n0, pre.data(), &mix0);
+            double a = 1e30, b = -1e30, c = 0;
+            for (float v : pre) { a = std::min(a, (double) v); b = std::max(b, (double) v); c += v; }
+            std::printf("stage1.hc_attn_pre-0 %d %zu %.9g %.9g %.9g\n", n0, pre.size(), a, b, c);
+        }
         std::vector<float> layer_in(n0);
         strata::kernels::glm::HcMix mix;
         std::string serr;
@@ -171,7 +180,7 @@ int main(int argc, char** argv) {
         }
         double mn = 1e30, mx = -1e30, sm = 0;
         for (float v : layer_in) { mn = std::min(mn, (double) v); mx = std::max(mx, (double) v); sm += v; }
-        std::printf("stage1.attn_norm-0\tne=%d,0\tn=%zu\t%.9g\t%.9g\t%.9g\t0\n", n0, layer_in.size(), mn, mx, sm);
+        std::printf("stage1.attn_norm-0 %d %zu %.9g %.9g %.9g\n", n0, layer_in.size(), mn, mx, sm);
     }
 
     cudaFree(arena);
