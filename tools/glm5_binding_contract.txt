@@ -1586,3 +1586,31 @@ STEP 4, the last one: run kda_gate on the ENGINE'S OWN bound weights instead of 
 fixture files exist because the weights could not be bound as floats; that reason is now gone.  That is the gate
 which proves the wiring end to end rather than kernel and binding separately, and after it the chain can continue
 past the attention call.
+
+########  THE KDA BINDING IS FULLY VERIFIED: 16 PASS, 0 FAIL, 0 QUANTIZED  ########
+
+Every weight kda_forward consumes, bound by the engine's own loader and compared against the oracle:
+
+    attn_norm 3.2e-09   ssm_a    1.3e-08   ssm_beta 3.0e-10   wo      8.5e-10
+    wq        1.0e-09   dt_bias  4.4e-09   ssm_g_a  1.0e-09
+    wk        4.2e-10   ssm_f_a  8.6e-10   ssm_g_b  3.9e-11
+    wv        1.0e-09   ssm_f_b  8.2e-10   o_norm   3.2e-10
+    conv_q    1.0e-11   conv_k   1.1e-11   conv_v   1.6e-09
+    -> 16 PASS, 0 FAIL, 0 quantized
+
+wq, wk and wv are the three that the whole K-quant effort existed for, and they land at 1.0e-09, 4.2e-10 and
+1.0e-09.  The checker's table also now lists them, so this is one command rather than a set of partial reports -
+which matters, because a table that silently omits the hard cases reports success without covering them, and this
+one did exactly that an hour ago.
+
+WHAT THE BINDING WORK ITEM TOOK, end to end, all of it recorded above: identifying that attn_q/k/v are Q5_K rather
+than Q8_0 (via alloc-vs-read, after two wrong readings of my own); confirming it against ggml's compiler-checked
+struct sizes; transcribing get_scale_min_k4 and dequantize_row_q5_K; gating the transcription BIT-EXACT against
+the oracle over 33.5 million elements rather than against the C it came from; widening the bind-time guard to {8,
+13} with a hard error for anything else; and extending the checker's inventory.  Six artifacts came out of it -
+glm5_bind_check, kda_gate, kda_binding_check.py, q5k_parity, its CMake target, and two fixtures - and every one of
+them still passes.
+
+STEP 4 IS THE ONLY ONE LEFT: run kda_gate on these bound weights instead of the oracle's fixture files.  The
+fixtures existed because the weights could not be bound as floats, and that reason is gone.  That gate proves the
+wiring rather than kernel and binding separately, and after it the chain continues past the attention call.

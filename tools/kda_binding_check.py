@@ -24,6 +24,9 @@ import numpy as np
 # oracle weight key -> the artifact tensor name the engine binds
 TENSORS = {
     "attn_norm": "attn_norm.weight",
+    "wq": "attn_q.weight",
+    "wk": "attn_k.weight",
+    "wv": "attn_v.weight",
     "conv_q": "ssm_conv1d_q.weight",
     "conv_k": "ssm_conv1d_k.weight",
     "conv_v": "ssm_conv1d_v.weight",
