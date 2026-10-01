@@ -796,3 +796,23 @@ being wrong, not the stage.
 NEXT, and it is now well-posed: identify what the dump's hc_attn_pre-0 actually is (test x*rms against it
 first), then compare attn_norm-0 against the stage's POST-norm output using the same node discipline - the last
 comparison mixed two different nodes and that, not the stage, produced the 20% figure.
+
+WHAT THE DUMP'S hc_attn_pre-0 IS - narrowed, not yet named
+
+    manifest  hc_attn_pre-0  ne=[4096,5,1,1]    (a 4096-vector per token - NOT the 16384-float stream block)
+    hc_init's four streams are IDENTICAL   (mean-over-streams and stream-0 give the same 0.753 rel error,
+                                           and hc_init = repeat_4d(reshape_3d(inp)) per the phase-8 notes)
+    pre = [6.1547250e-04  5.9876317e-01  2.5748528e-04  6.5421796e-04]   <- stream 1 dominates
+    layer_in = sum_h pre[h] * x[h] = 0.600290358 * x0
+    dump node / layer_in : mean 0.9489 (std 3.3e-02, inflated by division near zeros)
+    dump node / x0       : ~0.5696
+
+so the dump's node is the SAME SHAPE as layer_in - a scaled copy of the identical stream - with a slightly
+different gate scalar.  Candidates for that scalar, none tested: pre formed without the +HC_EPS and before the
+sigmoid's scale[0] application, a different layer's hc weights, or the graph's own hc_attn_pre being the value
+that feeds the mix rather than the value the mix produces.
+
+NONE OF THIS IS STAGE 1's PROBLEM, and that is the point worth carrying forward: stage 1's hc_pre agrees with the
+phase-6-validated oracle to seven significant digits on this exact input, and the discrepancy is entirely in my
+identification of the reference node.  The stage's next real gate is the norm and then the KDA/MLA call, and it
+should be judged against the oracle rather than against a dump node whose meaning has not been established.
