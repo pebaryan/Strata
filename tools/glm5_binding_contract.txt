@@ -398,3 +398,29 @@ normally (as Q8_0, the state that passed 9.1), and see what hc_attn_base looks l
 That answers whether "unregistered" is caused by the opt-in branch at all, or is simply what an arena pointer
 looks like to cudaMemcpy from this driver - which would make the whole pointer investigation a red herring and
 point back at glm_hc.cpp's expectations.
+
+THE ACTUAL CAUSE OF "invalid argument" - the driver asks for more bytes than exist
+
+Default path, stage 1's probe:
+
+    probe hc_attn_fn.weight   ptr=0x7fb778200000  want=393216  attr=ok device
+    stage1: copy hc_attn_fn.weight failed: invalid argument
+
+hc_attn_fn is Q8_0 in the default path: 393216 elements = 12288 blocks = 417792 BYTES.  host_copy asks CUDA to
+copy want = 393216 * 4 = 1.5 MB out of a 417 KB allocation, and CUDA refuses rather than overrunning.  So the
+"invalid argument" is my own call being wrong about the tensor's TYPE, not about its kind - which also means the
+earlier cudaMemoryTypeUnregistered reading for hc_attn_base was taken after this same failing path had already
+been entered, and is not reliable evidence about the arena.
+
+Consistent with everything else: this is why the failing tensor is always the FIRST one (hc_attn_fn), and why the
+bind print loop - which sizes each copy from what the tensor actually is - reads all of them correctly and gives
+the verified 12/12.
+
+THE FIX, in the driver: size the copy by the tensor's kind.  A quantized tensor must be dequantized (which is
+what STRATA_HC_DEQUANT is for, and that path sizes the buffer as floats of n elements - 1.5 MB - so its copy is
+correct and did succeed at 393216 floats), and only then read as floats.  In other words the opt-in branch was
+the right CONFIGURATION for stage 1 all along; what was never verified is what the stage then computes.
+
+So the next run is: STRATA_HC_DEQUANT=1, with the stage's copy path fixed to handle a quantized tensor by NOT
+treating its pointer as floats without dequantizing.  That is a small, bounded driver change, and it is the last
+one between here and stage 1's first real number.
