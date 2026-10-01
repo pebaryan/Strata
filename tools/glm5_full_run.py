@@ -92,6 +92,15 @@ def main() -> int:
     dump = pathlib.Path(a.dump) if getattr(a, "dump", None) else None
     if dump is not None:
         dump.mkdir(parents=True, exist_ok=True)
+        # THE ORACLE'S OWN BLOCK-0 INPUT, in the same container as l_out-N.
+        #
+        # Without this a block gate can only feed the engine the reference dump's hc_init, and this port has already
+        # measured that the two differ: at hc_attn_pre the dump reads rms 0.004125 while the oracle reads 0.00412163,
+        # about 0.08%.  Through a KDA whose gate is exponential - measured at 280x amplification - that difference
+        # lands at l_out looking like a 3% engine error, which is exactly the ambiguity that made the first block
+        # comparison unusable.  With the oracle's own input written here, the engine and the oracle start from the
+        # same bytes and a tight tolerance finally means something.
+        DRV.write_tensor(dump, "hc_init", inpL)
 
     for il in range(blocks):
         p = f"blk.{il}."

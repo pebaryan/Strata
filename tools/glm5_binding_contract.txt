@@ -3808,3 +3808,49 @@ retracted above.
 ALSO WORTH RECORDING so it does not mislead later: the 1-block oracle run prints "logits argmax = 134277 expected
 12089 MISMATCH".  That is EXPECTED and meaningless here - --blocks 1 runs only block 0, so the head is being applied
 to a single-block hidden state.  The 12089 gate only means anything for a full 45-block run.
+
+THE BLOCK COMPARISON HAS NEVER BEEN APPLES-TO-APPLES - the two hc_init files hold the SAME VALUES IN A DIFFERENT ORDER
+
+With the oracle's own input written (tools/glm5_full_run.py now dumps hc_init as well as l_out-N), the same trunk_gate
+run gives a very different result:
+
+    engine, fed the REF DUMP's hc_init : l_out rms 0.0058151    vs oracle 0.00599758   ratio 0.970  (3% low)
+    engine, fed the ORACLE's  hc_init : l_out rms 0.00828296   vs oracle 0.00599758   ratio 1.381  (38% high)
+    oracle l_out-0 rms 0.00599758   ref dump l_out-0 rms 0.00599831   (oracle and dump agree to 0.012%)
+
+A 42% swing in the engine's output from swapping input files is not a numerical sensitivity story, so the two files were
+compared directly:
+
+    ref-dump hc_init : ne=[4096,4,5,1]  n=81920  rms 0.00827007  min -0.0413961  max 0.0407766
+    oracle   hc_init : ne=[4096,4,5,1]  n=81920  rms 0.00827007  min -0.0413961  max 0.0407766
+    elementwise      : worst 0.0617329   rel-to-rms 7.46   mean|.| 0.00893637   identical elements 17 of 81920
+
+IDENTICAL STATISTICS TO SIX DIGITS, 17 OF 81,920 ELEMENTS THE SAME.  The two files hold the SAME MULTISET OF VALUES
+IN A DIFFERENT ARRANGEMENT - confirmed by np.sort being equal - and not a simple axis transpose: brute-forcing the
+permutation over the (4096,4,5) reshaping leaves only the identity shape-compatible, and it is off by 0.0617.  So the
+layout difference is real, is not the obvious one, and has not been identified yet.
+
+WHAT THIS MEANS, and it is the important part:
+
+  * THE ENGINE'S INPUT IS A LAYOUT ASSUMPTION, AND THE ASSUMPTION IS WHAT IS WRONG.  trunk_gate takes x as the first
+    HC*N_EMBD = 16,384 floats of hc_init, on the reasoning that ne0=4096 is fastest so token 0's four streams come
+    first.  Both files DO carry ne=[4096,4,5,1], but their first 16,384 floats are different sets of values, so the
+    slice the engine consumed was never the tensor the oracle computed with.  The 3% and the 38% are therefore both
+    comparisons of different inputs, and NEITHER NUMBER SAYS ANYTHING ABOUT THE ENGINE'S ARITHMETIC - not the 3% low
+    and not the 38% high.  The 3% figure recorded in the previous entry must not be carried forward as evidence of
+    anything;
+  * This also revisits the earlier "0.08% at hc_attn_pre" explanation: the dump reading 0.004125 against the engine's
+    and oracle's 0.00412163 was attributed to a small numerical difference in the input.  Given that the inputs differ
+    by a permutation, the rms AGREEING to 0.08% is a coincidence of multiset-preservation, not evidence that the two
+    inputs were nearly the same.  An rms is permutation-invariant; it could never have detected this, which is exactly
+    why it went unnoticed for a whole session across four separate comparisons.
+
+THE NEXT MEASUREMENT, and it must come before any more block comparison: identify the actual index mapping between the
+two hc_init files.  The tools are cheap - the files are 81,920 floats each and the mapping is a permutation, so a
+per-value search finds it immediately: for each element of the oracle's file, locate its value in the reference dump's,
+and read off the index map.  Then either (a) the engine's slice-and-shape rule is corrected to match, or (b) it is
+established which file is in which order and the comparison is run on one of them consistently.
+
+UNTIL THAT IS DONE, no statement about the engine's block arithmetic is supported by evidence.  This port has spent the
+session comparing numbers that came from different arrangements of the same data, and the honest position is that the
+block-level comparison has not yet been performed.
