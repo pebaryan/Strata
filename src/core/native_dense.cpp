@@ -1,3 +1,5 @@
+#include <filesystem>
+#include <cstdio>
 #include "strata/core/native_dense.hpp"
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
@@ -75,7 +77,42 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
             const auto* number = gguf.get("split.no");
             const auto* tensors = gguf.get("split.tensors.count");
             if (gguf.get("general.architecture")) {
-                err = strata::check_architecture(gguf);
+                // This branch builds the engine for GLM-5.3 as well as qwen4exp.  glm5next has its own,
+                // stricter guard (check_glm5next_architecture, which validates the block table, the
+                // per-layer MLA/KDA kinds, the expert counts and the indexer geometry), so route an
+                // glm5next artifact to it instead of failing the generic qwen4exp field checks.  The
+                // generic path is untouched for qwen4exp.
+                const strata::MetaValue* arch = gguf.get("general.architecture");
+                if (arch && arch->s == "glm5next") {
+                    // This artifact's shard 1 is METADATA ONLY - it holds no tensors at all - so the
+                    // per-block kind check has to see the siblings' tensor names, exactly as the phase-0
+                    // preflight tool does.  Without this the guard reports "blk.0 has neither ssm_a nor
+                    // attn_kv_a_mqa.weight" for every block, which is a property of the sharding, not of
+                    // the model.
+                    std::set<std::string> others;
+                    {
+                        const std::string fn = std::filesystem::path(path).filename().string();
+                        const size_t of = fn.rfind("-of-");
+                        if (of != std::string::npos && of >= 6) {
+                            const std::string dir = std::filesystem::path(path).parent_path().string() + "/";
+                            const std::string stem = fn.substr(0, of - 6);
+                            const int n_shards = std::atoi(fn.substr(of + 4).c_str());
+                            for (int i = 2; i <= n_shards; ++i) {
+                                char sib[4096];
+                                std::snprintf(sib, sizeof sib, "%s%s-%05d-of-%05d.gguf", dir.c_str(),
+                                              stem.c_str(), i, n_shards);
+                                try {
+                                    strata::GgufFile s2(sib);
+                                    for (const auto& t : s2.tensors()) others.insert(t.name);
+                                } catch (const std::exception&) { /* a missing sibling is reported by the guard */ }
+                            }
+                        }
+                    }
+                    strata::Glm5NextGeometry geo;
+                    err = strata::check_glm5next_architecture(gguf, geo, &others);
+                } else {
+                    err = strata::check_architecture(gguf);
+                }
                 if (!err.empty()) return false;
                 have_architecture = true;
                 if (count && number && tensors && number->u == 0 && count->u > 1) {

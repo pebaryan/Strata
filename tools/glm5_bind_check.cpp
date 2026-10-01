@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "strata/core/glm_bind.hpp"
+#include "strata/core/native_dense.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/weights.hpp"
 
@@ -24,12 +25,20 @@ static uint64_t fnv1a(const std::vector<float>& v) {
 }
 
 int main(int argc, char** argv) {
-    if (argc < 2) { std::fprintf(stderr, "usage: glm5_bind_check <pack_dir> [block]\n"); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: glm5_bind_check <pack_dir> <gguf_shard1> [block]\n"); return 2; }
     const std::string pack = argv[1];
-    const int block = argc > 2 ? std::atoi(argv[2]) : 0;
+    const std::string shard = argc > 2 ? argv[2] : "";
+    const int block = argc > 3 ? std::atoi(argv[3]) : 0;
     std::string err;
 
     strata::core::WeightTable table;
+    // The 14 quantized tensors are served from the GGUF, not from dense.bin: this pack records a shape for
+    // them and nothing else, so the native projection has to be registered with the table or the loader
+    // refuses - which is what its "run with --native SHARD1" message means.  Register BEFORE loading, because
+    // pool_bytes/load decide which rows they own from what the table already knows is served natively.
+    strata::core::NativeDense nd;
+    if (shard.empty()) { std::fprintf(stderr, "usage: glm5_bind_check <pack_dir> <gguf_shard1> [block]\n"); return 2; }
+    if (!nd.load({shard}, table, err)) { std::fprintf(stderr, "native: %s\n", err.c_str()); return 1; }
     uint64_t bytes = 0;
     if (!table.pool_bytes(pack, bytes, err)) { std::fprintf(stderr, "pool_bytes: %s\n", err.c_str()); return 1; }
     void* arena = nullptr;
@@ -51,8 +60,13 @@ int main(int argc, char** argv) {
         const size_t n = (size_t) t.ne0 * (size_t) t.ne1;
         host.resize(n);
         cudaMemcpy(host.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
-        std::printf("blk.%d.%s\tne=%d,%d\t%016llx\n", block, t.name.c_str(), t.ne0, t.ne1,
-                    (unsigned long long) fnv1a(host));
+        // stats, not just a hash: the engine's dequantizer and llama.cpp's need not agree bit for bit, and a
+        // hash cannot tell a ULP apart from a wrong tensor.
+        double sum = 0.0;
+        float mn = host[0], mx = host[0];
+        for (float f : host) { sum += f; if (f < mn) mn = f; if (f > mx) mx = f; }
+        std::printf("blk.%d.%s\tne=%d,%d\tn=%zu\t%.9g\t%.9g\t%.9g\t%016llx\n", block, t.name.c_str(),
+                    t.ne0, t.ne1, n, mn, mx, sum, (unsigned long long) fnv1a(host));
     }
     cudaFree(arena);
     return 0;
