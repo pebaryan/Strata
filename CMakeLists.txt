@@ -183,6 +183,14 @@ target_include_directories(glm5_bind_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/i
 target_compile_options(glm5_bind_check PRIVATE -O2)
 target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::cudart)
 
+# KDA gate (branch glm5next-port): kda_forward against the reference implementation's own weights, input and
+# expected intermediates, fed from the fixture the oracle writes.  kda_forward is host code, so this target needs
+# no CUDA sources beyond the runtime it links.
+add_executable(kda_gate tools/kda_gate.cpp src/kernels/glm_kda.cpp)
+target_include_directories(kda_gate PRIVATE /include)
+target_compile_options(kda_gate PRIVATE -O2)
+target_link_libraries(kda_gate PRIVATE strata_core strata_kernels CUDA::cudart)
+
 # MoE parity (branch glm5next-port): the router (sigmoid gating, the selection-only bias, top-8 of 288,
 # normalize-then-scale) and the expert/shared-expert FFNs, against tools/glm5_moe_reference.py.
 add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe.cpp)

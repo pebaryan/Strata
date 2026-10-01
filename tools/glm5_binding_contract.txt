@@ -1178,3 +1178,41 @@ so a failure at the first comparison point (qc) would be a conv/weight issue, no
 WHAT REMAINS: the driver side - read wq/wk/wv from a fixture file as floats, take the other eleven KDA weights from
 the engine's own binding, call kda_forward on input.bin, and compare stage by stage against these files. F32
 attention weights are needed only because the engine has no dequantizer for the 22-byte type those three use.
+
+########  KDA GATE PASSES - 8/8 STAGES ON THE ARTIFACT'S REAL WEIGHTS  ########
+
+tools/kda_gate.cpp (new target kda_gate) drives kda_forward with the fixture's own weights, input and expected
+values, and compares every stage the kernel exposes against the oracle's file for it:
+
+    result   rel 3.532e-06  PASS        q      rel 2.037e-06  PASS
+    g        rel 3.808e-07  PASS        k      rel 1.464e-06  PASS
+    beta     rel 2.859e-07  PASS        v      rel 8.844e-07  PASS
+                                        attn   rel 1.750e-06  PASS
+                                        o      rel 1.895e-06  PASS
+    KDA GATE: PASS
+
+Three things this establishes, and three it does NOT:
+
+  ESTABLISHED
+  * kda_forward is correct on block 0's REAL weights - not a synthetic fixture - right through the recurrence
+    (attn at 1.75e-06), the L2-normalised q/k, the gate g, beta, and the final o.  Phase 7 gated this kernel on
+    hand-made inputs; this gates it on the artifact.
+  * kda_forward is HOST code: src/kernels/glm_kda.cpp takes plain std::vector::data() pointers, exactly like
+    hc_pre, so no CUDA plumbing, streams or device copies are involved.  That is worth knowing before anyone
+    wraps it in device buffers.
+  * the fixture's own consistency: its input is stage 1's verified output, so the two gates now chain.
+
+  NOT ESTABLISHED - state this wherever the result is reported
+  * T > 1.  This gate runs ONE token.  Phase 8 measured that the multi-token recurrence FAILS (t=3/t=5: attn
+    3.71e-01 of scale, while t=1 passes ~1e-06), and nothing here exercises that path.  A single-token gate must
+    not be read as full KDA verification.
+  * the BINDING of these sixteen tensors.  The weights come from the oracle's own files, so this validates the
+    kernel and never the wiring - the rule recorded earlier in this file.  What the engine's binding produces for
+    attn_q/k/v (natively quantized, 22-byte blocks) is still unchecked, and cannot be checked as floats until
+    either a dequantizer for that type exists or the KDA weights are read from the pack.
+  * ssm_a's convention: the fixture's values are all NEGATIVE (-8.159 .. -1.417), i.e. already -exp(A_log) as the
+    KdaWeights comment requires, so the kernel and the oracle agree on that reading - but it is agreement, not an
+    independent check of the convention against the metadata.
+
+NEXT: the T>1 case is the honest next gate - reuse this harness with tokens=2,3,5, dumping the oracle's intermediates
+for each token count, since the recurrence is the one part of KDA that is known to have failed before.
