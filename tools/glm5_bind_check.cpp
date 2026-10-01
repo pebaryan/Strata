@@ -168,9 +168,21 @@ int main(int argc, char** argv) {
         // dequantized hc_fn in a device buffer), which is exactly what the original segfault was: a DEVICE
         // pointer dereferenced as host memory.  Copy them across first.
         auto host_copy = [&](const char* n, size_t count, std::vector<float>& dst) -> bool {
-            const float* q = nullptr; int d0 = 0, d1 = 0;
-            for (const auto& t : bound.tensors) if (t.name == n) { q = t.ptr; d0 = t.ne0; d1 = t.ne1; }
+            const float* q = nullptr; int d0 = 0, d1 = 0; bool quant = false;
+            for (const auto& t : bound.tensors)
+                if (t.name == n) { q = t.ptr; d0 = t.ne0; d1 = t.ne1; quant = t.quantized; }
             if (!q) { std::fprintf(stderr, "stage1: %s not bound\n", n); return false; }
+            if (quant) {
+                // Sizing a QUANTIZED tensor's copy as floats asks CUDA for more bytes than the allocation
+                // holds and it refuses ("invalid argument") - which is what happened here for hc_attn_fn,
+                // whose Q8_0 blocks are 417792 bytes but whose 393216 elements would be 1.5 MB.  Either
+                // dequantize it first (STRATA_HC_DEQUANT=1 makes the binding do exactly that) or refuse
+                // loudly; do not silently ask for the wrong number of bytes.
+                std::fprintf(stderr, "stage1: %s is QUANTIZED - re-run with STRATA_HC_DEQUANT=1 so the binding "
+                                     "dequantizes it, rather than copying %zu floats out of a block buffer\n",
+                             n, (size_t) d0 * (size_t) (d1 > 0 ? d1 : 1));
+                return false;
+            }
             const size_t want = count ? count : (size_t) d0 * (size_t) (d1 > 0 ? d1 : 1);
             dst.resize(want);
             // The arena is cudaMalloc'd device memory (this driver allocates it that way), and the
@@ -178,17 +190,11 @@ int main(int argc, char** argv) {
             // cudaHostAlloc'd.  Rather than infer which is which - three earlier attempts did, and both
             // cudaMemcpyDeviceToHost and plain memcpy were wrong for some tensor - use cudaMemcpyDefault,
             // which resolves the direction under UVA.
-            cudaPointerAttributes pa{};
-            const cudaError_t ast = cudaPointerGetAttributes(&pa, q);
-            cudaGetLastError();
-            std::fprintf(stderr, "  probe %-22s ptr=%p want=%zu attr=%s%s\n", n, (const void*) q, want,
-                         ast == cudaSuccess ? "ok" : cudaGetErrorString(ast),
-                         ast == cudaSuccess ? (pa.type == cudaMemoryTypeDevice ? " device"
-                                             : pa.type == cudaMemoryTypeHost   ? " host"
-                                             : pa.type == cudaMemoryTypeManaged? " managed" : " other")
-                                            : "");
-            fflush(stderr);
-            const cudaError_t cst = cudaMemcpy(dst.data(), q, want * sizeof(float), cudaMemcpyDefault);
+            // Use exactly what the bind print loop uses, because that is PROVEN to work on these same
+            // tensors in the same run: cudaMemcpyDeviceToHost.  cudaPointerGetAttributes does not recognise
+            // this arena as device ("other"), and cudaMemcpyDefault needs those attributes to infer a
+            // direction - so it faults.  The pointer is fine; only Default's inference is not.
+            const cudaError_t cst = cudaMemcpy(dst.data(), q, want * sizeof(float), cudaMemcpyDeviceToHost);
             if (cst != cudaSuccess) {
                 std::fprintf(stderr, "stage1: copy %s failed: %s\n", n, cudaGetErrorString(cst));
                 return false;

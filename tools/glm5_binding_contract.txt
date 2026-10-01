@@ -424,3 +424,27 @@ the right CONFIGURATION for stage 1 all along; what was never verified is what t
 So the next run is: STRATA_HC_DEQUANT=1, with the stage's copy path fixed to handle a quantized tensor by NOT
 treating its pointer as floats without dequantizing.  That is a small, bounded driver change, and it is the last
 one between here and stage 1's first real number.
+
+THE CONTRADICTION, AND WHAT IT LEAVES - ordering
+
+Same run, same tensor, both read from bound.tensors:
+
+    print loop:  blk.0.hc_attn_base.weight  n=24  min=-8  max=2.69234943  sum=-116.46156  OK
+    stage:       probe hc_attn_base.weight  attr=ok "other"  -> invalid argument / segfault
+
+So the pointer is VALID DEVICE MEMORY - the print loop proves it with cudaMemcpyDeviceToHost - and
+cudaPointerGetAttributes is what misreports it, which is why cudaMemcpyDefault (which needs those attributes to
+infer direction) faults.  host_copy now uses DeviceToHost, exactly the call that works.
+
+It STILL fails, and the remaining difference is ORDER:
+
+    print loop order:  ... attn_norm, ..., hc_attn_base, hc_attn_fn, ...   (hc_attn_base read BEFORE hc_attn_fn)
+    stage order:       hc_attn_fn (copies 393216 floats, SUCCEEDS) -> hc_attn_base FAILS
+
+Everything after the hc_attn_fn copy fails.  So the next test is one line and needs no new theory: make the stage
+read hc_attn_base FIRST.  If it then succeeds, the hc_attn_fn copy path is what breaks what follows, and the
+suspect becomes the dequantized buffer itself (its size, or the fact that the binding dequantized into a
+cudaMalloc that the stage then reads 1.5 MB out of) rather than anything about the arena.
+
+State: default path verified at 9.1's 12/12; the opt-in branch is the configuration stage 1 needs and is
+documented as unverified; stage 1 has still never printed a number.
