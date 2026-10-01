@@ -1,0 +1,97 @@
+# GLM-5.3 block-0 binding contract (generated; every line traced to a verified source)
+#
+# SOURCE 1: the kernel struct fields each binding must fill (include/strata/kernels/glm_*.hpp)
+# SOURCE 2: the pack's tensors for blk.0 and their recorded dims (strata-pack-glm5/index.txt)
+# SOURCE 3: tools/glm5_kda_reference.py load_weights() - the ONLY binding proven correct, by
+#           reproducing llama.cpp's activations (KDA block 5.2e-06, gate 0.88%, beta 0.07%)
+
+## kernel struct fields
+  const float* ape = nullptr;       ///< [kpool][d]: the intra-pool position bias
+  const float* attn_k = nullptr;    ///< [d][n_embd]
+  const float* attn_norm = nullptr;  ///< [n_embd]
+  const float* attn_q_b = nullptr;  ///< [nh*d][q_lora]
+  const float* c_gate = nullptr;    ///< [d][n_embd]
+  const float* const* const* experts, const float* const* shared, float* out,
+  const float* conv_k = nullptr;
+  const float* conv_q = nullptr;     ///< [d_conv][d_inner]
+  const float* conv_v = nullptr;
+  const float* dt_bias = nullptr;    ///< [d_inner]
+  const float* h, float* cur_out, float* concat_out = nullptr, float* e_norm_out = nullptr,
+  const float* k_norm_b = nullptr;  ///< [d]
+  const float* k_norm_w = nullptr;  ///< [d]
+  const float* kv_a_norm = nullptr;  ///< [kv_lora]
+  const float* kv_a = nullptr;       ///< [kv_lora][n_embd]
+  const float* o_norm = nullptr;     ///< [hd], the gain of ssm_norm
+  const float* probs_b = nullptr;   ///< [n_expert], ffn_exp_probs_b (may be null)
+  const float* proj = nullptr;      ///< [nh][n_embd]
+  const float* q_a_norm = nullptr;   ///< [q_lora]
+  const float* router = nullptr;    ///< [n_expert][n_embd]
+  const float* ssm_a = nullptr;      ///< [nh]: holds -exp(A_log)
+  const float* ssm_beta = nullptr;   ///< [nh][n_embd]
+  const float* ssm_f_a = nullptr;    ///< [hd][n_embd]
+  const float* ssm_f_b = nullptr;    ///< [d_inner][hd]
+  const float* ssm_g_a = nullptr;    ///< [hd][n_embd]
+  const float* ssm_g_b = nullptr;    ///< [d_inner][hd]
+  const float* wk_b = nullptr;       ///< [n_head][kv_lora][head_dim]
+  const float* wk = nullptr;
+  const float* wo = nullptr;         ///< [n_embd][d_inner]
+  const float* wo = nullptr;         ///< [n_embd][n_head*head_dim]
+  const float* wq_a = nullptr;       ///< [q_lora][n_embd]
+  const float* wq_b = nullptr;       ///< [n_head*head_dim][q_lora]
+  const float* wq = nullptr;         ///< [d_inner][n_embd]
+  const float* wv_b = nullptr;       ///< [n_head][head_dim][kv_lora]
+  const float* wv = nullptr;
+  IdxResult idx_select(const IdxWeights& w, const IdxGeometry& g, const float* cur, const float* qr,
+  int n_positions, const float* cache, int q_pos, int32_t* cells_out, int cells_capacity,
+  void expert_ffn(const float* wg, const float* wu, const float* wd, const MoeGeometry& g, const float* x,
+  void hc_mean(const float* x, int n_embd, float* out);
+  void hc_post(const float* site_out, const float* residual, const HcMix& mix, int n_embd, float* out,
+  void hc_pre(const float* x, const float* fn, const float* base, const float* scale, int n_embd,
+  void idx_cache_row(const IdxWeights& w, const IdxGeometry& g, const float* x, float* row_out);
+  void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int tokens, float* out,
+  void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
+  void moe_forward(const float* router, const float* probs_b, const MoeGeometry& g, const float* x,
+  void moe_route(const float* router, const float* probs_b, const MoeGeometry& g, const float* x,
+  void mtp_head_norm(const float* head_norm_w, int n_embd, const float* x, float* out);
+  void mtp_input(const float* enorm, const float* hnorm, const float* eh_proj, int n_embd, const float* e,
+
+## the pack's blk.0 tensors (name, ne0, ne1 as the pack records them)
+  blk.0.attn_k.weight                0 x 4096
+  blk.0.attn_norm.weight             16384 x 4096
+  blk.0.attn_output.weight           0 x 8192
+  blk.0.attn_q.weight                0 x 4096
+  blk.0.attn_v.weight                0 x 4096
+  blk.0.ffn_down.weight              0 x 12288
+  blk.0.ffn_gate.weight              0 x 4096
+  blk.0.ffn_norm.weight              16384 x 4096
+  blk.0.ffn_up.weight                0 x 4096
+  blk.0.hc_attn_base.weight          96 x 24
+  blk.0.hc_attn_fn.weight            0 x 16384
+  blk.0.hc_attn_scale.weight         12 x 3
+  blk.0.hc_ffn_base.weight           96 x 24
+  blk.0.hc_ffn_fn.weight             0 x 16384
+  blk.0.hc_ffn_scale.weight          12 x 3
+  blk.0.ssm_a                        256 x 64
+  blk.0.ssm_beta.weight              0 x 4096
+  blk.0.ssm_conv1d_k.weight          131072 x 4
+  blk.0.ssm_conv1d_q.weight          131072 x 4
+  blk.0.ssm_conv1d_v.weight          131072 x 4
+  blk.0.ssm_dt.bias                  32768 x 8192
+  blk.0.ssm_f_a.weight               0 x 4096
+  blk.0.ssm_f_b.weight               0 x 128
+  blk.0.ssm_g_a.weight               0 x 4096
+  blk.0.ssm_g_b.weight               0 x 128
+  blk.0.ssm_norm.weight              512 x 128
+
+## TRAPS THIS TABLE EXISTS TO PREVENT (all measured this phase, all silent)
+
+  1. conv_q/conv_k/conv_v: the header says [d_conv][d_inner] and the pack records (d_inner, 1, d_conv) with
+     d_conv FASTEST.  The binding must do reshape(d_inner, d_conv).T - a TRANSPOSE.  reshape(d_conv, d_inner)
+     interleaves four channels' taps: attn_output-0 goes from corr +1.00000 / 0.02% to +0.52073 / 90.56%.
+  2. The router bias is `exp_probs_b` in the artifact, NOT `ffn_exp_probs_b` (the field name in the kernel
+     header).  Binding the wrong key silently drops the bias, and the bias drives SELECTION ONLY.
+  3. The output projection: this artifact HAS output.weight; never fall back to the tied token_embd.
+  4. The swiglu clamps come from the artifact's own keys (swiglu_clamp_exp / _shexp), never a nearby constant.
+  5. KDA state's FIRST index is the KEY axis: pred and the read sum over i, the update is k[i]*delta[j].  The
+     other convention agrees at the first token and diverges from the second (it cost a phase).
+  6. attention.head_count_kv is an ARRAY: it is the per-layer MLA(1)/KDA(0) table, not a head count.
