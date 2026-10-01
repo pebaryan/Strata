@@ -3550,3 +3550,41 @@ STATUS OF "RUN GLM" ON STRATA: the trunk loop, both MoE paths, all seven stages,
 expert stage and the loop skeleton all exist and compile.  What is still absent is exactly three things - the provider
 above, a chain target that links strata_kernels_cpu and drives the loop for the prompt, and the head (final norm,
 lm_head, greedy argmax, tokenizer decode) - and then the gate, argmax == 12089.  Nothing has run end to end.
+
+THE PROVIDER EXISTS: glm_fill_layer_weights, AND IT IS PURE ASSIGNMENT OVER A BOUND BLOCK
+
+    src/core/glm_layer_weights.cpp + include/strata/core/glm_layer_weights.hpp
+    T strata::core::glm::glm_fill_layer_weights      verified by compiling the TU standalone and nm'ing the object
+
+It takes an ALREADY-BOUND GlmBoundBlock rather than the artifact, and that is the design point: bind_glm_block already
+walks every row of a block generically and GlmBoundBlock::find(name) already looks any of them up, so the mapping needs
+no pack, no LayerView and no shards.  A gate can hand it a block assembled from fixture arrays and check the
+assignment - the same property every other gate in this port has, and the reason they can run without a model.
+
+It is deliberately pure assignment: no arithmetic, no dequantization, no layout fixups, because the binder already does
+those and a second implementation would be a second thing to disagree with.
+
+The tensor names live in one struct at the top of the file, spelled as the generated table spells them, and two of them
+do not follow the obvious pattern - `ssm_a` carries no suffix at all, and `ssm_dt.bias` is a bias.  Those are the two
+names that cost this port a round earlier, so they are in one place rather than scattered through the function.
+
+TWO GATES THE PROVIDER KEEPS, both about not silently proceeding:
+
+  * a missing tensor is reported BY NAME ("no tensor attn_kv_a_mqa.weight in the bound block"), because the trunk's own
+    check can only say "a required weight is null" - which says nothing about which one or why;
+  * the MLA layers HAVE indexer tensors and MlaWeights has no field for them, so the filler refuses when it finds them
+    unless kGlmAppliesIndexer is true - which it is not.  The reference's own note says the selection is all-tokens
+    below 8192 positions, which is where this model's prompts sit, so dropping them is right here and wrong later; the
+    constant and the refusal are what make that a decision rather than an oversight.
+
+k.attn_norm = out.attn_norm for a KDA layer, because the KDA kernel norms its own input with the layer's attn_norm -
+the same tensor, reached by two names, and the one place this function has to know that.
+
+FINAL STATE OF THE PORT THIS SESSION: all seven stages, both MoE paths, the trunk loop with kind dispatch, the
+compile-time-asserted dispatch table, and the weight provider all exist, compile, and carry verified symbols.  What
+remains is one chain target - bind the 45 blocks, open FileExpertSource on the pack dir, set the routed geometries and
+the native descriptor from the pack's own types, call glm_trunk_forward, then the head: final norm, lm_head, greedy
+argmax, tokenizer decode - and then the gate, argmax == 12089, the same number the Python full run passes.
+
+NOTHING HAS RUN END TO END, and that remains the honest summary: every piece is compiled and symbol-checked, none of
+them has been executed together, and the first execution will be the first time the assembly is tested.
