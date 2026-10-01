@@ -121,6 +121,35 @@ def main() -> int:
     print(f'  {len(w)} weights bound from the artifact; wq {w["wq"].shape} conv_q {w["conv_q"].shape}')
 
     result, inter = K.kda_block(w, x, tokens)
+
+    # SELF-CONSISTENCY, ASSERTED BEFORE ANYTHING IS WRITTEN.  A fixture whose parts do not imply each other cannot
+    # validate anything, and a gate cannot tell that apart from a broken engine.  This costs three lines and it is
+    # the check that took a whole session to think of when it should have been first: recompute one reference
+    # intermediate from the fixture's OWN other parts and require them to agree.
+    def _silu(v):
+        return v / (1.0 + np.exp(-v))
+
+    def _conv1d_causal(xx, ww):
+        t, ch = xx.shape
+        out = np.zeros_like(xx)
+        d = ww.shape[0]
+        for k in range(d):
+            sh = k - (d - 1)
+            if sh < 0:
+                out[-sh:] += ww[k] * xx[:t + sh]
+            else:
+                out[:t - sh] += ww[k] * xx[sh:]
+        return out
+
+    xn_ref = np.asarray(inter['xn'], dtype=np.float64).reshape(tokens, -1)
+    qc_ref = np.asarray(inter['qc'], dtype=np.float64).ravel()
+    qc_calc = _silu(_conv1d_causal(xn_ref @ w['wq'].T, w['conv_q'].reshape(d_conv, -1))).ravel()
+    gap = float(np.abs(qc_calc - qc_ref).max()) / max(1e-30, float(np.abs(qc_ref).max()))
+    print(f'  self-consistency: silu(conv1d(xn @ wq.T, conv_q)) vs the oracle\'s own qc: rel {gap:.3e}')
+    if gap > 1e-4:
+        raise SystemExit(f'FIXTURE IS NOT SELF-CONSISTENT for block {block}: its qc is not what its own xn, wq '
+                         f'and conv_q imply (rel {gap:.3e}). Nothing has been written. A gate over this would be '
+                         f'measuring a disagreement between two things that were never consistent.')
     for name, arr in inter.items():
         np.asarray(arr, dtype=np.float32).tofile(out / f'inter_{name}.bin')
     np.asarray(result, dtype=np.float32).tofile(out / 'result.bin')

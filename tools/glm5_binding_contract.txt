@@ -2247,3 +2247,40 @@ recomputing the reference from the reference's own inputs - and it should have b
 reading matvec, before reading conv1d_silu, before two rounds of narrowing.  The right order is: does the fixture
 agree with itself, THEN does the engine agree with the fixture.  Asking the second question first cost most of a
 session and very nearly produced a "fix" to correct code.
+
+TWO THINGS, AND ONE CHANGES THE PLAN
+
+1. THE ORACLE FILE ALREADY HAS A FIXTURE WRITER.  glm5_kda_reference.py contains a writer that emits the raw
+   fixture (weights, input, every intermediate, result) and it has a REGRESSION MODE:
+
+       if BAD_CONV and _a.shape == (D_CONV, D_INNER):
+           # REGRESSION MODE: emit the conv weights in the WRONG order while the fixture's expected outputs above
+           # were computed with the right one, so the parity gate must FAIL.  Flipping in the loader instead would
+           # corrupt the expected values too (wrong against wrong) and the gate would pass - which is exactly how
+           # the original defect survived every gate.
+           _a = np.ascontiguousarray(_a.T)
+
+   That comment describes this session's failure mode in advance: wrong against wrong passes every gate.  It also
+   means the block-0 fixture was produced BY THIS WRITER, not by an inline script as assumed, and therefore that a
+   hand-rolled builder is the wrong tool for the job - the writer that already exists encodes conventions the
+   builder would have to rediscover, which is exactly the rediscovery that produced a false block-1 failure.
+
+   THE PLAN CHANGES: use glm5_kda_reference's own writer for block 1 instead of extending make_kda_fixture.py.  Its
+   BAD_CONV mode additionally lets the gate be shown to FAIL on a known-bad fixture, which is a property this port
+   requires and which the builder does not offer.
+
+2. THE NEW SELF-CONSISTENCY ASSERTION FIRED ON BLOCK 0 AT rel 4.572e+01, WHILE THE HAND CHECK GAVE 7.975e-08.  Both
+   cannot be right, and the difference is where each reads from: the hand check read inter_xn.bin and inter_qc.bin
+   from disk, while the assertion reshapes the oracle's IN-MEMORY inter['xn'], whose layout is not the file's.  So
+   the assertion is buggy, not the fixture - which is itself the lesson repeating at one remove: the check has to be
+   written against something whose layout is known, and a freshly written file is that thing while an in-memory
+   array from another module is not.
+
+   The fix, when this is resumed: run the self-consistency check over the WRITTEN files, after writing them, or
+   establish inter['xn']'s actual shape first.  Do not trust a reshape of a foreign array - that is the same
+   mistake as assuming a dump's container format, which also cost a round.
+
+STATE, unchanged and honest: the engine is exonerated on block 1 (its qc matches the fixture's to 4 significant
+digits, and the fixture disagrees with its own arithmetic).  Block 0 is verified 12/12.  Block 1 remains UNVERIFIED
+- not because the engine fails, but because its fixture does not imply its own outputs, and no gate over it can
+support any conclusion either way.
