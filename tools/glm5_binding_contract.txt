@@ -4974,3 +4974,43 @@ WHY THIS IS WORTH RECORDING IN THIS MUCH DETAIL: the crash is the FIRST executio
 after every piece passed its own gate, and it is the fifth instance of this session's recurring failure - a component
 that is correct in isolation while the wiring around it is not.  The difference here is that the wiring is exactly what
 building this tool was meant to test, so the tool is doing its job on the first run.
+
+THE CRASH MOVED, WHICH CONFIRMS THE DIAGNOSIS AND SHOWS IT IS GENERAL
+
+The measured pointer map, from the runner's own diagnostic:
+
+    arena range: 0x7f04b8000000 .. 0x7f04bf647b00
+      layer 0: hc_attn_fn=0x7f1bb6200000(OUTSIDE-arena)   hc_attn_base/scale/attn_norm (in-arena)
+      layer 3: hc_attn_fn=0x7f1bb6e00000(OUTSIDE-arena)   hc_attn_base/scale/attn_norm (in-arena)
+
+hc_attn_fn is the one tensor of its group that the pack serves QUANTIZED, so it comes back from the GGUF-native path -
+or from the dequant branch's own CUDA buffer - as a DEVICE pointer, while its three neighbours live in the arena.  The
+runner now copies hc_attn_fn and hc_ffn_fn to host (393,216 floats each, 67 MB for all 45 blocks) and repoints the
+weight structs, and the diagnostic confirms it: 0x5629f679ada0 is a heap address.
+
+AND THE CRASH MOVED TO THE NEXT CPU KERNEL:
+
+    before:  #0 hc_pre           <- glm_stage_hc_norm <- glm_trunk_forward
+    after:   #0 kda_forward      <- glm_stage_kda      <- glm_trunk_forward
+
+That is the evidence the fix was real rather than incidental - and also that it was not the whole story.  The pattern
+is general: **every tensor the pack serves quantized arrives as a device pointer, and every CPU kernel in the trunk that
+reads one segfaults.**  hc_pre was simply the first, because the attention site's hc stage runs before the KDA.
+
+WHAT THIS IS, PROPERLY STATED: not a bug in any kernel, and not a bug in the runner either.  It is a MISSING PATH - the
+engine's loaders put CPU-consumed weights in device memory, which is invisible to every caller that ever fed
+glm_trunk_forward a fixture (trunk_gate, block3_gate, head_gate all did) and fatal to the first caller that fed it the
+real pack.  Fifth instance of this session's recurring shape: correct components, wired to something that does not fit.
+
+THE FIX IS ARCHITECTURAL AND BELONGS WHERE THE WEIGHTS ARE LOADED, NOT IN THE RUNNER.  Two candidate shapes:
+  * the loader keeps CPU-consumed tensors (the hc weights, the norms, and whatever kda_forward reads) in host memory,
+    which is what a real serving path does anyway - they are small, and staging them costs a copy that is not on the
+    GPU's critical path;
+  * or the arena becomes the single managed allocation the runner already makes it, AND the binder is changed to place
+    every tensor in it rather than allocating privately per tensor.
+The runner's cudaMallocManaged change had no effect, which is the clue: the binder is not using the arena for these
+tensors at all.
+
+THE NEXT DIAGNOSTIC IS ONE RUN: walk bound[layer].tensors for layers 0 and 3 and print, for every tensor, whether its
+pointer is inside the arena - which produces the exact list of tensors a CPU kernel cannot read, and therefore the
+exact list the loader has to stage in host memory.  That list is what the fix should be written against.

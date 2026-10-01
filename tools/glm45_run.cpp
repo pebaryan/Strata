@@ -256,6 +256,77 @@ int main(int argc, char** argv) {
     }
     std::printf("bound and mapped %d blocks\n", N_LAYERS);
 
+    // ---- THE hc WEIGHTS MUST BE HOST-READABLE, and this is measured rather than assumed.
+    //
+    // Printed just below: hc_attn_fn comes back OUTSIDE the arena - a private allocation, whether from the GGUF-native
+    // path or from the dequant branch's own CUDA buffer - while hc_attn_base, hc_attn_scale and attn_norm are inside
+    // it.  glm_stage_hc_norm runs hc_pre on the CPU, so a device pointer there is a SIGSEGV, which is exactly what the
+    // first run of this tool did.  Every previous caller (trunk_gate, block3_gate, head_gate) passed FIXTURE arrays in
+    // ordinary host memory, which is why nothing before this ever touched it.
+    //
+    // A production loader would keep these small tensors in host memory from the start.  This harness copies them
+    // explicitly instead of pretending: hc_attn_fn and hc_ffn_fn are 393,216 floats each, so 45 blocks cost 67 MB.
+    std::vector<std::vector<float> > hc_host((size_t) 2 * N_LAYERS);
+    {
+        const char* want_name[2] = {"hc_attn_fn.weight", "hc_ffn_fn.weight"};
+        for (int b = 0; b < N_LAYERS; ++b) {
+            const float* dst[2] = {P.w[(size_t) b].hc_attn_fn, P.w[(size_t) b].hc_ffn_fn};
+            for (int k = 0; k < 2; ++k) {
+                for (const C::GlmBoundBlock::Tensor& t : P.bound[(size_t) b].tensors) {
+                    if (t.name != want_name[k]) continue;
+                    const size_t n = (size_t) t.ne0 * (size_t) (t.ne1 > 0 ? t.ne1 : 1);
+                    std::vector<float>& buf = hc_host[(size_t) b * 2 + k];
+                    buf.assign(n, 0.0f);
+                    const cudaError_t ce = cudaMemcpy(buf.data(), t.ptr, n * sizeof(float), cudaMemcpyDeviceToHost);
+                    if (ce != cudaSuccess) {
+                        std::fprintf(stderr, "hc copy for %s (layer %d): %s\n", want_name[k], b, cudaGetErrorString(ce));
+                        return 1;
+                    }
+                    dst[k] = buf.data();
+                    break;
+                }
+            }
+            P.w[(size_t) b].hc_attn_fn = dst[0];
+            P.w[(size_t) b].hc_ffn_fn = dst[1];
+            if ((b % 15 == 0 || b == N_LAYERS - 1) && dst[0] != nullptr && dst[1] != nullptr) {
+                std::printf("  hc weights on host for layer %2d: %zu floats each\n", b,
+                            hc_host[(size_t) b * 2].size());
+                std::fflush(stdout);
+            }
+        }
+    }
+
+    // ---- DIAGNOSTIC: are the hc/norm weights the trunk's CPU stages read actually host-readable?
+    //
+    // Every previous caller of glm_trunk_forward passed FIXTURE arrays living in ordinary host memory, so this could
+    // not come up before.  The bound pack puts those tensors somewhere, and hc_pre - a CPU kernel - segfaults on it.
+    // An address inside the arena would mean the arena itself needs a host mapping; an address outside means the
+    // binder allocated privately and that allocation is the thing to inspect.
+    {
+        const char* lo = (const char*) arena;
+        const char* hi = lo + bytes;
+        std::printf("arena range: %p .. %p\n", (const void*) lo, (const void*) hi);
+        const int probe[2] = {0, 3};
+        for (int k = 0; k < 2; ++k) {
+            const int b = probe[k];
+            const C::glm::GlmTrunkLayerWeights& ww = P.w[(size_t) b];
+            const void* ptrs[4] = {(const void*) ww.hc_attn_fn, (const void*) ww.hc_attn_base,
+                                   (const void*) ww.hc_attn_scale, (const void*) ww.attn_norm};
+            const char* names[4] = {"hc_attn_fn", "hc_attn_base", "hc_attn_scale", "attn_norm"};
+            std::printf("  layer %2d:", b);
+            for (int j = 0; j < 4; ++j) {
+                const char* where = "NULL";
+                if (ptrs[j] != nullptr) {
+                    const char* c = (const char*) ptrs[j];
+                    where = (c >= lo && c < hi) ? "in-arena" : "OUTSIDE-arena";
+                }
+                std::printf(" %s=%p(%s)", names[j], ptrs[j], where);
+            }
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+    }
+
     // ---- state: one KDA state per KDA layer, one MLA cache per MLA layer, both keyed by the ARTIFACT's layer number
     std::vector<std::vector<float> > kda_state(N_LAYERS);
     std::vector<std::vector<float> > mla_cache(N_LAYERS);
