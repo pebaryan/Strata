@@ -1506,3 +1506,28 @@ copying).  Concretely: python dumps that tensor's raw GGUF bytes to a file, a sm
 over them and writes the floats, and the values are compared elementwise against
 glm5_kda_reference's own np.asarray(m.tensor('blk.0.attn_q.weight')) - which is the same oracle that has verified
 every other gate in this port.  A failure there is informative in a way a llama.cpp comparison cannot be.
+
+STEP 2 FIXTURE READY: /home/peb/moredata/glm5-q5k-parity
+
+    raw_q5k_blocks.bin        23,068,672 bytes = 131,072 blocks of 176 B, taken from GGUF shard 2
+    oracle_dequantised.bin    33,554,432 floats, the oracle's own values for the same tensor
+
+TWO INDEPENDENT CONFIRMATIONS CAME OUT OF BUILDING THIS, neither of which was the point of building it:
+
+  * 131,072 blocks x 256 elements = 33,554,432 elements exactly, and the raw byte count is 23,068,672 - IDENTICAL to
+    the alloc size the engine's own trace reported for blk.0.attn_q.weight.  So the engine's native buffer really is
+    this tensor's raw Q5_K blocks, which is a second, independent confirmation of the type identification (the
+    first was that 176 and 210 match ggml's compiler-checked struct sizes).
+  * the oracle's min/max for blk.0.attn_q.weight are -0.374668 / +0.404713, which are exactly the values in the
+    KDA fixture's w_wq.bin - so blk.0.attn_q.weight IS the oracle's wq, as the weight mapping assumed.  The mapping
+    recorded earlier in this file is confirmed against the data rather than by name.
+
+Also worth keeping: the tensor lives in GGUF SHARD 2, not shard 1.  The driver is given shard 1 for metadata and
+scans siblings; anything reading a specific tensor must scan the shards rather than assume.
+
+WHAT REMAINS FOR STEP 2 - the tool, in full: declare `void dequant_q5_K(const uint8_t*, float*, int64_t, void*)`
+in include/strata/kernels/quantize_act.hpp (next to dequant_q8_0's declaration), then a small host tool that reads
+raw_q5k_blocks.bin, cudaMallocs the output, calls dequant_q5_K, copies back and writes floats; compare elementwise
+against oracle_dequantised.bin in python.  About forty lines and one CMake target, but it needs the header touched,
+a new file and a build - four steps, and this file should be the sixth port artifact that gets built in one pass
+rather than a fifth that gets patched repeatedly.
