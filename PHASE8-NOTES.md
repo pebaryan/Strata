@@ -312,3 +312,37 @@ FIX: size ssm_dt.bias (and the GLM KDA weight layout generally) from the artifac
 per-head convention - 8192 here, model-dependent, so the GLM layout needs its own entry rather than
 reusing gdn_v's.  Then assert at bind time that the length matches the kernel's documented [d_inner]
 contract, so the next mismatch of this kind fails loudly instead of silently reading a neighbour.
+
+## Part 10: PART 9 IS WRONG - dt_bias is fine.  What the pack actually contains, measured.
+
+Part 9 blamed `src/core/layout.cpp:101` sizing ssm_dt.bias as g.ssm_v_heads.  That is the Qwen4-Exp layout
+table, not the GLM path's, and the claim was never checked against the pack before it was written down.
+Measured now, byte-for-byte, by searching strata-pack-glm5/dense.bin for the artifact's own values:
+
+    ssm_a          (64,)      fp32 BYTE-IDENTICAL to the GGUF, at offset 49536
+    ssm_dt.bias    (8192,)    fp32 BYTE-IDENTICAL to the GGUF, at offset 443008
+    attn_norm.weight, ssm_norm.weight   likewise identical
+    ssm_f_a.weight (128,4096)  NOT PRESENT in dense.bin, as fp32 or fp16
+    ssm_f_b.weight (8192,128)  NOT PRESENT
+    ssm_beta.weight (64,4096)  NOT PRESENT
+
+So every KDA length the kernel asks for is right (ssm_a 64, dt_bias 8192, f_a hd*ne, f_b di*hd, beta
+nh*ne), the two 1-D inputs to the gate are exact, and the gate formula in src/kernels/glm_kda.cpp is
+identical to the oracle's.  The matrices are not in the dense arena at all: they are served natively from
+the GGUF, i.e. still quantized (the index row carries a quant type and a 32-byte block size for them),
+which is also why an earlier attempt to read them at a byte offset read nothing.
+
+That leaves one specific question, and it is exactly where the 56% lives: the gate's value is
+v = ssm_f_b @ (ssm_f_a @ xn) + dt_bias, and the two matvecs are the only part of it whose weights the port
+gets from a natively-served, still-quantized source.  If the loader treats those blobs as float while the
+pack serves them quantized, the error would be confined to v - which is what the measurement shows: g
+wrong by 56% at r +0.9856, beta (same xn, no matvec in its path) wrong by only 12%, and everything upstream
+exact.
+
+Next: read what the port's loader does with ssm_f_a / ssm_f_b - the dequantization path and the sraw
+convention - and check it against the GGUF type.  Also verify the port's beta path, which uses ssm_beta
+with the same xn and no dt_bias, since a 12% error there needs its own explanation once the gate is fixed.
+
+Method note worth keeping: part 9 was written from a grep hit in the wrong code path and disproved by one
+cheap measurement.  Read the table that the path under test actually uses, and measure the artifact before
+blaming a declaration.
