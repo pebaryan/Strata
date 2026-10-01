@@ -203,6 +203,13 @@ target_link_libraries(q5k_parity PRIVATE strata_kernels CUDA::cudart)
 # Dequantizes the fixture's raw blocks with the two bit-exact K-quant kernels, and asserts that its own input
 # actually exceeds the clamp limit before reporting a verdict.
 add_executable(ffn_gate tools/ffn_gate.cpp src/kernels/glm_moe.cpp)
+
+# hc_post gate (branch glm5next-port): the residual combination, the last unverified piece of block 0.  Host-only -
+# no CUDA, no weights - and it asserts that both of its terms actually move the result before reporting a verdict.
+add_executable(hcpost_gate tools/hcpost_gate.cpp src/kernels/glm_hc.cpp)
+target_include_directories(hcpost_gate PRIVATE /include)
+target_compile_options(hcpost_gate PRIVATE -O2)
+target_link_libraries(hcpost_gate PRIVATE strata_core strata_kernels)
 target_include_directories(ffn_gate PRIVATE /include)
 target_compile_options(ffn_gate PRIVATE -O2)
 target_link_libraries(ffn_gate PRIVATE strata_core strata_kernels CUDA::cudart)

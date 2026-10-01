@@ -1960,3 +1960,45 @@ WHAT IS NOW VERIFIED FOR BLOCK 0 OF GLM-5.3 IN THIS ENGINE:
 
 SIX GATES, ALL PASSING, ALL COMMITTED: glm5_bind_check (stage 1), kda_gate (T=1, T=5), kda_binding_check.py
 (16/16), q5k_parity (176 and 210 byte blocks), ffn_gate (PASS + INCONCLUSIVE + FAIL-on-known-bad).
+
+########  HC_POST PASSES, AND BLOCK 0 IS VERIFIED END TO END  ########
+
+    engine rms 0.0146031   oracle rms 0.0146031
+    worst absolute difference 3.725e-09   relative to rms 2.551e-07   elements off: 0   (over 16,384)
+    term magnitudes: post-term 6.65045   residual-term 21.5222   both present: yes
+    HC_POST GATE: PASS
+
+2.551e-07 of rms is the tightest agreement anywhere in this port, 50x closer than the FFN's 1.2e-05, and for a
+reason: this is host arithmetic with four multiplies per element, so fp32-against-fp64 has almost nothing to
+disagree about.  The term-magnitude line is the assertion that matters - post contributes 6.65 and the residual
+21.52, so the comparison is genuinely testing the sum rather than one term standing in for both.
+
+THE DUMP'S CONTAINER FORMAT, which cost five attempts to establish and is now known:
+
+    every file in glm5-ref-dump* is  [0, ne0, ne1, ne2, ne3] as five u32 words, then ne0*ne1*ne2*ne3 floats,
+    with ne0 FASTEST.  hc_init is ne=[4096,4,5,1]: 4 hc streams x 5 tokens x 4096 embd.
+
+    The (view) files are NOT the arrays the oracle consumes: hc_attn_scale.weight (view) holds 1 float where the
+    oracle's scale needs 3, and hc_attn_base.weight (view) holds 4 where base needs 24.  They are per-site slices.
+    The full arrays come from the artifact through the model's own dequantizing tensor accessor - which is exactly
+    what the driver does, and why it printed "24 floats" when this pass was hunting the same value in the dump.
+
+    hc_attn_fn.weight is not in the dump AT ALL, because it is quantized (Q8_0).  The dump holds float tensors only.
+
+The sequence of five failures is worth keeping as a shape rather than as a story: wrong format, then a filename taken
+from a listing I had truncated myself, then the wrong source, then a slicing detail (the oracle's hc_post is
+token-aware), then an undersized output buffer.  Each was one wrong assumption, each was named by the failure, and
+none was arithmetic - the arithmetic had been read on both sides and found identical before any of this started.
+The undersized buffer is the one that could have gone badly: hc_post writes HC rows, not one vector, so allocating
+n_embd would have written 48 KB past a 16 KB buffer.  It never ran, because the fixture-size assertion is placed
+BEFORE the call rather than after.
+
+BLOCK 0 OF GLM-5.3 IS NOW VERIFIED END TO END - attention and FFN, and both hyper-connection stages:
+    stage 1  hc_pre + host RMS norm     7 significant digits / 5.4e-10
+    KDA      8/8 stages, T=1 and T=5    worst 2.94e-06 (T=5)
+    binding  16/16 KDA weights          worst 1.3e-08
+    dequant  types 8, 13, 14            BIT-EXACT, 83.9M elements between them
+    FFN      expert_ffn vs dense_forward  1.5e-05 of rms, clamp verified by a demonstrated failure
+    hc_post  residual combination       2.551e-07 of rms
+Seven gates, all passing, all committed.  The chain can now move to block 1 - and the dump carries activations for
+every one of the 45 blocks.
