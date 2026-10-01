@@ -46,11 +46,22 @@ ROW = re.compile(
 
 
 def parse(driver_output):
+    """Fields, per the byte dump of the real output: name \\t ne=.. \\t n=<digits> \\t min \\t max \\t sum \\t hash.
+
+    Note the separator is two characters - a backslash and a 't' - because the driver's printf contains a literal
+    '\\t' rather than a tab.  Splitting on '\\t' in this file is that pair; a regex for the same thing has now
+    been got wrong several times, so it is not used.
+    """
     rows = {}
     for line in pathlib.Path(driver_output).read_text().splitlines():
-        m = ROW.match(line)
-        if m:
-            rows[m.group("name")] = (float(m.group("min")), float(m.group("max")), float(m.group("sum")))
+        parts = line.split("\\t")
+        if len(parts) < 6 or not parts[0].startswith("blk."):
+            continue
+        name = parts[0].split(".", 2)[2]
+        try:
+            rows[name] = (float(parts[3]), float(parts[4]), float(parts[5]))
+        except ValueError:
+            continue
     return rows
 
 

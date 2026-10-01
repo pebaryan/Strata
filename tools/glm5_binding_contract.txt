@@ -1279,3 +1279,30 @@ WHAT THE NEXT SESSION SHOULD DO FIRST: fix that regex against a repr() of the ac
 format is believed to be), confirm it parses 26 rows for block 0, and only then read its verdicts.  The engine-side
 facts it should then check are the remaining eleven F32 tensors plus, separately, whether wq/wk/wv can be verified
 at all without a dequantizer for their 22-byte type.
+
+THE PARSER: SEVEN ATTEMPTS, AND THE STEP I KEPT SKIPPING
+
+tools/kda_binding_check.py still parses 0 rows.  The file it reads does contain the rows - a repr() read of
+/tmp/M2.out printed three of them verbatim, including
+
+    'blk.0.attn_norm.weight\\tne=4096,0\\tn=4096\\t0.0703125\\t0.157226562\\t420.698242\\t79e345f766dfca09'
+
+and od -c on the same file shows the separator as backslash + t at the byte level.  So the FORMAT is known and the
+parser is still wrong, and the reason I have not found it is the mistake, not the format:
+
+    I edited the parser and re-ran the whole check SEVEN TIMES without ever printing the intermediate - the
+    `parts` list for one known-good line.  Each round produced "0 rows parsed", which says nothing about WHY.
+
+That is the same failure the whole session keeps exhibiting in different clothes - acting on an assumption about
+what a tool produced instead of looking at what it produced.  The single next action, and it is not an edit:
+
+    python3 -c "print(repr(open('/tmp/M2.out').read().splitlines()[i]))"   # for the line that has the stats
+    then split it interactively and print len(parts) and parts[0..6]
+
+Do that BEFORE touching the parser again.  Everything the parser needs is already known and written down; what is
+missing is one look at the value it actually receives.
+
+STATE, unchanged and all committed: stage 1 PASS (hc_pre 7 significant digits, norm 5.4e-10); KDA gate PASS at
+T=1 and T=5, 8/8 stages each; the dequant root cause fixed (native_type == 8 guard) with the widened path exiting 0
+and 0 failures; binding verified by direct reading for attn_norm and ssm_conv1d_q, both exact.  tools/kda_gate.cpp
+and the two fixtures are committed and working - the broken artifact is the checker only.
