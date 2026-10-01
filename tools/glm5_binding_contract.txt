@@ -3588,3 +3588,46 @@ argmax, tokenizer decode - and then the gate, argmax == 12089, the same number t
 
 NOTHING HAS RUN END TO END, and that remains the honest summary: every piece is compiled and symbol-checked, none of
 them has been executed together, and the first execution will be the first time the assembly is tested.
+
+THE CHAIN TARGET'S SETUP, RESOLVED - every line of it read from code that already runs
+
+LayerView is not a struct (layout.hpp:72): it is `LayerView(const WeightTable& table, int64_t layer)` with
+`name(suffix)` building "blk.<layer>.<suffix>" and `get(suffix)` returning the WeightRef.  And tools/glm5_bind_check.cpp
+already does the whole setup, so the chain target does not have to invent any of it:
+
+    WeightTable table;
+    table.pool_bytes(pack, bytes, err, &served);          // what will be resident, and how much
+    cudaMalloc(&arena, bytes);
+    table.load(pack, arena, bytes, err, &served);
+    NativeDense nd; nd.load(shards, table, err);
+    LayerView v(table, block);
+    GlmBoundBlock bound;
+    bind_glm_block(v, block, d_inner, d_conv, shards, bound, stream, err);
+        with d_inner = 8192, d_conv = 4, "from the artifact's own metadata"
+
+So the chain target is:
+
+    1  build the table, arena, NativeDense once
+    2  for layer in 0..44: bind the block, glm_fill_layer_weights(...), and keep the per-layer KdaWeights /
+       MlaWeights / shexp-triple STORAGE alive (a vector of them), since GlmTrunkLayerWeights holds pointers
+    3  open FileExpertSource on /home/peb/moredata/strata-pack-glm5, and for each routed layer call
+       native_fmt(gu_type, d_type, 4096, 2048) with the types native_experts.txt carries for that layer, then set
+       moe_g / shexp_g / moe_fmt / blob_fn on the layer's weights
+    4  allocate GlmTrunkState: one nh*hd*hd KDA state per KDA layer (zeroed), one [max_cells][kv_lora] MLA cache per
+       MLA layer, and the two index maps from glm_block_kinds
+    5  seed x from the embedding's streams and call glm_trunk_forward(x, 45, provider, ctx, kda_g, mla_g, 1e-5f,
+       state, l_out, stream, err)
+    6  the head: final norm, lm_head, greedy argmax, and the pack's tokenizer/ for decode
+
+Then the gate: argmax(logits) == 12089 for 785 6722 315 9621 374 - the same number tools/glm5_full_run.py passes.
+
+Nothing in that list is unknown any more.  Every function, struct, name and recipe has been read rather than inferred,
+and the pieces that are new this session have each been compiled and symbol-checked independently:
+
+    glm_stage_hc_norm  glm_stage_kda  glm_stage_mla  glm_stage_hc_post  glm_stage_ffn  glm_stage_moe (resident)
+    glm_stage_moe_native (streamed)     glm_block_forward     glm_trunk_forward     glm_fill_layer_weights
+    glm_block_kinds.hpp (asserted dispatch)
+
+WHAT HAS NOT HAPPENED: none of it has run together, and the trunk has never executed at all.  The remaining work is
+integration of verified parts, and the first execution is the first test of the assembly - which this port has learned,
+repeatedly, is a different thing from the sum of its parts passing their own gates.
