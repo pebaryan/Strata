@@ -4529,3 +4529,35 @@ remaining candidates are therefore the things that only exist in the ASSEMBLY of
 THE NEXT MEASUREMENT is to have the runner dump block 3's per-stage intermediates (it already dumps l_out-N; adding
 attn_output and ffn_out for one layer is a few lines) and compare the engine's attention-site and FFN outputs against
 them separately.  That splits 6% into "before the FFN" or "the FFN" in a single run instead of by argument.
+
+THE EXISTING BLOCK-3 STAGE DUMPS ARE NOT A VALID REFERENCE, AND THAT IS NOW PROVEN RATHER THAN ASSUMED
+
+The plan was to bisect block 3's remaining 6% against the stage families already on disk (hc_attn_pre-3, attn_norm-3,
+ffn_norm-3, ffn_out-3, hc_attn_post-3, l_out-3).  Two measurements killed that shortcut, and both are recorded here so
+the next attempt does not spend a run discovering them:
+
+  1. glm5_block_driver.py, the tool that writes the stage families, ONLY DOES KDA BLOCKS.  Running it for four blocks
+     stops with "block 3 is an MLA block; this driver only does KDA blocks so far", so the block-3 stages on disk came
+     from a DIFFERENT tool - one whose MLA path is a separate implementation from the oracle's.
+
+  2. THAT TOOL'S BLOCK 3 DOES NOT AGREE WITH THE ORACLE.  tools/check_stage_refs.py compares a dump's l_out-3 elementwise
+     against the oracle's own l_out-3 - a source that never went through the writer that was fixed, so agreement would
+     be evidence and not a tautology:
+
+         oracle l_out-3  ne=[4096,4,5,1]  81920 floats
+         driver l_out-3  ne=[4096,4,5,1]  81920 floats
+         worst |driver - oracle| over l_out-3: 0.0219   DISAGREE      (against a driver rms of 0.159, so ~13.8%)
+
+     glm5-ref-dump, ...2, ...3 and ...5 all carry the SAME values (identical rms on every stage), so this is not a
+     stale copy problem and re-checking another directory cannot fix it.
+
+WHAT FOLLOWS FROM IT: block 3's stage references must come from the AUTHORITATIVE path - the oracle runner
+(glm5_full_run.py) whose full 45-block run is the one that produces token 12089 - extended to dump its own block-3
+intermediates, with the fixed writer.  Only that source is definitionally consistent with the output this port is
+gated on, and the 13.8% disagreement above is exactly why a convenient-looking reference is worth one cheap check
+before it is trusted: a stage-level bisection against a dump that is itself off by 14% would have produced a
+confident, wrong answer about which half of the block is broken.
+
+This is the third time this session that verifying the FIXTURE came before using it, and it is the same rule each time:
+check that a fixture agrees with itself - or with an independent authority - before checking that the engine agrees
+with the fixture.
