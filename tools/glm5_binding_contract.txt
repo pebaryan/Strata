@@ -3903,3 +3903,42 @@ anything.  A subtly wrong Q6_K would leave the gate/up path exact, perturb ffn_d
 l_out - exactly the shape of what is measured.  The next gate is therefore q6k_parity: dequantize
 blk.0.ffn_down.weight's raw blocks and compare against the oracle's own dequantization of the same tensor, the way
 q5k_parity does it and NOT by comparing the implementation against itself.
+
+dequant_q6_K IS BIT-EXACT - THE LEADING SUSPECT IS ELIMINATED
+
+    ./build-glm5/q5k_parity /home/peb/moredata/glm5-q6k-parity 210 raw_q5k_blocks.bin
+    q5k parity: 196608 raw blocks (41287680 bytes) -> 50331648 elements
+      engine : min -0.117431641  max +0.117431641  sum -185.914256
+    GATE vs oracle_dequantised.bin: worst 0   relative to rms 0   differing elements 0 of 50,331,648
+
+Zero differing elements over 50,331,648 - the same standard dequant_q5_K met over 33,554,432.  The kernel over the
+210-byte blocks of blk.0.ffn_down.weight reproduces the reference exactly, so a wrong Q6_K CANNOT be the cause of the
+3.0% the block gate measures at l_out.  The hypothesis recorded in the previous entry was reasonable and is now dead,
+which is the point of having a gate for a transcription rather than trusting it.
+
+TWO RECORD CORRECTIONS this exercise turned up, both about my own bookkeeping:
+
+  * I had recorded dequant_q6_K as "transcribed, UNWIRED, never compared against anything".  That was WRONG.  The
+    directory /home/peb/moredata/glm5-q6k-parity already held a fixture from 18:25 today - raw_q6k_blocks.bin at
+    41,287,680 bytes, exactly 196,608 x 210, i.e. blk.0.ffn_down's blocks - alongside engine_output.bin and
+    oracle_dequantised.bin, each 201,326,592 bytes = 50,331,648 floats.  A Q6_K parity fixture with the right tensor,
+    its raw blocks and a reference already existed and had already been compared (both sides matched before this run
+    too).  So the gate existed; what was missing was the record of it, and the corrected statement is that
+    dequant_q6_K is gated bit-exact, not ungated;
+  * the Q5_K/Q6_K comparison tool takes its block size and input name as arguments - 176 or 210, and any file name -
+    precisely so the second K-quant would not need a second copy of the file.  That was already true before this
+    session; it is what let the Q6_K gate be re-run here in one command instead of being rewritten.
+
+WHERE THE 3.0% THEN COMES FROM, having eliminated this: not dequant_q6_K (bit-exact), not dequant_q5_K (bit-exact),
+not the KDA kernel or hc_pre/hc_post or the leading dense FFN (each gated independently at 1e-6 to 1e-9 on their own
+fixtures).  What has never been compared is the PER-STAGE SEQUENCE inside a block - and that is now the only thing the
+3% can be hiding in, because every part is right and the assembly is what has not been checked stage by stage.  The
+reference dump holds exactly the per-stage tensors a bisection needs (hc_attn_pre, attn_norm, attn_output,
+hc_attn_post, hc_ffn_pre, ffn_norm, ffn_out, l_out), so the next gate is a block bisection: dump the engine's own
+intermediates at each of those points and compare them one at a time, in order, until the first one that disagrees -
+which localises the 3% to a single line of the assembly instead of leaving it as a block-level number.
+
+One caveat to carry into that: the reference dump's own hc_init and the oracle's now agree only AFTER the writer fix,
+and the dump's per-stage tensors were written by the reference dumper (ne0-fastest, correct) - so the bisection can
+use the dump's stages directly, but its INPUT must be the oracle's hc_init, not the dump's, until the two are shown
+identical elementwise rather than merely equal in rms.  That is the same trap, and it is avoidable by construction now.
