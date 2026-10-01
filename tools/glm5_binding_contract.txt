@@ -4080,3 +4080,42 @@ WHAT REMAINS UNTESTED, stated precisely, because the distinction matters after t
 STATE: two blocks verified to the fp32 floor, isolated and chained; the KDA and MLA kernels both verified against the
 oracle; the dense FFN and both dequantizers bit-exact or at the floor.  Nothing in the port is known to be wrong; what
 is missing is execution of the parts that need the pack.
+
+THE ROUTED EXPERT PATH IS NOT VERIFIED - glm_moe_parity returns FAILURES, and it is right to
+
+    $PY tools/glm5_moe_reference.py --gguf $GGUF --layer 3 --raw-fixture /home/peb/moredata/glm5-moe-l3.raw
+        -> 910,755,036 bytes, 8 experts (ids [45, 25, 117, 180, 98, 55, 9, 88])
+    ./build-glm5/glm_moe_parity /home/peb/moredata/glm5-moe-l3.raw
+        clamp exercised: 0 pre-activation(s) past exp 10 / shexp 10, max |gate| 3.372   NO
+        glm_moe_parity: FAILURES (the clamp is not covered)
+
+Read carefully, this is NOT a numerical mismatch report: the gate produced no per-stage max-abs lines at all, because it
+refuses at the clamp-coverage check before claiming anything.  The fixture's largest pre-activation is 3.372 against a
+limit of 10, so the clamp is inert and the gate cannot catch a port that omits it - and rather than pass vacuously it
+reports FAILURES.  That is the correct behaviour and the same one this port demanded of the FFN gate, whose block-1 run
+returned INCONCLUSIVE for exactly this reason.
+
+SO THE HONEST STATE OF THE ROUTED EXPERT KERNEL IS: UNVERIFIED.  Not "passed", not "failed" - the gate will not give a
+verdict on a fixture that cannot exercise the term it tests, and I am recording it that way rather than reading the
+absence of a numerical failure as a success.  This is the third time in this port that a green-looking result had to be
+refused on these grounds (the layer_weights_gate that passed while skipping 23 of 25 checks; the FFN INCONCLUSIVE; now
+this), and it is why the rule exists.
+
+HOW TO CLOSE IT, taken from the gate that did solve this: ffn_gate demonstrated its clamp by running the same fixture
+with the limit FORCED to 0, producing a 15,000x failure and proving the clamp is wired.  The same approach applies here
+- run glm_moe_parity with clamp_exp/clamp_shexp overridden low enough that the fixture's own pre-activations cross them,
+require the numerical stages to then FAIL, and only then trust a PASS at the artifact's real limits.  Until that is
+done, blocks 3..44 - every routed block, 42 of the 45 - rest on a kernel whose parity gate has never returned a verdict.
+
+STATE AFTER THIS ENTRY, complete and without inflation:
+
+    verified:       block 0 and block 1 end to end, isolated and chained, at the fp32 floor (1.2e-05 to 1.6e-05 of rms)
+                    the KDA kernel (12/12, four layers)
+                    the MLA kernel (5 stages, attn bit-exact, 1-entry-cache invariant)
+                    hc_pre, hc_post, the leading dense FFN
+                    dequant_q5_K and dequant_q6_K, bit-exact
+                    the weight mapping, 25 checks
+    not verified:   the routed expert kernel (this entry)
+                    the MLA and MoE WIRING inside glm_trunk_forward - neither branch has ever run
+                    everything past block 2, which needs the pack
+                    the head, and argmax == 12089
