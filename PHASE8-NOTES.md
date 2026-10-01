@@ -375,3 +375,35 @@ Two consequences, and the second is testable immediately:
 Next, in order: (a) confirm how the port's loader dequantizes and transposes the Q8_0 KDA matrices, block
 order included, against the GGUF; (b) fix the beta access to match whatever orientation the loader
 actually produces, rather than the one the kernel was written against.
+
+## Part 12: the double-norm fix is in, and the trunk is still wrong - bisect it per block
+
+glm5_full_run.py ran all 45 blocks with the double-norm removed and wrote the post-trunk hidden state
+(last token, post output_norm - verified against the flag's own help text, so it is the same quantity the
+reference's result_norm holds).  Compared against the reference:
+
+    OLD (double norm)   corr +0.20802   max|d| 5.702e+00
+    NEW (raw residual)  corr +0.07921   max|d| 1.349e+01
+    argmax 421 vs expected 12089   MISMATCH
+
+So the fix did not help; it made the end-to-end worse.  This CONTRADICTS the block-0 measurement, which is
+direct and unambiguous (raw residual -> gate 0.88% off the reference; double normed -> 56.07%; the
+driver's dumped gate was 56.1%).  Both statements are measured, so the honest reading is that they are
+measuring different things: block 0 in the driver matches the reference with the raw residual, while the
+45-block trunk was already wrong before this change and something else dominates it.  Do not treat the
+end-to-end delta as a verdict on the normalization until the trunk is bisected - a broken trunk cannot
+score a change.
+
+WHAT IS MISSING, and it is now the only thing in the way: the reference dump carries l_out-N for every
+block (90 of them, 45 blocks x 2 variants), but glm5_full_run.py dumps no per-block tensors, so the real
+trunk has never been checked block by block.  The driver does dump per block, which is how block 0 was
+localized, but it stops at block 2 ("block 3 is an MLA block; this driver only does KDA blocks so far").
+
+Next: have glm5_full_run.py write l_out-{il} for every block (the same [n_embd, hc, T] transpose the
+driver uses) and bisect against the reference's l_out-N.  That yields the FIRST wrong block of the real
+trunk deterministically, the same way block 0's gate was pinned down.  Until that number exists, any
+claim about which operator is wrong is inference, not measurement.
+
+Also recorded from this run: clamp activity over 1890 calls was exp_up 1, shexp_up 10, everything else 0 -
+consistent with the earlier note that the swiglu clamp barely fires on real data even though it is a
+required term.
