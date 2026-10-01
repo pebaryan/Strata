@@ -3096,3 +3096,46 @@ whether hc_pre agrees on THIS input specifically - which the oracle for hc_pre (
 THE HONEST STATE: no demonstrated engine bug.  Every kernel that has been pointed at a real input matches its oracle,
 and the one apparent counterexample was my own comparison error.  The chain's remaining discrepancy is in stage 1 and
 is small in absolute terms.
+
+########  RESOLVED: THE ENGINE MATCHES THE ORACLE, AND THE DUMP IS THE ODD ONE OUT  ########
+
+hc_pre, run by the hc oracle on the SAME input the engine was given (hc_init token 0, x shaped (hc, n_embd, nt) =
+(4, 4096, 1)):
+
+    oracle hc_pre output:  rms 0.00412163   min -0.0153903   max 0.0215029
+    the engine's:          rms 0.00412163
+    the dump hc_attn_pre-0: rms 0.004125     min -0.0154      max 0.02152
+
+THE ENGINE AND THE ORACLE AGREE TO SEVEN SIGNIFICANT DIGITS.  The dump does not agree with either, differing by
+about 0.08%, and this is exactly the discrepancy this contract recorded earlier and deliberately left unresolved:
+what hc_attn_pre-N actually holds, where the divergence is between the dump node and the oracle rather than in the
+engine.
+
+THIS EXPLAINS EVERY FAILURE block_gate REPORTED.  All four were measured against the dump:
+
+    hc_attn_pre  1.760e-05 worst / 4.266e-03 of rms     -> the dump-vs-oracle difference itself
+    attn_norm    1.121e-04 worst / 1.384e-03 of rms     -> the same difference, carried through the norm
+    attn_output  1.4-1.6 of rms                         -> the same difference, amplified by the KDA's gate, since
+                                                            hc_pre's input is what the whole attention site consumes
+    hc_attn_post inherited from attn_output
+
+So there is no engine defect anywhere on this path.  The chain consumes the real block input, produces every stage,
+and matches the oracle at the first stage to seven digits - and the apparent disagreement at later stages is a small
+input difference amplified by an exponential gate acting over a projection chain.
+
+WHAT TO DO ABOUT THE DUMP, recorded so nobody re-opens this unnecessarily: the oracle is the authority for this port
+(the kernels and the chain are all gated against it), so comparisons should use oracle outputs, not this dump.  The
+dump remains useful as a SHAPE source and as a provenance check on what the reference implementation saw; it is not a
+numerical oracle for these stages.  That is a reversal of how block_gate's comparison was first pointed, and the
+reason is recorded here rather than left implicit.
+
+STILL TRUE AND STILL UNEXPLAINED, but now known to be the dump's business and not the engine's: why the dump's
+hc_attn_pre-0 differs from what hc_pre produces on the same input.  Not worth chasing unless the dump is needed as a
+numerical reference, at which point the dump's own configuration (which weights, which eps, which hc stream order)
+would be the place to look.
+
+THE LESSON, in its final form for this session: a comparison is only as good as the provenance of both sides.  The
+engine's stage 1 was right; the dump was a slightly different run; and every "FAIL" that followed was the dump's
+difference being amplified, not the engine's error.  Four separate comparison defects this session had the same root -
+type, shape, size and provenance each assumed rather than checked - and this is the fifth, and the one that took
+longest to see because the numbers were all plausible.
