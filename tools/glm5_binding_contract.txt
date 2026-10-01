@@ -3270,3 +3270,32 @@ WHAT IS ACTUALLY MISSING, restated:
 Items 1, 2, 4 and 5 are assembly over code that exists and is gated.  Item 3 is the one with genuine unknowns, and the
 inventory says it is narrower than it looked: the router, the selection bias and the shared expert are all ordinary
 per-block tensors that already bind, so the streamed pack only has to supply the eight selected experts' gate/up/down.
+
+THE EXPERT PATH IS REUSABLE AFTER ALL - the item I called "the real work" is mostly already built
+
+  ExpertSource is a virtual interface (expert_source.hpp:78):
+      virtual const uint8_t* blob(int64_t layer, int64_t expert) = 0;      the quantized expert blob
+      virtual void begin_layer(int64_t layer, const int32_t* ids, int64_t k)   prefetch hook
+      virtual const uint8_t* device_alias(layer, expert)                   a pinned device pointer, for GPU reads
+      virtual bool pinned(layer, expert) / int64_t reads()
+
+  and there are already two implementations: FileExpertSource and ArenaExpertSource.  FileExpertSource is the one
+  that matters:
+
+      bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err)
+
+  It opens a PACK DIRECTORY - and /home/peb/moredata/strata-pack-glm5/ is a pack directory that already contains
+  native_experts.txt.  So serving GLM's 288 experts is: open the pack dir, then blob(layer, expert).  It also has a
+  cache-complement planner (make_cache_complement_plan over per-layer layer_blob_bytes), cgroup-aware memory sizing,
+  and pinned/device aliases for GPU reads, all of which exist because this port already had to stream experts for the
+  other model - none of which needs reimplementing for GLM.
+
+  What still has to be checked rather than assumed: expert_layout.cpp / native_expert.cpp in kernels/cpu turn a blob
+  into the {gate, up, down} arrays a caller can hand to moe_forward.  If they do, the expert path is complete apart
+  from the GLM blob types (native_experts.txt's rows carry gu_type and d_type, e.g. layer 3 is 16 and 18) being among
+  the types the layout understands - and the dequantizers this session gated bit-exact cover Q5_K and Q6_K, which are
+  the two types the pack uses for the FFN matrices, so the set is likely already covered.
+
+NET EFFECT ON THE PLAN: item 3 shrinks from "the real work, genuine unknowns" to "wire a pack dir into
+FileExpertSource and confirm the blob types".  The remaining substantial piece is item 1 - the loop over trunk blocks
+0..44 with glm_attention_is_mla / glm_ffn_is_dense dispatch - plus the per-kind packing and the head.
