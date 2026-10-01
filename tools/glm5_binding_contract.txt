@@ -4424,3 +4424,39 @@ WHAT IS *NOT* BLOCKED, and it is most of the gate: the 21 tensors are fetched an
 set from the artifact's own numbers, the descriptor matches the pack's blob_bytes exactly, FileExpertSource's interface
 is wired, the oracle's l_out-2 and l_out-3 are the input and reference, and the tool builds and runs.  One decision
 about representing expertless layers stands between this and the first execution of the is_mla and routed branches.
+
+THE BLOCK-3 GATE RUNS: THE is_mla AND ROUTED BRANCHES EXECUTED FOR THE FIRST TIME
+
+    layer 3 experts: gu_type 16, d_type 18, pack blob_bytes 7536640, descriptor bytes 7536640  (MATCH)
+    loaded expert layout: n_layers 46, n_expert 288
+    l_out-2 (block 3's input) ne=[4096,4,5,1] 81920 floats
+    5 token(s) in the dump; running token 4 (the last), block 3, MLA + routed
+    engine l_out: rms 0.0571010654
+    oracle l_out: rms 0.0583536194
+    worst absolute difference 0.0582634   relative to rms 0.998453   ratio 0.97853511
+    BLOCK3 GATE: FAIL
+
+THE BUG THAT BLOCKED IT WAS IN THE ENGINE, AND IT WAS THIS PORT'S FIRST PACK-FACING DEFECT:
+
+FileExpertSource::open validated a CONTIGUOUS 0..n_layers-1 set and never consulted ExpertLayout::first_layer -
+which exists for exactly this case, is set by the loader from the pack's own lowest layer, and whose comment names this
+model ("A model whose first blocks are a dense MLP stem (GLM-5.3-Flash: blocks 0-2) starts its native_experts.txt
+here").  Layers 0-2 hold offset ~0ull and bytes 0 BY DESIGN, so open() refused a layout that was correct, with "the
+native expert layout is invalid at layer 0".  Fixed by starting the validation at first_layer and seeding the running
+offset from it; layer_offsets/layer_blob_bytes stay zeroed for the stem, as the layout's own comment says they should
+("no consumer may ask this table for them").  This is worth recording because it is the first defect found on the
+PACK-FACING side rather than in the GLM arithmetic: nothing in this port had ever loaded a native pack whose model has
+a dense stem, so the path had never been exercised.
+
+THE REMAINING FAIL IS THE GATE'S OWN DOING, and the diagnosis is specific rather than a shrug.  The rms values are close
+(ratio 0.978) while the worst elementwise difference is 99.8% of rms - the signature of a block that computes the right
+KIND of thing and differs structurally, not one that is numerically off.  The cause: the gate feeds token 4 to a FRESH
+MLA cache.  In the oracle's run, MLA layers accumulate a latent per token, so its token-4 output attends to the latents
+of tokens 0-4, while the gate's single call gives the MLA branch one cell and it attends only to itself.  The KDA blocks
+never exposed this because KDA carries its state as a matrix the loop threads correctly; MLA carries it as a GROWING
+CACHE, and the gate never grew it.
+
+So the fix is in the gate and it is small: run the five tokens in order, threading the MLA cache so it accumulates
+exactly as the oracle's does, and compare the LAST token's output against l_out-3.  The oracle dump already holds every
+token, every input and every reference, so nothing new is needed - and this is also the first exercise of the MLA cache
+across tokens, which is the remaining untested mechanism even in the KDA-verified blocks.

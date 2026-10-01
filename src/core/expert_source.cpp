@@ -297,8 +297,14 @@ bool FileExpertSource::open(const std::string& pack_dir, int64_t n_layers, int64
             err = "FileExpertSource: the native expert layout is incomplete";
             return false;
         }
-        uint64_t at = 0;
-        for (int64_t layer = 0; layer < n_layers; ++layer) {
+        // THE STEM MUST BE SKIPPED, and ExpertLayout::first_layer is the authority on where it ends: the loader sets
+        // it from the file's own lowest layer, and its comment names this very model ("GLM-5.3-Flash: blocks 0-2").
+        // Starting at 0 validated a contiguous 0..n_layers-1 set, so GLM was refused at layer 0 with "the native
+        // expert layout is invalid" even though the layout was correct - those layers hold offset ~0ull and bytes 0 BY
+        // DESIGN, and the layout's own comment says no consumer may ask this table for them.  layer_offsets and
+        // layer_blob_bytes are deliberately left at their zeroed values for the stem, for the same reason.
+        uint64_t at = layout.first_layer > 0 ? layout.offset[(size_t) layout.first_layer] : 0;
+        for (int64_t layer = layout.first_layer; layer < n_layers; ++layer) {
             const size_t i = (size_t) layer;
             const uint64_t bytes = (uint64_t) layout.fmt[i].bytes;
             if (layout.offset[i] != at || bytes == 0 || layout.bytes[i] != bytes ||
