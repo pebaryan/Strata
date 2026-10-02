@@ -6384,3 +6384,32 @@ SO THE GROUND TRUTH FOR THE KERNEL IS COMPLETE: the grid in both representations
 50-byte block layout, and the device arithmetic cross-validated against the decode.  What is left is the kernel and its
 bit-exact gate - and the gate now has a reference that has been checked against itself first, which is the order this
 port's discipline requires.
+
+THE ROW ARITHMETIC CLOSES FROM THE PACK'S OWN blob_bytes - FOR 40 OF 43 ROWS, AND THE THREE THAT DO NOT ARE A BLOCKER
+
+    solving 2*(n_embd*n_ff)*gu_bytes/256 + (n_ff*n_embd)*down_bytes/256 == blob_bytes, with n_embd 4096 and n_ff 2048:
+
+      layer  3  gu_type 16 d_type 18: 7,536,640 vs 7,536,640  MATCH   (gu 66 / down  98 B per 256)
+      layer  4  gu_type 19 d_type 18: 6,488,064 vs 6,488,064  MATCH   (gu 50 / down  98)  <- IQ1_S
+      ... all 28 rows with gu_type 19 MATCH at 6,488,064, and all 11 with gu_type 16/d_type 18 MATCH at 7,536,640
+      layer 45  gu_type 10 d_type 11: 9,109,504 vs 9,109,504  MATCH   (gu 84 / down 110)
+      layers 11, 12, 44  gu_type 16 d_type 23: 8,781,824 vs 8,126,464  DEFICIT 1,245,184 each
+
+WHY THIS IS WORTH DOING BEFORE THE KERNEL, and it paid twice.  FIRST, IT CLOSES THE LOOP FROM THE FILE TO THE BLOCK
+LAYOUT: 50 bytes per 256 weights, taken from the reference's struct and its static_assert, reproduces the pack's own
+blob_bytes to the byte for all 28 IQ1_S rows.  That is the same claim as the block-transcription entry above, made
+independently and against data I did not transcribe, so it is evidence rather than a restatement.
+
+SECOND, AND THIS IS THE IMPORTANT PART: IT FOUND THREE ROWS WHOSE DECLARED TYPES DO NOT DESCRIBE THEIR OWN DATA.  Layers
+11, 12 and 44 are declared gu_type 16 (66 B per 256) and d_type 23, and their blob_bytes is 8,781,824 - which no
+combination of those sizes produces; the only pair that reproduces it exactly is gu 76 and down 116 bytes per 256.  So
+either the table's types are wrong for those rows, or the gate and up projections there are not the same type as each
+other (the format declares ONE gu_type for both), or those layers' expert width differs.  WHATEVER THE CAUSE, A DEVICE
+EXPERT PATH THAT TRUSTS THE DECLARED TYPE WOULD READ THE WRONG BLOCK LAYOUT ON THREE OF FORTY-THREE LAYERS and produce
+garbage on exactly the layers whose down projection is d_type 23 - the failure would be concentrated, intermittent and
+easy to mistake for a numerical problem, which is the shape of nearly every bug this port has had.
+
+SO THE ORDER IS: resolve those three rows before the device expert path relies on the declared types, and the way to
+resolve them is a decode of one block from each layer's blob and a comparison against the same weights read from the
+GGUF through the reference's own reader - a measurement rather than an inference from arithmetic, since the arithmetic
+has already told us it cannot decide.
