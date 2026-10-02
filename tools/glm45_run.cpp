@@ -631,7 +631,10 @@ int main(int argc, char** argv) {
     GlmExpertDeviceRuntime expert_device_runtime((size_t) 18 * 1024 * 1024 * 1024);
     C::glm::glm_set_device_expert_ffn(&run_cached_device_expert, &expert_device_runtime);
     C::glm::glm_set_device_moe_ffn(&run_cached_device_moe, &expert_device_runtime);
-    K::kda_set_device_recurrence(true);
+    const char* kda_cuda_env = std::getenv("STRATA_GLM_KDA_CUDA");
+    const bool kda_cuda = !kda_cuda_env || std::strcmp(kda_cuda_env,"0") != 0;
+    K::kda_set_device_recurrence(kda_cuda);
+    std::printf("KDA recurrence: %s\n",kda_cuda?"CUDA":"host");
 
     // ---- bind and map all 45 blocks
     P.bound.resize(N_LAYERS);
