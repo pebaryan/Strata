@@ -97,22 +97,25 @@ int main(int argc, char** argv) {
                 cache[(size_t)row*kv_lora+i]=(float)((int)(((size_t)i*19+(size_t)salt*23+7)%89)-44)*0.002f;};
             auto verify=[&](int n_cache,const char* label){
                 std::vector<float> ref(q.size(),0.0f);
-                const float scale=1.0f/std::sqrt((float)head_dim);
+                const float inv_sqrt_hd=1.0f/std::sqrt((float)head_dim);
                 for(int h=0;h<heads;++h){
                     std::vector<float> score((size_t)n_cache);float best=-INFINITY;
-                    for(int t=0;t<n_cache;++t){float sum=0.0f;for(int i=0;i<kv_lora;++i)
-                        sum+=q[(size_t)h*kv_lora+i]*cache[(size_t)t*kv_lora+i];
-                        score[(size_t)t]=sum*scale;best=std::max(best,score[(size_t)t]);}
+                    for(int t=0;t<n_cache;++t){
+                        float sum=0.0f;
+                        for(int i=0;i<kv_lora;++i)
+                            sum+=q[(size_t)h*kv_lora+i]*cache[(size_t)t*kv_lora+i];
+                        score[(size_t)t]=sum*inv_sqrt_hd;best=std::max(best,score[(size_t)t]);
+                    }
                     double denom=0.0;for(float& z:score){z=std::exp(z-best);denom+=z;}
                     for(int t=0;t<n_cache;++t)for(int i=0;i<kv_lora;++i)
                         ref[(size_t)h*kv_lora+i]+=(float)(score[(size_t)t]/denom)*cache[(size_t)t*kv_lora+i];
                 }
                 char error[256]={};const bool called=glm::mla_attention_cuda(q.data(),cache.data(),n_cache,heads,head_dim,
                     kv_lora,gpu.data(),error,sizeof(error));
-                double worst=0.0,scale=1e-30;for(size_t i=0;i<ref.size();++i){
-                    worst=std::max(worst,std::fabs((double)gpu[i]-ref[i]));scale=std::max(scale,std::fabs((double)ref[i]));}
-                const bool pass=called&&worst/scale<5e-5;
-                std::printf("  cache lifecycle %-12s rel %.3e %s%s\n",label,worst/scale,pass?"PASS":"FAIL",
+                double worst=0.0,ref_scale=1e-30;for(size_t i=0;i<ref.size();++i){
+                    worst=std::max(worst,std::fabs((double)gpu[i]-ref[i]));ref_scale=std::max(ref_scale,std::fabs((double)ref[i]));}
+                const bool pass=called&&worst/ref_scale<5e-5;
+                std::printf("  cache lifecycle %-12s rel %.3e %s%s\n",label,worst/ref_scale,pass?"PASS":"FAIL",
                             called?"":error);all_ok=all_ok&&pass;
             };
             fill_row(0,1);verify(1,"initial");
