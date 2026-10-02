@@ -15,6 +15,7 @@ namespace strata::kernels::glm {
 namespace {
 
 KdaNativeProjectFn g_native_project = nullptr;
+bool g_device_recurrence = false;
 
 /// WHERE THE KDA STAGE'S HOST TIME GOES, phase by phase.  The blocks are 69.9% of the wall time and their projections are
 /// already native, so the remainder is the non-GEMM work - and there are four distinct candidates in here (the input
@@ -73,6 +74,15 @@ void conv1d_silu(const float* conv_w, const float* proj /* [tokens][d_inner] */,
 }  // namespace
 
 void kda_set_native_project(KdaNativeProjectFn fn) { g_native_project = fn; }
+void kda_set_device_recurrence(bool enabled) { g_device_recurrence = enabled; }
+
+#if !defined(STRATA_ENABLE_CUDA)
+bool kda_recurrence_cuda(const float*, const float*, const float*, const float*, const float*, int, int, int,
+                         float*, float*, char* error, size_t error_capacity) {
+    if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return false;
+}
+#endif
 
 void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int tokens, float* out,
                  float* state, const KdaIntermediates* mid, float* conv_state) {
@@ -174,6 +184,26 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
         for (size_t i = 0; i < S.size(); ++i) S[i] = (double) state[i];
     std::vector<double> dec((size_t) hd), delta((size_t) hd), qn((size_t) hd), kn((size_t) hd);
     std::vector<float> attn((size_t) tokens * nh * hd);
+    std::vector<float> qnorm((size_t) tokens * di), knorm((size_t) tokens * di);
+    bool device_done = false;
+    if (g_device_recurrence) {
+        for (int t = 0; t < tokens; ++t) for (int h = 0; h < nh; ++h) {
+            const float* qh = qc.data() + (size_t)t * di + (size_t)h * hd;
+            const float* kh = kc.data() + (size_t)t * di + (size_t)h * hd;
+            double nq=0.0, nk=0.0;
+            for (int i=0;i<hd;++i) { nq+=(double)qh[i]*qh[i]; nk+=(double)kh[i]*kh[i]; }
+            const double iq=1.0/std::max(std::sqrt(nq),(double)KDA_L2_EPS);
+            const double ik=1.0/std::max(std::sqrt(nk),(double)KDA_L2_EPS);
+            for (int i=0;i<hd;++i) {
+                qnorm[(size_t)t*di+(size_t)h*hd+i]=(float)((double)qh[i]*iq);
+                knorm[(size_t)t*di+(size_t)h*hd+i]=(float)((double)kh[i]*ik);
+            }
+        }
+        char cuda_err[256] = {};
+        device_done = kda_recurrence_cuda(qnorm.data(), knorm.data(), vc.data(), gv.data(), beta.data(),
+                                           tokens, nh, hd, state, attn.data(), cuda_err, sizeof(cuda_err));
+        if (!device_done) std::fprintf(stderr, "GLM KDA CUDA recurrence unavailable: %s; using host recurrence\n", cuda_err);
+    }
     for (int t = 0; t < tokens; ++t) {
         for (int h = 0; h < nh; ++h) {
             const float* gth = gv.data() + ((size_t) t * nh + h) * hd;
@@ -193,6 +223,12 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
                 qn[(size_t) i] = (double) qh[i] * iq;
                 kn[(size_t) i] = (double) kh[i] * ik;
                 dec[(size_t) i] = std::exp((double) gth[i]);
+            }
+            if (device_done) {
+                if (mid && mid->q) for (int i=0;i<hd;++i) mid->q[((size_t)t*nh+h)*hd+i]=qnorm[(size_t)t*di+(size_t)h*hd+i];
+                if (mid && mid->k) for (int i=0;i<hd;++i) mid->k[((size_t)t*nh+h)*hd+i]=knorm[(size_t)t*di+(size_t)h*hd+i];
+                if (mid && mid->v) std::memcpy(mid->v+((size_t)t*nh+h)*hd,vh,(size_t)hd*sizeof(float));
+                continue;
             }
             if (mid && mid->q) for (int i = 0; i < hd; ++i) mid->q[((size_t) t * nh + h) * hd + i] = (float) qn[(size_t) i];
             if (mid && mid->k) for (int i = 0; i < hd; ++i) mid->k[((size_t) t * nh + h) * hd + i] = (float) kn[(size_t) i];
@@ -227,7 +263,7 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
             }
         }
     }
-    if (state)
+    if (state && !device_done)
         for (size_t i = 0; i < S.size(); ++i) state[i] = (float) S[i];
     if (mid && mid->attn) std::memcpy(mid->attn, attn.data(), attn.size() * sizeof(float));
     const double tm_rec = lap();

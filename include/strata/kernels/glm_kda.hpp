@@ -25,6 +25,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 namespace strata::kernels::glm {
 
@@ -60,6 +61,13 @@ struct KdaWeights {
 using KdaNativeProjectFn = bool (*)(int count, const void* const* weights, const int* types,
                                     const float* x, int n_in, int n_out, float* const* out);
 void kda_set_native_project(KdaNativeProjectFn fn);
+
+/// Enable the CUDA delta-rule recurrence in kda_forward.  The caller still owns the host state; this path
+/// stages it to/from the device and is intended for the token-serial GLM runner until its state is made resident.
+void kda_set_device_recurrence(bool enabled);
+bool kda_recurrence_cuda(const float* q, const float* k, const float* v, const float* g, const float* beta,
+                         int tokens, int nh, int hd, float* state, float* attn,
+                         char* error, size_t error_capacity);
 
 /// Print the KDA stage's host-time breakdown, phase by phase.  Diagnostics only.
 void kda_print_profile();

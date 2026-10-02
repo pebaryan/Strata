@@ -68,6 +68,7 @@ option(STRATA_WERROR "Treat compiler warnings as errors" OFF)
 
 if(STRATA_ENABLE_CUDA)
   enable_language(CUDA)
+  add_compile_definitions(STRATA_ENABLE_CUDA=1)
   # `enable_language(CUDA)` gives the .cu compile rules but NOT the imported targets, so `CUDA::cudart` has to
   # be brought in explicitly for the host-side tests that call cudaMalloc themselves.
   find_package(CUDAToolkit REQUIRED)
@@ -169,6 +170,9 @@ target_compile_options(glm_indexer_parity PRIVATE -O2)
 add_executable(glm_kda_parity src/kernels/glm_kda_parity.cpp src/kernels/glm_kda.cpp)
 target_include_directories(glm_kda_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_kda_parity PRIVATE -O2)
+if(STRATA_ENABLE_CUDA)
+  target_link_libraries(glm_kda_parity PRIVATE strata_kernels CUDA::cudart)
+endif()
 
 # 9.1's pass check: bind layer 0 from the pack with the ENGINE'S OWN loader (WeightTable + LayerView) and
 # print a checksum per bound tensor, for tools/glm5_bind_check.py to diff against the verified oracle's
@@ -395,6 +399,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   target_include_directories(strata_kernels PRIVATE third_party/ggml)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
   if(STRATA_ENABLE_CUDA)
+    target_sources(strata_kernels PRIVATE src/kernels/cuda/glm_kda_recurrence.cu)
     set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
       src/kernels/cuda/native_gr_norm.cu
       src/kernels/cuda/native_moe.cu
