@@ -525,7 +525,7 @@ int main(int argc, char** argv) {
     C::NativeDense nd;
     if (!nd.load(shards, table, err)) { std::fprintf(stderr, "native: %s\n", err.c_str()); return 1; }
     C::NativeEmbed native_embed;
-    if (serve && (shards.size() < 2 || !native_embed.load(shards[1], N_EMBD, 154880, err))) {
+    if (serve && (shards.size() < 2 || !native_embed.load(shards, N_EMBD, 154880, err))) {
         std::fprintf(stderr, "embedding: %s\n", err.c_str());
         return 1;
     }
@@ -535,7 +535,7 @@ int main(int argc, char** argv) {
     // reported it as the trunk's cost.  Unavailable is a fallback rather than a failure, so the gate still runs on a
     // machine or a shard set where the native head cannot load.
     C::NativeHead native_head;
-    if (shards.size() < 2 || !native_head.load(shards[1], N_EMBD, 154880, err)) {
+    if (shards.size() < 2 || !native_head.load(shards, N_EMBD, 154880, err)) {
         std::fprintf(stderr, "output head: CUDA head unavailable (%s) - falling back to the CPU projection\n",
                      err.c_str());
     }

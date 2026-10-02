@@ -16,6 +16,7 @@
 namespace strata::kernels::cpu {
 
 struct ExpertLayout {
+    int version = 0;
     bool native = false;
     int64_t n_layers = 0, n_expert = NE;
     /// The lowest layer that HAS experts.  A model whose first blocks are a dense MLP stem (GLM-5.3-Flash:
@@ -57,6 +58,7 @@ const ExpertLayout& expert_layout();
 /// `hidden` and `expert_ffn` are the model's expert geometry; 0 means the compiled-in qwen4exp defaults
 /// (2560 / 640).  GLM-5.3-Flash needs 4096 / 2048, and with the wrong pair the block-size check refuses
 /// the layer instead of decoding it wrongly (native_fmt), so this is a refusal to get right, not a guess.
+inline constexpr int kExpertLayoutVersion = 4;
 bool expert_layout_load(const std::string& pack_dir, int64_t n_layers, int64_t n_expert, std::string& err,
                         int64_t hidden = 0, int64_t expert_ffn = 0);
 
