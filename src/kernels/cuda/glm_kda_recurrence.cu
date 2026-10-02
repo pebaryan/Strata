@@ -30,7 +30,8 @@ __global__ void kda_recur(const float* q, const float* k, const float* v, const 
         const size_t row=((size_t)t*nh+h)*hd;
         if (tid<hd) {
             float sum=0.0f;
-            for (int i=0;i<hd;++i) sum=fmaf(state[state_off+(size_t)i*hd+tid], k[row+i], sum);
+            for (int i=0;i<hd;++i)
+                sum=fmaf(state[state_off+(size_t)i*hd+tid]*expf(g[row+i]), k[row+i], sum);
             pred[tid]=sum;
         }
         __syncthreads();
