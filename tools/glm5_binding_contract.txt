@@ -6282,3 +6282,26 @@ WHAT IS STILL MISSING BEFORE THE KERNEL CAN BE WRITTEN:
 WHAT IS SETTLED: the scope (IQ1_S alone reaches 42 of 43 layers), the block size so the row arithmetic can be checked
 against the pack's blob_bytes (50/256), and the gate's shape - a bit-exact comparison against a numpy transcription of
 the reference, with the fixture first checked against itself by dequantising and re-quantising through both paths.
+
+IQ1_S'S GRID IS EXTRACTED, BOTH COPIES, AND THE FIXTURE WAS CHECKED AGAINST ITSELF FIRST
+
+    source     llama.cpp-glm5/ggml/src/ggml-common.h:1135, GGML_TABLE_BEGIN(uint64_t, iq1s_grid, NGRID_IQ1S)
+    extracted  2048 entries, each a uint64 read as 8 SIGNED BYTES - which is exactly the decode's grid[0..7] for one
+               sub-block of 8 weights, so no repacking is needed between the reference and the kernel
+    written    tools/iq1s_grid.npy             (2048 x 8 int8)      for the oracle
+               src/kernels/cuda/iq1s_grid.h    (uint64_t[2048])      for the kernel, 16 KB, __constant__ sized
+    checked    round trip uint64 -> int8[8] -> uint64 identical: True
+
+AND THE FIXTURE AGREES WITH ITSELF, which is the rule this port keeps re-learning the hard way: every extracted value lies
+in {-1, 0, +1}, which is what a one-bit-per-weight grid plus a delta MUST be - three values, because the delta carries the
+zero and the grid bit carries the sign of the magnitude.  If the extraction had misread the table macro's own argument
+list as data, or dropped an entry, the range would not have come out clean.  First entries are [-1 x8], [1,-1 x7] and
+[0,0,-1 x6], which are the expected shapes for the smallest and next-smallest indices.
+
+ALSO NOTED FOR LATER: ggml-common.h:1650 defines a second table, iq1s_grid_gpu (uint32_t, NGRID_IQ1S), which llama.cpp's
+own CUDA kernel uses.  A device kernel may want that packed form instead of the uint64 one - it is worth reading before
+writing the kernel's inner loop, because the upstream device path already solved whatever packing it needed and the
+transcription should follow it rather than invent a layout.
+
+REMAINING BEFORE THE KERNEL: ggml_vec_dot_iq1_s_q8_K's integer arithmetic - the accumulation pattern and where the
+per-block scales enter - because that is what bit-exactness must be defined against.
