@@ -7071,3 +7071,32 @@ THE FORMAT QUESTION, ANSWERED BY MEASUREMENT: THE CPU SIDE IS Q8_K, THE DEVICE S
     chain, which is why the acceptance gate (argmax 12089) is the test that matters and a per-expert parity gate alone
     cannot clear the stage.  Note also the direction of the fix if divergence ever shows up: the CPU side is the reference
     here only because it is the one that has been validated end to end, not because Q8_K is more correct than Q8_1.
+
+THE ERROR IS A PROPERTY OF THE ACTIVATION FORMAT, NOT THE WEIGHTS: 1.705-1.886% ACROSS ALL EIGHT LAYERS TESTED
+
+    layer  3  1.705%   (16,18)      layer 11  1.784%   (16,23)
+    layer 10  1.874%   (16,18)      layer 12  1.880%   (16,23)
+    layer 15  1.755%   (16,18)      layer 44  1.826%   (16,23)
+    layer 17  1.886%   (16,18)
+    layer 21  1.857%   (16,18)
+
+    An 0.18 percentage-point band across EIGHT layers, and - the part that matters - across BOTH weight classes.  The
+    (16,18) layers have IQ2_XXS gate/up with IQ3_XXS down and the (16,23) layers have the same gate/up with IQ4_XS down,
+    i.e. different weight types, different block sizes, different byte counts, and the error is the same to within a fifth
+    of a percent.  So the difference is not where the weights are stored; it is where the ACTIVATION is quantised, which is
+    Q8_K super-blocks on the CPU side and Q8_1 32-element blocks on the device side.  That is the format measurement
+    predicting the outcome of a different experiment, and the prediction holding.
+
+    AND THE CLASS CENSUS, WHICH CLOSES THE "14 OF 43" QUESTION PROPERLY:
+      (16,18) 11 layers [3, 10, 15, 17, ...]      (19,18) 28 layers [4, 5, 6, 7, ...]
+      (16,23)  3 layers [11, 12, 44]              (10,11)  1 layer  [45]
+    so 14 of 43 layers are servable on the PER-EXPERT path - 11 plus 3 - and the gate refuses (19,18) on layers 4 and 5
+    with the guard's message rather than dying, which is the behaviour the std::exit(1) default made necessary.  The same
+    14 figure was WRONG for the grouped path (three layers), and RIGHT for this one, which is the whole reason the design
+    changed: a capability figure is meaningless without naming the entry point it belongs to.
+
+    WHAT REMAINS FOR THE STAGE: the 14 servable layers can be wired now, and the ~1.8% per-expert difference means the
+    trunk accumulates about 1.8% per routed layer over 43 layers per token, so argmax 12089 on the acceptance gate is the
+    only test that can clear it.  For the other 29 layers, the gap is unchanged and precisely known: IQ1_S (type 19) needs
+    a kernel for 28 of them, and Q2_K (10) plus Q3_K (11) for layer 45 - and IQ1_S is already fully transcribed, both
+    grids agreeing 2048/2048 and the integer DP4A arithmetic written down.
