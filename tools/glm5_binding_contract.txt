@@ -5855,3 +5855,36 @@ WHERE THE CUDA PORT GOES FIRST, BY MEASURED COST, NOT BY GUESS:
 
   The expert GEMVs are worth doing in the same pass as (2) and (3) but they are not where the seconds are in this
   profile: the routed experts are 8 of 288 per layer per token, whereas the dense projections run over every row.
+
+STEP ONE OF THE CUDA PORT IS DONE: THE HEAD IS ON THE DEVICE AND THE GATE STILL PASSES
+
+    head: native (CUDA) over 154880 x 4096
+    PROFILE 21002.7 ms for 5 tokens = 4200.5 ms/token (0.24 tok/s)     [was 4772.0 ms/token at 0.21 tok/s]
+      stem 0-2 :   3499.6 ms  16.7%
+      34 KDA   :  10277.9 ms  48.9%
+      11 MLA   :   7225.2 ms  34.4%
+      heaviest block: layer 0 at 1249.1 ms
+    argmax = 12089   (logit 17.233259)   expected 12089
+    ENGINE TOKEN: PASS
+
+THE CHANGE WAS ONE GATE, NOT A KERNEL: the CUDA head was loaded only when serving, so the acceptance run measured the
+CPU projection and the profile reported the head's 3.1 seconds as the trunk's cost, attributed to whatever layer was
+live.  It is now loaded whenever the shards allow, with the CPU projection as a fallback rather than the default, and the
+runner prints which head it used so the measurement is never ambiguous again.  The layer-44 artefact in the previous
+profile is gone - the heaviest block is now layer 0 at 1249 ms - which confirms that the 3.1 seconds was the head and not
+the last block, exactly as the attribution had implied.
+
+AND THE ACCEPTANCE GATE CROSS-CHECKS TWO INDEPENDENT HEADS.  The CPU projection and the CUDA native head are different
+implementations of the same 154,880 x 4,096 projection - one float32 over a resident matrix, one a quantized MMVQ over
+the artifact's own blocks - and they agree on the token while differing in the logit:
+
+    CPU      17.230408
+    CUDA     17.233259
+
+    the same argmax (12089) and different logits is the correct relationship between two implementations at different
+    precisions, and it is a stronger statement than either alone: the token is not an artefact of one arithmetic.
+
+WHAT REMAINS, in the order the profile dictates: the 34 KDA blocks at 48.9% (about 0.6 s per block per token - the
+wq/wk/wv/wo projections, which are exactly native_mmvq's shape over the pack's quantized rows, plus conv, gates and the
+delta-rule recurrence as small kernels), then the 11 MLA blocks at 34.4% with the same treatment, then the stem at 16.7%,
+and the expert type gap (19 IQ1_S over 28 rows, 10 Q2_K and 11 Q3_K one row each) alongside them.

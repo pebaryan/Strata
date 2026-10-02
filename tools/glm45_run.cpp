@@ -433,11 +433,18 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "embedding: %s\n", err.c_str());
         return 1;
     }
+    // THE CUDA HEAD IS LOADED EVEN IN THE DIAGNOSTIC RUN.  It is not gated on serve any more, because the head is the
+    // largest single item in the profile - 3.1 of 4.8 seconds per token for one 154,880 x 4,096 projection - and its
+    // device path already exists here; gating it on serve meant the acceptance run measured the CPU projection and
+    // reported it as the trunk's cost.  Unavailable is a fallback rather than a failure, so the gate still runs on a
+    // machine or a shard set where the native head cannot load.
     C::NativeHead native_head;
-    if (serve && (shards.size() < 2 || !native_head.load(shards[1], N_EMBD, 154880, err))) {
-        std::fprintf(stderr, "output head: %s\n", err.c_str());
-        return 1;
+    if (shards.size() < 2 || !native_head.load(shards[1], N_EMBD, 154880, err)) {
+        std::fprintf(stderr, "output head: CUDA head unavailable (%s) - falling back to the CPU projection\n",
+                     err.c_str());
     }
+    const bool head_cuda = native_head.loaded();
+    std::printf("head: %s\n", head_cuda ? "native (CUDA) over 154880 x 4096" : "CPU projection (fallback)");
     std::printf("arena %.2f GB, %zu tensors served from the GGUF\n", bytes / 1073741824.0, served.size());
 
     // ---- geometry.  The clamps are set EXPLICITLY: their defaults are 0.0f, which DISABLES them, and the header
@@ -670,8 +677,8 @@ int main(int argc, char** argv) {
     std::vector<float> l_out((size_t) HC * N_EMBD), hidden((size_t) N_EMBD), x((size_t) HC * N_EMBD);
     float *d_embed = nullptr, *d_hidden = nullptr, *d_logits = nullptr;
     cudaStream_t head_stream = nullptr;
-    std::vector<float> logits(serve ? (size_t) vocab : 0);
-    if (serve && (cudaMalloc(&d_embed, (size_t) N_EMBD * sizeof(float)) != cudaSuccess ||
+    std::vector<float> logits(head_cuda ? (size_t) vocab : 0);
+    if (head_cuda && (cudaMalloc(&d_embed, (size_t) N_EMBD * sizeof(float)) != cudaSuccess ||
                   cudaMalloc(&d_hidden, (size_t) N_EMBD * sizeof(float)) != cudaSuccess ||
                   cudaMalloc(&d_logits, (size_t) vocab * sizeof(float)) != cudaSuccess ||
                   cudaStreamCreateWithFlags(&head_stream, cudaStreamNonBlocking) != cudaSuccess)) {
@@ -688,8 +695,9 @@ int main(int argc, char** argv) {
         if (!C::glm::glm_trunk_forward(in, N_LAYERS, provider, &P, P.kda_g, P.mla_g, EPS, st, l_out.data(), nullptr,
                                        err, 0, diagnostic ? &stage_cb : nullptr, diagnostic ? &sc : nullptr)) return false;
         if (!C::glm::glm_stage_head_mean_norm(l_out.data(), HC, N_EMBD, onorm.data(), hidden.data(), err)) return false;
-        if (!serve)
-            return C::glm::glm_stage_head_project(output_w.data(), (int) vocab, N_EMBD, hidden.data(), best, best_logit, err);
+        if (!head_cuda)
+            return C::glm::glm_stage_head_project(output_w.data(), (int) vocab, N_EMBD, hidden.data(), best, best_logit,
+                                                  err);
         if (cudaMemcpyAsync(d_hidden, hidden.data(), (size_t) N_EMBD * sizeof(float), cudaMemcpyHostToDevice,
                             head_stream) != cudaSuccess ||
             !native_head.run(d_hidden, d_logits, (void*) head_stream, err) ||
