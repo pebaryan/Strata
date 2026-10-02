@@ -87,6 +87,39 @@ int main(int argc, char** argv) {
                         pass?"PASS":"FAIL",call_ok?"":error);
             all_ok=all_ok&&pass;
         }
+        // Exercise the runner's real cache lifecycle: first row, one-row append, same-depth rewrite, then reset.
+        // The host pointer stays fixed so the CUDA path must distinguish incremental updates from rewritten state.
+        {
+            const int heads=4,head_dim=8,kv_lora=16,capacity=4;
+            std::vector<float> q((size_t)heads*kv_lora),cache((size_t)capacity*kv_lora),gpu(q.size());
+            for(size_t i=0;i<q.size();++i)q[i]=(float)((int)((i*13+5)%71)-35)*0.003f;
+            auto fill_row=[&](int row,int salt){for(int i=0;i<kv_lora;++i)
+                cache[(size_t)row*kv_lora+i]=(float)((int)(((size_t)i*19+(size_t)salt*23+7)%89)-44)*0.002f;};
+            auto verify=[&](int n_cache,const char* label){
+                std::vector<float> ref(q.size(),0.0f);
+                const float scale=1.0f/std::sqrt((float)head_dim);
+                for(int h=0;h<heads;++h){
+                    std::vector<float> score((size_t)n_cache);float best=-INFINITY;
+                    for(int t=0;t<n_cache;++t){float sum=0.0f;for(int i=0;i<kv_lora;++i)
+                        sum+=q[(size_t)h*kv_lora+i]*cache[(size_t)t*kv_lora+i];
+                        score[(size_t)t]=sum*scale;best=std::max(best,score[(size_t)t]);}
+                    double denom=0.0;for(float& z:score){z=std::exp(z-best);denom+=z;}
+                    for(int t=0;t<n_cache;++t)for(int i=0;i<kv_lora;++i)
+                        ref[(size_t)h*kv_lora+i]+=(float)(score[(size_t)t]/denom)*cache[(size_t)t*kv_lora+i];
+                }
+                char error[256]={};const bool called=glm::mla_attention_cuda(q.data(),cache.data(),n_cache,heads,head_dim,
+                    kv_lora,gpu.data(),error,sizeof(error));
+                double worst=0.0,scale=1e-30;for(size_t i=0;i<ref.size();++i){
+                    worst=std::max(worst,std::fabs((double)gpu[i]-ref[i]));scale=std::max(scale,std::fabs((double)ref[i]));}
+                const bool pass=called&&worst/scale<5e-5;
+                std::printf("  cache lifecycle %-12s rel %.3e %s%s\n",label,worst/scale,pass?"PASS":"FAIL",
+                            called?"":error);all_ok=all_ok&&pass;
+            };
+            fill_row(0,1);verify(1,"initial");
+            fill_row(1,2);verify(2,"append");
+            fill_row(0,3);verify(2,"rewrite");
+            fill_row(0,4);verify(1,"reset");
+        }
         {
             glm::MlaGeometry g; g.n_embd=32;g.n_head=2;g.head_dim=8;g.kv_lora=16;g.q_lora=12;
             const int ncache=257,qdim=g.n_head*g.head_dim;
