@@ -6248,3 +6248,37 @@ SO THE FIRST KERNEL TO WRITE IS IQ1_S AND NOTHING ELSE, and the discipline for i
 this port: transcribe the reference's block layout and vec_dot into a CUDA kernel, then gate it BIT-EXACT against a numpy
 transcription of ggml's own code - the way dequant_q5_K (16fd02f) and dequant_q6_K were gated, not against the code it was
 transcribed from.  The other two types are single-layer follow-ups and are not on the critical path.
+
+IQ1_S, TRANSCRIBED FROM THE REFERENCE: WHAT THE KERNEL NEEDS AND WHAT IS STILL MISSING
+
+    upstream: /home/peb/llama.cpp-glm5/ggml/src/ggml-quants.c, ggml-common.h
+
+THE BLOCK, 50 BYTES PER 256 WEIGHTS (ggml-common.h:429, static_assert confirms it):
+
+    typedef struct { ggml_half d; uint8_t qs[QK_K/8]; uint8_t qh[QK_K/16]; } block_iq1_s;
+                    ^ 2 bytes      ^ 32 bytes          ^ 16 bytes (read as uint16_t[8])
+
+THE DECODE, read off dequantize_row_iq1_s (ggml-quants.c:2650) rather than recalled:
+
+    d     = fp16(x.d)                                     per block
+    dl    = d * (2*((qh[ib] >> 12) & 7) + 1)              per group of 32, a 3-bit scale
+    delta = (qh[ib] & 0x8000) ? -IQ1S_DELTA : IQ1S_DELTA  per group, IQ1S_DELTA = 0.125f
+    grid  = iq1s_grid[qs[l] | (((qh[ib] >> 3*l) & 7) << 8)]     an 11-bit index
+    y[j]  = dl * (grid[j] + delta)                        for j in 0..7, four l per group
+
+    8 groups of 32 per block; within a group, four sub-blocks of 8 weights, each taking its high grid bits from a
+    different 3-bit field of qh[ib] and its low 8 bits from one byte of qs.  So the index is 3+8 = 11 bits, which is
+    exactly why iq1s_grid has 2,048 entries of int8[8] - 16 KB, small enough for a __constant__ table on the device.
+
+WHAT IS STILL MISSING BEFORE THE KERNEL CAN BE WRITTEN:
+  1. the iq1s_grid table itself, 2,048 x 8 int8, to be lifted from the reference into both a __constant__ array for the
+     kernel and a numpy copy for the oracle - the layout above names the index but not the contents;
+  2. ggml_vec_dot_iq1_s_q8_K's integer arithmetic, because MMVQ does NOT compute a float dot of dequantised weights:
+     it accumulates quantised products with per-block scales, so bit-exactness has to be defined against THAT function
+     and not against a dequantise-then-dot, which would agree only to within rounding.
+  3. the iq_row_bytes and iq_supported entries for type 19 (iq_mmvq dispatches 16, 17, 18, 20, 21, 22, 23, 29, 42 and
+     iq_row_bytes has 11 with no kernel case).
+
+WHAT IS SETTLED: the scope (IQ1_S alone reaches 42 of 43 layers), the block size so the row arithmetic can be checked
+against the pack's blob_bytes (50/256), and the gate's shape - a bit-exact comparison against a numpy transcription of
+the reference, with the fixture first checked against itself by dequantising and re-quantising through both paths.
