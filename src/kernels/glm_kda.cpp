@@ -195,9 +195,7 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     auto kd_t3 = kd_t();
     // the recurrence, per head.  Decay first (S[i][:] *= exp(g[i]) - the gate index is S's FIRST index),
     // then the delta-rule correction, then the read, which happens AFTER the update.
-    std::vector<double> S((size_t) nh * hd * hd, 0.0);
-    if (state)
-        for (size_t i = 0; i < S.size(); ++i) S[i] = (double) state[i];
+    std::vector<double> S;
     std::vector<double> dec((size_t) hd), delta((size_t) hd), qn((size_t) hd), kn((size_t) hd);
     std::vector<float> attn((size_t) tokens * nh * hd);
     std::vector<float> qnorm((size_t) tokens * di), knorm((size_t) tokens * di);
@@ -219,6 +217,13 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
         device_done = kda_recurrence_cuda(qnorm.data(), knorm.data(), vc.data(), gv.data(), beta.data(),
                                            tokens, nh, hd, state, attn.data(), cuda_err, sizeof(cuda_err));
         if (!device_done) std::fprintf(stderr, "GLM KDA CUDA recurrence unavailable: %s; using host recurrence\n", cuda_err);
+    }
+    // The device path owns the recurrence state and returns it to the host for reset/checkpoint semantics. Avoid
+    // constructing and converting the full double-precision host state on every decode step when CUDA succeeded.
+    if (!device_done) {
+        S.assign((size_t) nh * hd * hd, 0.0);
+        if (state)
+            for (size_t i = 0; i < S.size(); ++i) S[i] = (double) state[i];
     }
     for (int t = 0; t < tokens; ++t) {
         for (int h = 0; h < nh; ++h) {
