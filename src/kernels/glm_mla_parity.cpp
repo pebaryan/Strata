@@ -52,8 +52,46 @@ void compare(const char* what, const std::vector<float>& got, const float* want,
 }  // namespace
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--attention-selftest") {
+        const int heads=4,head_dim=256,kv_lora=512;
+        bool all_ok=true;
+        for (int n_cache : {1,5,257,8192}) {
+            std::vector<float> q((size_t)heads*kv_lora),cache((size_t)n_cache*kv_lora);
+            for(size_t i=0;i<q.size();++i) q[i]=(float)((int)((i*17+3)%101)-50)*0.001f;
+            for(size_t i=0;i<cache.size();++i) cache[i]=(float)((int)((i*29+7)%127)-63)*0.001f;
+            std::vector<float> cpu(q.size(),0.0f),gpu(q.size(),0.0f);
+            const float scale=1.0f/std::sqrt((float)head_dim);
+            for(int h=0;h<heads;++h) {
+                std::vector<float> scores((size_t)n_cache);
+                float best=-INFINITY;
+                for(int t=0;t<n_cache;++t) {
+                    float sum=0.0f;
+                    for(int i=0;i<kv_lora;++i) sum+=q[(size_t)h*kv_lora+i]*cache[(size_t)t*kv_lora+i];
+                    scores[(size_t)t]=sum*scale; best=std::max(best,scores[(size_t)t]);
+                }
+                double denom=0.0;
+                for(float& s:scores) { s=std::exp(s-best); denom+=s; }
+                for(int t=0;t<n_cache;++t) for(int i=0;i<kv_lora;++i)
+                    cpu[(size_t)h*kv_lora+i]+=(float)(scores[(size_t)t]/denom)*cache[(size_t)t*kv_lora+i];
+            }
+            char error[256]={};
+            const bool call_ok=glm::mla_attention_cuda(q.data(),cache.data(),n_cache,heads,head_dim,kv_lora,
+                                                        gpu.data(),error,sizeof(error));
+            double max_abs=0.0,scale_ref=1e-30;
+            if(call_ok) for(size_t i=0;i<cpu.size();++i) {
+                max_abs=std::max(max_abs,std::fabs((double)gpu[i]-cpu[i]));
+                scale_ref=std::max(scale_ref,std::fabs((double)cpu[i]));
+            }
+            const bool pass=call_ok&&max_abs/scale_ref<2e-5;
+            std::printf("  cache %-5d max abs %.3e (%.2e of scale) %s%s\n",n_cache,max_abs,max_abs/scale_ref,
+                        pass?"PASS":"FAIL",call_ok?"":error);
+            all_ok=all_ok&&pass;
+        }
+        std::printf("MLA CUDA attention selftest: %s\n",all_ok?"PASS":"FAIL");
+        return all_ok?0:1;
+    }
     if (argc < 2) {
-        std::printf("usage: glm_mla_parity <fixture.bin>   (tools/glm5_mla_reference.py --raw-fixture)\n");
+        std::printf("usage: glm_mla_parity <fixture.bin> | --attention-selftest\n");
         return 2;
     }
     std::FILE* f = std::fopen(argv[1], "rb");

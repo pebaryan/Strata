@@ -158,6 +158,9 @@ target_compile_options(glm_hc_parity PRIVATE -O2)
 add_executable(glm_mla_parity src/kernels/glm_mla_parity.cpp src/kernels/glm_mla.cpp)
 target_include_directories(glm_mla_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_mla_parity PRIVATE -O2)
+if(STRATA_ENABLE_CUDA)
+  target_link_libraries(glm_mla_parity PRIVATE strata_kernels CUDA::cudart)
+endif()
 
 # Indexer parity (branch glm5next-port): the 4:1 key pool and the whole-pool selection, against
 # tools/glm5_indexer_reference.py.
@@ -400,6 +403,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # Match the pinned llama.cpp CUDA arithmetic contract for this adapter only.
   if(STRATA_ENABLE_CUDA)
     target_sources(strata_kernels PRIVATE src/kernels/cuda/glm_kda_recurrence.cu)
+    target_sources(strata_kernels PRIVATE src/kernels/cuda/glm_mla_attention.cu)
     set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
       src/kernels/cuda/native_gr_norm.cu
       src/kernels/cuda/native_moe.cu
