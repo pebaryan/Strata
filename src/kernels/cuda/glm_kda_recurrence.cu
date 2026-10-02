@@ -1,8 +1,10 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstdio>
+#include <cstring>
 #include <mutex>
 #include <unordered_map>
+#include <vector>
 
 namespace strata::kernels::glm {
 namespace {
@@ -12,11 +14,18 @@ struct Scratch {
     size_t q_cap=0,k_cap=0,v_cap=0,g_cap=0,beta_cap=0,state_cap=0,attn_cap=0;
     size_t x_cap=0,fa_cap=0,fb_cap=0,beta_pre_cap=0,gate_cap=0,beta_out_cap=0;
     std::unordered_map<const float*,std::pair<size_t,float*>> resident_weights;
+    struct ResidentState {
+        size_t count=0;
+        float* device=nullptr;
+        std::vector<float> host_shadow;
+    };
+    std::unordered_map<const float*,ResidentState> resident_states;
     std::mutex mutex;
     ~Scratch() {
         cudaFree(q); cudaFree(k); cudaFree(v); cudaFree(g); cudaFree(beta); cudaFree(state); cudaFree(attn);
         cudaFree(x); cudaFree(fa); cudaFree(fb); cudaFree(beta_pre); cudaFree(gate_out); cudaFree(beta_out);
         for (auto& kv:resident_weights) cudaFree(kv.second.second);
+        for (auto& kv:resident_states) cudaFree(kv.second.device);
     }
     bool reserve(float*& p, size_t& cap, size_t need) {
         if (p && need <= cap) return true;
@@ -110,16 +119,43 @@ bool kda_recurrence_cuda(const float* q, const float* k, const float* v, const f
         (e=cudaMemcpy(s.g,g,seq*sizeof(float),cudaMemcpyHostToDevice))!=cudaSuccess ||
         (e=cudaMemcpy(s.beta,beta,(size_t)tokens*nh*sizeof(float),cudaMemcpyHostToDevice))!=cudaSuccess)
         return fail(cudaGetErrorString(e));
-    if (state) e=cudaMemcpy(s.state,state,st*sizeof(float),cudaMemcpyHostToDevice);
-    else e=cudaMemset(s.state,0,st*sizeof(float));
+    float* state_device=s.state;
+    if (state) {
+        auto it=s.resident_states.find(state);
+        if (it==s.resident_states.end() || it->second.count!=st) {
+            if (it!=s.resident_states.end()) {
+                cudaFree(it->second.device);
+                s.resident_states.erase(it);
+            }
+            Scratch::ResidentState entry;
+            entry.count=st;
+            if (cudaMalloc(&entry.device,st*sizeof(float))!=cudaSuccess)
+                return fail("CUDA resident state allocation failed");
+            entry.host_shadow.assign(state,state+st);
+            e=cudaMemcpy(entry.device,state,st*sizeof(float),cudaMemcpyHostToDevice);
+            if (e!=cudaSuccess) { cudaFree(entry.device); return fail(cudaGetErrorString(e)); }
+            it=s.resident_states.emplace(state,std::move(entry)).first;
+        } else if (std::memcmp(it->second.host_shadow.data(),state,st*sizeof(float))!=0) {
+            // The host buffer is authoritative: a request reset or external state edit invalidates residency.
+            e=cudaMemcpy(it->second.device,state,st*sizeof(float),cudaMemcpyHostToDevice);
+            if (e!=cudaSuccess) return fail(cudaGetErrorString(e));
+            it->second.host_shadow.assign(state,state+st);
+        }
+        state_device=it->second.device;
+    } else {
+        e=cudaMemset(s.state,0,st*sizeof(float));
+    }
     if (e!=cudaSuccess) return fail(cudaGetErrorString(e));
-    kda_recur<<<nh,256,(size_t)2*hd*sizeof(float)>>>(s.q,s.k,s.v,s.g,s.beta,tokens,nh,hd,s.state,s.attn);
+    kda_recur<<<nh,256,(size_t)2*hd*sizeof(float)>>>(s.q,s.k,s.v,s.g,s.beta,tokens,nh,hd,state_device,s.attn);
     if ((e=cudaGetLastError())!=cudaSuccess || (e=cudaDeviceSynchronize())!=cudaSuccess)
         return fail(cudaGetErrorString(e));
     if ((e=cudaMemcpy(attn,s.attn,seq*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)
         return fail(cudaGetErrorString(e));
-    if (state && (e=cudaMemcpy(state,s.state,st*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)
-        return fail(cudaGetErrorString(e));
+    if (state) {
+        if ((e=cudaMemcpy(state,state_device,st*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)
+            return fail(cudaGetErrorString(e));
+        s.resident_states.find(state)->second.host_shadow.assign(state,state+st);
+    }
     if (error && error_capacity) error[0]='\0';
     return true;
 }
