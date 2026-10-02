@@ -187,12 +187,12 @@ target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::c
 # SAME blob.  This is the gate for the design the grouped kernel cannot serve, since its down switch has no case for the
 # type 18 that 39 of 43 layers use.
 #
-# IT IS COMPILED BUT NOT YET LINKED, AND DELIBERATELY NOT LEFT IN THE BUILD.  It resolves the CPU native kernels against
-# strata_kernels_cpu, but FileExpertSource is not in strata_core - so the one remaining step is the library that already
-# provides src/core/expert_source.cpp to glm45_run.  A target that does not link cannot be left in the tree: every commit
-# here builds, and a permanently red target would train the next reader to ignore a red build.  Re-enable it by adding the
-# missing library and confirming it links.
-# add_executable(expert_parity_gate tools/expert_parity_gate.cpp)
+# IT COMPILES AND IS ONE LINK LINE SHORT OF RUNNING, AND THE LINE IS KNOWN: glm45_run's own target compiles
+# src/core/expert_source.cpp AND src/core/expert_cache.cpp into its executable (its line lists both), and expert_source
+# additionally references RemoteExperts.  So the fix is to add those two - and remote_experts.cpp if the linker still asks -
+# to the add_executable below.  Until that is done and verified, the target stays COMMENTED OUT: a permanently red target
+# in a tree whose rule is that every commit builds would train the next reader to ignore a red build.
+# add_executable(expert_parity_gate tools/expert_parity_gate.cpp src/core/expert_source.cpp src/core/expert_cache.cpp)
 # target_include_directories(expert_parity_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 # target_compile_options(expert_parity_gate PRIVATE -O2)
 # target_link_libraries(expert_parity_gate PRIVATE strata_core strata_kernels strata_kernels_cpu CUDA::cudart)

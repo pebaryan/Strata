@@ -6972,3 +6972,21 @@ THE PARITY GATE IS WRITTEN AND COMPILES; IT IS NOT LINKED, AND THAT IS RECORDED 
     SO THE NEXT STEP IS TWO MINUTES OF WORK WITH A KNOWN ANSWER: find which target compiles src/core/expert_source.cpp,
     add it to the gate's link line, and run it on layer 3 expert 0 - where the expected result is agreement to a fraction
     of a percent and the interesting result would be anything else.
+
+THE PARITY GATE'S LINK LINE, WRITTEN DOWN SO IT IS A COPY RATHER THAN A SEARCH
+
+    The gate is tools/expert_parity_gate.cpp and it COMPILES.  It needs three sources and three libraries, in the same
+    shape glm45_run's own target uses - expert_source.cpp pulls in expert_cache.cpp, which is why compiling expert_source
+    alone produced one more round of undefined symbols (ExpertCache::slot_of, ExpertCache::admit) after the first was fixed:
+
+      add_executable(expert_parity_gate tools/expert_parity_gate.cpp
+                     src/core/expert_source.cpp src/core/expert_cache.cpp)      # + remote_experts.cpp if asked
+      target_include_directories(expert_parity_gate PRIVATE /include)
+      target_compile_options(expert_parity_gate PRIVATE -O2)
+      target_link_libraries(expert_parity_gate PRIVATE strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
+
+    WHY IT IS NOT UNCOMMENTED DESPITE BEING ONE LINE FROM WORKING: each fix in this chain revealed the next undefined
+    symbol, and the honest bound on what is known is "these three sources, and possibly remote_experts.cpp".  Leaving the
+    target enabled and red would break the rule this port has held all day - every commit builds and passes its gate - and
+    a build that is red for a known-benign reason is how a team learns to stop reading red builds.  The gate's own
+    contents are committed and reviewed; only its activation is deferred, with the line above as the answer.
