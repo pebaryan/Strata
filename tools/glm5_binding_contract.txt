@@ -6900,3 +6900,50 @@ CORRECTION: THE GROUPED KERNEL'S DOWN SWITCH COVERS THREE TYPES, SO THE DEVICE P
     switches rather than from memory, and tools/glm_expert_types_gate.cpp asserts the model's three real type pairs
     against it - (16,23) servable, (16,18) and (19,18) not, (10,11) not - with the gate shown to fail by inverting every
     expectation.
+
+THE CPU REFERENCE AND THE DEVICE PATH USE THE SAME ACTIVATION FORMAT, SO THE PARITY GATE CAN BE TIGHT
+
+    include/strata/kernels/cpu/native_expert.hpp, in full:
+
+      struct NativeFmt {
+          int gu_type, d_type;               // ggml types of gate/up and down
+          int gu_act, d_act;                 // their vec_dot_type - THE ACTIVATION FORMATS
+          int64_t n_embd, n_ff;
+          size_t gu_row, d_row;              // bytes per weight row
+          size_t up_off, down_off;           // inside the blob
+          size_t bytes;
+          size_t act_bytes, h_bytes;         // quantized activation sizes
+      };
+      bool native_fmt(gu_type, d_type, n_embd, n_ff, f, err);
+      void native_quant_act(f, x, dst);                       // x (n_embd floats) -> act_bytes
+      void native_gu_rows(f, blob, act, nt, ff, r0, r1);       // ff[r] = silu(gate_r . a) * (up_r . a)  <- SILU INCLUDED
+      void native_quant_h(f, h, dst);                          // h (n_ff floats) -> h_bytes
+      void native_down_rows(f, blob, hq, nt, out, r0, r1);     // out[t][r] = down_r . hq[t]
+
+    TWO THINGS THAT MATTER FOR THE GATE:
+
+    1. native_gu_rows COMPUTES silu(gate . a) * (up . a) ITSELF, so the CPU reference is exactly two calls and the
+       activation is INSIDE it.  A device path built from per-expert iq_mmvq calls must therefore do the SiLU and the
+       multiply explicitly between the two MMVQs - which is the same shape native_glm_ffn already has, where the runner
+       does "SiLU and the clamp on the host" between gate/up and down.  Same step, same place.
+    2. AND THE ACTIVATION FORMAT IS THE SAME ON BOTH SIDES.  The header says the kernels quantize to something
+       "Q8_1-shaped (4 B scale + 4 B sum + 32 codes = 40 B per 32 elements, 1.25 B per element)" - which is exactly
+       block_q8_1, the format native_mmvq's iq_mmvq consumes and quantize_q8_1_rows produces.  So the two paths differ in
+       ACCUMULATION ORDER and not in what they quantize to, which means the parity gate's tolerance can be tight rather
+       than generous: the same weights, the same activation codes, different summation order on the same values.
+
+    Buffer sizes are given too: act_bytes = n_embd/32 * 40 and h_bytes = n_ff/32 * 40, with kNativeActBytes and
+    kNativeHBytes as the compiled floors - for a 4096-wide activation and a 2048-wide FF that is 5,184 and 2,624 bytes.
+
+    SO BOTH THE STAGE AND ITS GATE ARE FULLY SPECIFIED:
+
+      host   : native_fmt(16, 18, 4096, 2048, f) ; native_quant_act(f, x, act) ;
+               native_gu_rows(f, blob, {act}, 1, {ff}, 0, n_ff) ; native_quant_h(f, ff, hq) ;
+               native_down_rows(f, blob, {hq}, 1, {out_cpu}, 0, n_embd)
+      device : L = native_expert_layout(16, 18, 4096, 2048) ; row = upload(blob) ;
+               iq_mmvq(16, row, xq8_1, gate, 4096, 2048, 1, s) ; iq_mmvq(16, row + L.up_off, xq8_1, up, 4096, 2048, 1, s) ;
+               host silu(gate)*up -> h ; quantize_q8_1_rows(h) -> hq ;
+               iq_mmvq(18, row + L.down_off, hq, out_dev, 2048, 4096, 1, s)
+
+      and the guard is glm_expert_layer_supported(gu, d) from include/strata/core/glm_expert_types.hpp, which is generated
+      from iq_mmvq's own switch and therefore covers 16 and 18 - the pair the grouped kernel does not.
