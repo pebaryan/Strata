@@ -115,6 +115,28 @@ int main(int argc, char** argv) {
 
     std::printf("kda gate: %s, %d token(s), weights and input from the oracle's fixture\n", dir.c_str(), tokens);
     int failures = 0;
+    std::vector<float> cuda_g(mg.size()),cuda_beta(mbeta.size());
+    char gate_error[256] = {};
+    const bool cuda_gates_ok = strata::kernels::glm::kda_gates_cuda(
+        mxn.data(),w.ssm_f_a,w.ssm_f_b,w.ssm_beta,w.ssm_a,w.dt_bias,tokens,n_embd,nh,hd,
+        cuda_g.data(),cuda_beta.data(),gate_error,sizeof(gate_error));
+    if (!cuda_gates_ok) {
+        std::printf("  CUDA gates unavailable: %s\n",gate_error);
+        ++failures;
+    } else {
+        auto compare_cuda_gate = [&](const char* label,const std::vector<float>& got,const std::vector<float>& want) {
+            double worst=0.0,scale=1e-30;
+            for (size_t i=0;i<want.size();++i) {
+                worst=std::max(worst,std::fabs((double)got[i]-(double)want[i]));
+                scale=std::max(scale,std::fabs((double)want[i]));
+            }
+            const double rel=worst/scale; const bool pass=rel<2e-4;
+            std::printf("  CUDA %-8s vs host rel %.3e  %s\n",label,rel,pass?"PASS":"FAIL");
+            failures+=pass?0:1;
+        };
+        compare_cuda_gate("gate",cuda_g,mg);
+        compare_cuda_gate("beta",cuda_beta,mbeta);
+    }
     std::vector<float> device_attn(tok_nh_hd), device_state(state.size(),0.0f);
     char cuda_error[256] = {};
     const bool cuda_ok = strata::kernels::glm::kda_recurrence_cuda(
