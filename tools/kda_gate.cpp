@@ -5,8 +5,8 @@
 // binding.  Binding these same sixteen tensors is a separate check, and this gate must not be reported as
 // covering it.
 //
-// kda_forward is host code (src/kernels/glm_kda.cpp), so everything here is a plain std::vector: no CUDA, no
-// device copies, no stream.
+// The host implementation remains the reference; when CUDA is enabled, this gate also compares its recurrence
+// intermediates and final state with the CUDA implementation.
 
 #include <algorithm>
 #include <cmath>
@@ -115,6 +115,28 @@ int main(int argc, char** argv) {
 
     std::printf("kda gate: %s, %d token(s), weights and input from the oracle's fixture\n", dir.c_str(), tokens);
     int failures = 0;
+    std::vector<float> device_attn(tok_nh_hd), device_state(state.size(),0.0f);
+    char cuda_error[256] = {};
+    const bool cuda_ok = strata::kernels::glm::kda_recurrence_cuda(
+        mq.data(),mk.data(),mv.data(),mg.data(),mbeta.data(),tokens,nh,hd,
+        device_state.data(),device_attn.data(),cuda_error,sizeof(cuda_error));
+    if (!cuda_ok) {
+        std::printf("  CUDA recurrence unavailable: %s\n",cuda_error);
+        ++failures;
+    } else {
+        auto compare_cuda = [&](const char* label,const std::vector<float>& got,const std::vector<float>& want) {
+            double worst=0.0,scale=1e-30;
+            for (size_t i=0;i<want.size();++i) {
+                worst=std::max(worst,std::fabs((double)got[i]-(double)want[i]));
+                scale=std::max(scale,std::fabs((double)want[i]));
+            }
+            const double rel=worst/scale; const bool pass=rel<3e-4;
+            std::printf("  CUDA %-8s vs host rel %.3e  %s\n",label,rel,pass?"PASS":"FAIL");
+            failures+=pass?0:1;
+        };
+        compare_cuda("attn",device_attn,mattn);
+        compare_cuda("state",device_state,state);
+    }
     if (tokens > 1) {
         std::vector<float> split_out((size_t) tokens * n_embd, 0.0f);
         std::vector<float> split_state((size_t) nh * hd * hd, 0.0f);
