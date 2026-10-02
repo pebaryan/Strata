@@ -6764,3 +6764,42 @@ reader does not have to relearn it.
 WHAT THIS CLOSES: the question the pack's offsets could not answer (0 of 43 layers under the stride model) is answered by
 a function whose answer agrees with the pack's byte sizes for the whole blob, and that agreement is what lets the stage
 address an expert's gate, up and down inside a resident row without re-deriving anything.
+
+native_expert_grouped'S SEMANTICS, READ OFF ITS OWN BODY - THE STAGE IS FIVE ARRAYS AND ONE CALL
+
+    void native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                               const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                               const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                               const void* x_q8_1, void* scratch, float* out, void* stream)
+
+      grp_ptr[g]   the BLOB ADDRESS for group g - an unsigned long long, i.e. a device pointer, which is exactly what
+                   the resident expert cache's handle is
+      grp_start[g] the first entry index belonging to group g
+      n_groups[g]  how many entries group g has
+      ent_tok[e]   the token index of entry e
+      ent_dst[e]   the destination index of entry e
+      cap_groups   the number of groups (one per expert), cap_entries the number of entries (one per expert, or more if
+                   several tokens share a group)
+      x_q8_1       the quantised activations (all entries' tokens, contiguous)
+      scratch      sized by native_expert_scratch_bytes(cap_entries, n_ff), which lays out gate, up, h (each
+                   cap_entries x n_ff floats, 256-byte aligned) and then the q8_1 blocks of h
+      out          the per-entry outputs
+
+AND ITS BODY DOES THE ENTIRE EXPERT FORWARD PASS ON THE DEVICE: a grouped gate/up MMVQ per group, then
+swiglu_entries_kernel over all cap_entries x n_ff values (so the SiLU never leaves the device), then quantize_q8_1_kernel
+of the hidden, then a grouped down MMVQ into out.  The router weights are NOT applied here - the adapter's comment says
+"clause 2: moe_combine applies it on the device.  Not an oversight." - so combination is a separate device step that
+already exists.
+
+native_expert_layout's own body confirms what the gate measured against the pack: up_off = n_ff * gu_row, down_off = 2 *
+up_off, bytes = down_off + n_embd * d_row - the three projections concatenated, which is why its bytes equals the pack's
+blob_bytes to the byte for the (16, 18) pair.
+
+AND ITS DISPATCH HAS THE SAME HOLE AS THE REST: the gate/up switch covers 16, 17, 18, 21, 22, 23, 29 and 42 with
+default: std::exit(1), so type 19 (28 layers) and type 10 (1 layer) would kill the process rather than return an error -
+the same shape as iq_mmvq's missing case 11.  The guard must be an explicit list, not iq_supported.
+
+SO THE STAGE IS NOW FULLY SPECIFIED AND SMALL: allocate scratch for cap_entries = the number of selected experts, fill
+five small host arrays, upload the activations once, call this, then combine.  Everything it needs from today's work is
+the residency policy that decides which grp_ptr values can point into the cache instead of a fresh upload - which is the
+thing that separates a wash from a gain, and which is already built and gated.
