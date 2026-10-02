@@ -103,12 +103,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 2 and 3. upload one expert's blob and require the round trip to be byte-identical
+    // 2 and 3. upload a 7.5 MB slice and require the round trip to be byte-identical
+    //
+    // WHAT THIS SLICE IS NOT: it is not one expert's blob.  The region a layer's offsets describe may or may not be laid
+    // out expert-contiguously, and this gate does not know which - an attempt to infer it from the offsets (assuming the
+    // three projections sit 288 rows apart) matched 0 of 43 layers, so the layout is the engine's business and the
+    // authority on it is ExpertSource::blob(layer, expert), which the CPU path already uses successfully.  So this reads
+    // blob_bytes from an offset that is deliberately NOT the first expert's, and checks only what a copy is responsible
+    // for: that the range is inside the file, that the transfer is exact, and that the bytes are not degenerate.
     const std::uint64_t one = per_expert;
     std::vector<unsigned char> host((size_t) one);
-    f.seekg((std::streamoff) (row.offset + 7ull * per_expert), std::ios::beg);    // an expert that is not the first
+    const std::uint64_t slice_at = row.offset + 7ull * per_expert;
+    f.seekg((std::streamoff) slice_at, std::ios::beg);
     f.read((char*) host.data(), (std::streamsize) one);
-    if (!f) { std::fprintf(stderr, "  FAIL: short read of %llu bytes at expert 7\n", (unsigned long long) one); return 1; }
+    if (!f) { std::fprintf(stderr, "  FAIL: short read of %llu bytes at %llu\n", (unsigned long long) one,
+                           (unsigned long long) slice_at); return 1; }
 
     void* dev = nullptr;
     const cudaError_t a = cudaMalloc(&dev, (size_t) one);
@@ -125,8 +134,10 @@ int main(int argc, char** argv) {
     for (std::size_t i = 0; i < back.size(); ++i) {
         if (back[i] != host[i]) { ++differ; if (!seen) { first = i; seen = true; } }
     }
-    std::printf("  expert 7 of layer %d: H2D+D2H of %llu bytes, %zu byte(s) differ%s\n", layer,
-                (unsigned long long) one, differ, differ ? "" : " (byte-identical)");
+    std::printf("  layer %d: H2D+D2H of %llu bytes from offset %llu (an arbitrary non-first slice, NOT one expert's blob"
+                " - the layout is ExpertSource::blob's business), %zu byte(s) differ%s\n",
+                layer, (unsigned long long) one, (unsigned long long) slice_at, differ,
+                differ ? "" : " (byte-identical)");
     if (differ) {
         std::fprintf(stderr, "  FAIL: first difference at %zu (host 0x%02x vs device 0x%02x)\n", first, host[first],
                      back[first]);

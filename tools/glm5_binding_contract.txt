@@ -6600,3 +6600,31 @@ experts.bin and falls back to the named shard, printing which it used so the cho
 
 ALSO WORTH NOTING FOR ANYONE READING A ROW: the first 16 bytes of layer 3's expert 7 begin 560d7d899e3ff3c340fcc389a06d52d5,
 and they will be different every time the pack is rebuilt - they are a fingerprint of this pack's cut, not a constant.
+
+THE EXPERT LAYOUT IS NOT INFERABLE FROM THE OFFSETS - IT IS THE ENGINE'S BUSINESS
+
+    Attempting to infer the per-expert layout from gate_off/up_off/down_off, on the theory that the three projections sit
+    288 rows apart, matched 0 OF 43 LAYERS:
+
+      |up_off - gate_off| == 288 * gu_row : 0 of 43      (layer 3: 633,356,288 vs 622,854,144)
+      |down_off - gate_off| == 288 * d_row: 0 of 43      (layer 3: 931,725,312 vs 924,844,032)
+
+    Layer 3's regions by offset are down at 1,434,086,592 (288 rows of 3,211,264, ending 2,358,930,624), gate at
+    2,365,811,904 and up at 2,999,168,192 - so the order is down, gate, up, with gaps between the regions that the strides
+    do not explain, and the per-expert blob of 7,536,640 = 2,162,688 + 2,162,688 + 3,211,264 says what the three pieces
+    are but not how they are addressed.
+
+    THEREFORE THE STAGE MUST NOT RE-DERIVE THE LAYOUT.  It must ask the engine, which already answers exactly this
+    question and whose answer the working CPU path uses every token:
+
+        virtual const uint8_t* blob(int64_t layer, int64_t expert) = 0;          // ExpertSource, expert_source.hpp:87
+        virtual const uint8_t* device_alias(int64_t layer, int64_t expert);      // :100, and FileExpertSource has it too
+
+    The second one is worth noticing: a DEVICE alias for a blob already exists in the interface, so part of the device
+    path this stage was going to build may already be present - which is the same finding as the KDA and MLA ports, where
+    the pattern existed one file over and the work was wiring rather than invention.
+
+AND THE UPLOAD GATE'S OWN LABEL WAS CORRECTED RATHER THAN LEFT: it said it uploaded "expert 7 of layer 3", but with the
+layout unknown that slice is simply blob_bytes read from a non-first offset, and a gate that mislabels what it tested is
+the instrument failure this port has now recorded eleven times.  It reads, checks bounds, round trips and requires the
+bytes to be non-degenerate - and says so, including that the layout is ExpertSource::blob's business and not its own.
