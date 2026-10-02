@@ -6348,3 +6348,39 @@ FOUR THINGS THIS SETTLES, and each of them changes what the kernel has to do:
 NOTE ALSO: the CPU has this function only in per-architecture files (x86/arm/loongarch/riscv/powerpc) plus arch-fallback.h,
 so on the host side there is no single generic reference to compare against - which is another reason the oracle has to be
 a transcription and the comparison has to be bit-exact against THAT, not against a convenient host implementation.
+
+THE IQ1_S ORACLE IS WRITTEN AND SELF-VALIDATED - AND IT CAUGHT TWO BUGS OF MINE ON THE WAY
+
+    tools/iq1s_reference.py
+      grid: 2048 entries, CPU table values in [-1, 0, +1]
+      cross-representation check (CPU int8 + 1 == device unpacked): AGREE  (0 mismatching of 16384)
+      integer path  [ 5.94513e+01 -1.45191e+01  1.60623e+02 -4.36520e-02 -6.25406e+01  2.67305e+00 ...]
+      float   path  [ 5.94513e+01 -1.45191e+01  1.60623e+02 -4.36520e-02 -6.25406e+01  2.67305e+00 ...]
+      max relative difference 7.464e-14
+
+TWO INDEPENDENT ARITHMETICS AGREE, which is the whole point of the file: the integer DP4A path over packed nibbles, and
+the float decode path over the int8 grid, are different transcriptions of different reference functions
+(vecdotq.cuh:1244 and ggml-quants.c:2650) and they now agree to 7.5e-14.  Agreement at that level is what makes the
+oracle usable as the thing a CUDA kernel is gated against - a disagreement would have been about my transcription
+rather than about IQ1_S, in either direction.
+
+BUG ONE, CAUGHT BY THE REFUSAL.  The first run of check() reported 7,830 mismatches of 16,384 and the script REFUSED to
+continue - correctly, because a kernel and an oracle built on two disagreeing table representations are not comparable
+and any parity result would have been about that disagreement.  The pattern in the report was the tell: entry 2 came out
+as [1,1,0,0,...] against [1,0,1,0,...], the SAME VALUES IN A DIFFERENT ORDER, so it was a permutation error and not
+corrupt data.  Testing the candidate orders then gave the answer immediately: lo[0..3],hi[0..3] matched 2048 of 2048
+entries exactly, the interleaved variants matched 2, and the observed permutation over all 2048 entries where the
+multisets agreed was the identity - so the tables were never in doubt and MY CHECK was building the device sequence
+interleaved.  One line.  The refusal is kept in the file as behaviour even though the bug is fixed, because it is what
+stopped a kernel being built on an unverified ordering.
+
+BUG TWO, CAUGHT BY A SCALE FACTOR.  The integer path then read ~1e4 against the float path's ~1e1 - a pure scale factor,
+which is the signature of a wrong CONVENTION rather than a wrong transpose, and it pointed straight at my q8_1 model:
+llama.cpp's block_q8_1 stores ds.y = d * sum(q), not the raw integer sum, and the device formula
+d1q * (ds.x*sumi + ds.y*delta) only reduces to the decode path's d1q * ds.x * sum((g +/- 0.125) * u) under that
+convention.  With s as the bare integer sum the two agreed to nothing.  Both facts are now written into the file.
+
+SO THE GROUND TRUTH FOR THE KERNEL IS COMPLETE: the grid in both representations and their exact relationship, the
+50-byte block layout, and the device arithmetic cross-validated against the decode.  What is left is the kernel and its
+bit-exact gate - and the gate now has a reference that has been checked against itself first, which is the order this
+port's discipline requires.
