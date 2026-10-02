@@ -6660,3 +6660,36 @@ SO THE STAGE'S FIRST JOB IS NOT TO BUILD AN UPLOADER.  It is to look at what pin
 device_alias for each selected expert, and only arrange an upload for the ones it declines.  That is exactly the shape of
 the three ports that worked today - the KDA hook, the MLA types, the dense FFN's ffn_types - each of which took minutes
 because the pattern existed one file over and the work was naming it correctly.
+
+device_alias IS DEAD CODE IN THIS TREE - IT HAS NO PRODUCER ANYWHERE, INCLUDING THE PATH THAT WOULD PRODUCE IT
+
+    pin_cache_complement is called in exactly ONE place in the whole tree:
+        src/program/generate.cpp:2228    if (!src.pin_cache_complement(xcache, err, /*pin=*/false))
+    and it is called with pin = FALSE - i.e. the path that would populate the device complement arena asks for the HOST
+    complement and no pinning at all.  The GLM runner never calls it either: grepping tools/glm45_run.cpp for
+    pin_cache_complement, read_expert_profile, device_alias or ExpertCache finds only my own wall-clock profiling, and the
+    pack carries no profile file, only manifest.json.
+
+    SO complement_device_ IS ALWAYS NULL, pinned(layer, expert) IS ALWAYS FALSE, AND device_alias RETURNS NULL FOR EVERY
+    EXPERT IN EVERY CONFIGURATION THIS TREE CAN RUN.  The device half of the expert design has an interface, a pinning
+    routine, an arena, an adapter and a refusal clause, and NO PRODUCER.
+
+THIS REVERSES THE PREVIOUS ENTRY'S CONCLUSION, and the reversal matters more than either conclusion: the previous entry
+said the stage should ask device_alias first and upload only what it declines.  That is wrong as written, because it would
+decline everything and fall through to an upload path that would then need to exist anyway - i.e. the "wiring not
+invention" reading was mistaken one step deeper.  What survives is the useful half: ExpertSource::blob(layer, expert) IS
+the authority on where an expert's bytes are (the CPU path uses it every token, and the offsets do not permit inferring
+the layout - 0 of 43), so the stage uploads from THAT.
+
+AND THE CACHE ALREADY BUILT IS THEREFORE THE RIGHT SHAPE RATHER THAN REDUNDANT: with no producer for device_alias, device
+residency has to come from somewhere, and a keyed, budgeted, LRU cache of uploaded rows is exactly that somewhere.  The
+stage's shape is now:
+
+    for each selected expert e:
+        src  = source->blob(layer, e)                       // the layout authority, not an inference
+        state = cache.lookup({layer, e}, bytes)
+        if (state == needs_upload) cache.insert({layer, e}, upload(src, bytes))
+        if (state == cannot_fit)   use src directly          // no residency, correct but slower
+        mmvq(row_from_cache_or_src, x_q8_1, y, ...)          // guarding on the DISPATCH LIST, not iq_supported
+
+and the fallback for cannot_fit is what makes a small budget a performance question rather than a correctness one.
