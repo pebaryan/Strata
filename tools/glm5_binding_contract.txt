@@ -6476,3 +6476,22 @@ types 16, 18 and 23 are already in iq_mmvq's dispatch and cover 14 of the 43 lay
 with no new kernel; (2) the stage that drives it with native_mmvq over the resident rows; (3) IQ1_S to add the remaining
 28 layers; (4) Q2_K and Q3_K for the last one.  Each step is gated on the token acceptance test, which has caught every
 wiring error this port has produced.
+
+THE EXPERT LOAD PATH'S ARITHMETIC AND TYPES ARE VALIDATED FOR ALL 43 LAYERS
+
+    tools/check_expert_rows.py <pack_dir> <shard2> <shard3>
+      43 row(s) in native_experts.txt
+      check 2 (gate + up + down == blob_bytes per expert): PASS
+      GGUF header declares expert types for 129 (layer, which) pair(s)
+      check 4 (pack types == GGUF header types): PASS
+
+129 pairs is 43 layers x 3 tensors, all matched, and the byte arithmetic reproduces every row's blob_bytes exactly.  So
+the load path the device expert stage is about to depend on - (layer, expert) -> which byte range is the gate, how long
+it is, and what block type is in it - is now checked against the GGUF itself rather than against the pack's own claims,
+which is the difference between two documents agreeing and one of them being verified against the artifact.
+
+AND THE CHECK THAT WAS REMOVED IS WORTH AS MUCH AS THE TWO THAT STAYED: I had written a third check on the differences
+between gate_off, up_off and down_off, but those are ABSOLUTE offsets in a shard spanning aggregations that include other
+tensors, so their differences cannot validate the per-expert layout.  It was left as a block of no-ops that READ like a
+check, which is worse than having no check at all - an instrument that reports nothing while looking like it verified
+something.  It is gone, with a note saying why, so nobody re-adds it.
