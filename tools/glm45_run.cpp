@@ -639,6 +639,10 @@ int main(int argc, char** argv) {
     const bool kda_gates_cuda = !kda_gates_env || std::strcmp(kda_gates_env,"0") != 0;
     K::kda_set_device_gates(kda_gates_cuda);
     std::printf("KDA gates: %s\n",kda_gates_cuda?"CUDA":"host");
+    const char* mla_cuda_env = std::getenv("STRATA_GLM_MLA_CUDA");
+    const bool mla_cuda = !mla_cuda_env || std::strcmp(mla_cuda_env,"0") != 0;
+    K::mla_set_device_attention(mla_cuda);
+    std::printf("MLA attention: %s\n",mla_cuda?"CUDA":"host");
 
     // ---- bind and map all 45 blocks
     P.bound.resize(N_LAYERS);

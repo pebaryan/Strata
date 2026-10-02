@@ -4,12 +4,14 @@
 #include "strata/kernels/glm_mla.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <vector>
 
 namespace strata::kernels::glm {
 namespace {
 
 MlaNativeProjectFn g_native_project = nullptr;
+bool g_device_attention = false;
 
 /// x -> rms_norm(x) * weight, over the whole row (the reference normalizes ne0 and scales by the weight).
 void rms_norm_inplace(float* x, int n, const float* weight) {
@@ -22,6 +24,14 @@ void rms_norm_inplace(float* x, int n, const float* weight) {
 }  // namespace
 
 void mla_set_native_project(MlaNativeProjectFn fn) { g_native_project = fn; }
+void mla_set_device_attention(bool enabled) { g_device_attention = enabled; }
+
+#if !defined(STRATA_ENABLE_CUDA)
+bool mla_attention_cuda(const float*,const float*,int,int,int,int,float*,char* error,size_t error_capacity) {
+    if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return false;
+}
+#endif
 
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
                  float* out, const MlaIntermediates& want) {
@@ -103,28 +113,40 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
     const float kq_scale = 1.0f / std::sqrt((float) head_dim);
     std::vector<float> attn((size_t) n_head * kv_lora, 0.0f);
     std::vector<float> v((size_t) q_dim, 0.0f);
-    std::vector<float> scores((size_t) (n_cache > 0 ? n_cache : 1), 0.0f);
+    bool attention_done = false;
+    if (g_device_attention) {
+        char cuda_err[256] = {};
+        attention_done = mla_attention_cuda(qcur.data(),cache,n_cache,n_head,head_dim,kv_lora,
+                                            attn.data(),cuda_err,sizeof(cuda_err));
+        if (!attention_done) std::fprintf(stderr,"GLM MLA CUDA attention unavailable: %s; using host attention\n",cuda_err);
+    }
+    if (!attention_done) {
+        std::vector<float> scores((size_t) (n_cache > 0 ? n_cache : 1), 0.0f);
+        for (int h = 0; h < n_head; ++h) {
+            const float* Qh = qcur.data() + (size_t) h * kv_lora;
+            float best = -INFINITY;
+            for (int t = 0; t < n_cache; ++t) {
+                const float* kt = cache + (size_t) t * kv_lora;
+                float acc = 0.0f;
+                for (int i = 0; i < kv_lora; ++i) acc += Qh[i] * kt[i];
+                scores[(size_t) t] = acc * kq_scale;
+                if (scores[(size_t) t] > best) best = scores[(size_t) t];
+            }
+            double sum = 0.0;
+            for (int t = 0; t < n_cache; ++t) {
+                scores[(size_t) t] = std::exp(scores[(size_t) t] - best);
+                sum += scores[(size_t) t];
+            }
+            float* Ah = attn.data() + (size_t) h * kv_lora;
+            for (int t = 0; t < n_cache; ++t) {
+                const float p = (float) (scores[(size_t) t] / sum);
+                const float* kt = cache + (size_t) t * kv_lora;
+                for (int i = 0; i < kv_lora; ++i) Ah[i] += p * kt[i];
+            }
+        }
+    }
     for (int h = 0; h < n_head; ++h) {
-        const float* Qh = qcur.data() + (size_t) h * kv_lora;
-        float best = -INFINITY;
-        for (int t = 0; t < n_cache; ++t) {
-            const float* kt = cache + (size_t) t * kv_lora;
-            float acc = 0.0f;
-            for (int i = 0; i < kv_lora; ++i) acc += Qh[i] * kt[i];
-            scores[(size_t) t] = acc * kq_scale;
-            if (scores[(size_t) t] > best) best = scores[(size_t) t];
-        }
-        double sum = 0.0;
-        for (int t = 0; t < n_cache; ++t) {
-            scores[(size_t) t] = std::exp(scores[(size_t) t] - best);
-            sum += scores[(size_t) t];
-        }
-        float* Ah = attn.data() + (size_t) h * kv_lora;
-        for (int t = 0; t < n_cache; ++t) {
-            const float p = (float) (scores[(size_t) t] / sum);
-            const float* kt = cache + (size_t) t * kv_lora;
-            for (int i = 0; i < kv_lora; ++i) Ah[i] += p * kt[i];
-        }
+        const float* Ah = attn.data() + (size_t) h * kv_lora;
         // v[h] = wv_b[h] (head_dim x kv_lora) @ attn[h]
         const float* m = w.wv_b + (size_t) h * head_dim * kv_lora;
         float* vh = v.data() + (size_t) h * head_dim;

@@ -17,6 +17,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstddef>
 
 namespace strata::kernels::glm {
 
@@ -65,6 +66,9 @@ inline constexpr float MLA_RMS_EPS = 1e-5f;
 using MlaNativeProjectFn = bool (*)(int count, const void* const* weights, const int* types,
                                     const float* x, int n_in, int n_out, float* const* out);
 void mla_set_native_project(MlaNativeProjectFn fn);
+void mla_set_device_attention(bool enabled);
+bool mla_attention_cuda(const float* qcur, const float* cache, int n_cache, int n_head, int head_dim, int kv_lora,
+                        float* attn, char* error, size_t error_capacity);
 
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
                  float* out, const MlaIntermediates& want = {});
