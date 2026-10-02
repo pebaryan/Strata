@@ -44,17 +44,17 @@ class Runtime:
                                     add_generation_prompt=True,
                                     reasoning_effort=req.get("reasoning_effort", "max"), clear_thinking=False)
 
-    def generate(self, ids, max_new):
+    def generate_iter(self, ids, max_new):
         if not ids: raise ValueError("prompt tokenizes to an empty sequence")
         with self.lock:
             self.proc.stdin.write("GEN %d %s\n" % (max_new, ",".join(map(str, ids))))
-            self.proc.stdin.flush(); out = []
+            self.proc.stdin.flush()
             while True:
                 line = self.proc.stdout.readline()
                 if not line: raise RuntimeError("Strata GLM engine exited")
                 line = line.strip()
-                if line.startswith("T "): out.append(int(line[2:]))
-                elif line.startswith("DONE "): return out
+                if line.startswith("T "): yield int(line[2:])
+                elif line.startswith("DONE "): return
                 elif line.startswith("ERR "): raise RuntimeError(line[4:])
 
 
@@ -86,23 +86,54 @@ class Handler(BaseHTTPRequestHandler):
             prompt=rt.chat_prompt(req) if chat else req.get("prompt",req.get("content",""))
             if isinstance(prompt,list): prompt=prompt[0]
             ids=rt.tok.encode(str(prompt),True); max_new=int(req.get("max_tokens",req.get("n_predict",128)))
-            max_new=max(1,min(max_new,8192-len(ids))); out=rt.generate(ids,max_new); text=rt.tok.decode(out)
+            max_new=max(1,min(max_new,8192-len(ids)))
             if self.path == "/completion":
+                out=list(rt.generate_iter(ids,max_new)); text=rt.tok.decode(out)
                 return self.send_json(200,{"content":text,"tokens_predicted":len(out),"stop":bool(out and out[-1] in rt.eos)})
             now=int(time.time()); rid=("chatcmpl-" if chat else "cmpl-")+uuid.uuid4().hex
             if req.get("stream"):
                 self.send_response(200); self.send_header("Content-Type","text/event-stream")
-                self.send_header("Cache-Control","no-cache"); self.end_headers()
-                for token in out:
-                    ch={"id":rid,"object":"chat.completion.chunk" if chat else "text_completion",
-                        "created":now,"model":req.get("model","glm-5.3-flash"),"choices":[{"index":0,
-                        "delta":{"content":rt.tok.decode([token])} if chat else {},
-                        "text":"" if chat else rt.tok.decode([token]),"finish_reason":None}]}
-                    self.wfile.write(("data: "+json.dumps(ch,ensure_ascii=False)+"\n\n").encode()); self.wfile.flush()
-                fin={"id":rid,"object":"chat.completion.chunk" if chat else "text_completion","created":now,
-                     "model":req.get("model","glm-5.3-flash"),"choices":[{"index":0,"delta":{} if chat else None,
-                     "text":"","finish_reason":"stop" if out and out[-1] in rt.eos else "length"}]}
-                self.wfile.write(("data: "+json.dumps(fin,ensure_ascii=False)+"\n\ndata: [DONE]\n\n").encode()); return
+                self.send_header("Cache-Control","no-cache"); self.send_header("X-Accel-Buffering","no")
+                self.send_header("Connection","close"); self.end_headers(); self.close_connection=True
+                out=[]; disconnected=False
+                try:
+                    # Consume the engine's T lines as it generates them. Previously generate() drained through DONE
+                    # first, so SSE chunks arrived as a burst and clients reported impossible decode throughput.
+                    for token in rt.generate_iter(ids,max_new):
+                        out.append(token)
+                        if disconnected: continue
+                        content=rt.tok.decode([token])
+                        ch={"id":rid,"object":"chat.completion.chunk" if chat else "text_completion",
+                            "created":now,"model":req.get("model","glm-5.3-flash"),"choices":[{"index":0,
+                            "delta":{"content":content} if chat else {},
+                            "text":"" if chat else content,"finish_reason":None}]}
+                        try:
+                            self.wfile.write(("data: "+json.dumps(ch,ensure_ascii=False)+"\n\n").encode())
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            # Keep draining through DONE so the persistent engine protocol stays synchronized.
+                            disconnected=True
+                    if not disconnected:
+                        fin={"id":rid,"object":"chat.completion.chunk" if chat else "text_completion","created":now,
+                             "model":req.get("model","glm-5.3-flash"),"choices":[{"index":0,"delta":{} if chat else None,
+                             "text":"","finish_reason":"stop" if out and out[-1] in rt.eos else "length"}]}
+                        tail="data: "+json.dumps(fin,ensure_ascii=False)+"\n\n"
+                        if req.get("stream_options",{}).get("include_usage"):
+                            usage={"id":rid,"object":"chat.completion.chunk" if chat else "text_completion",
+                                   "created":now,"model":req.get("model","glm-5.3-flash"),"choices":[],
+                                   "usage":{"prompt_tokens":len(ids),"completion_tokens":len(out),
+                                            "total_tokens":len(ids)+len(out)}}
+                            tail+="data: "+json.dumps(usage,ensure_ascii=False)+"\n\n"
+                        self.wfile.write((tail+"data: [DONE]\n\n").encode()); self.wfile.flush()
+                except Exception as e:
+                    if not disconnected:
+                        try:
+                            err={"error":{"message":str(e),"type":"engine_error"}}
+                            self.wfile.write(("data: "+json.dumps(err,ensure_ascii=False)+"\n\ndata: [DONE]\n\n").encode())
+                            self.wfile.flush()
+                        except (BrokenPipeError, ConnectionResetError): pass
+                return
+            out=list(rt.generate_iter(ids,max_new)); text=rt.tok.decode(out)
             choice={"index":0,"finish_reason":"stop" if out and out[-1] in rt.eos else "length"}
             if chat: choice["message"]={"role":"assistant","content":text}
             else: choice["text"]=text
