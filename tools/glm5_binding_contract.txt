@@ -5970,3 +5970,38 @@ WHAT THE MLA NEEDS, WHICH IS THE SAME THREE PIECES AND NOT A NEW IDEA:
 WHAT IT BUYS, MEASURED RATHER THAN ASSUMED: the CPU path materialises 7.23 GB per token, and the MLA's tensors are
 among the largest in the model - q_b alone is 25,165,824 elements, wo is 67,108,864, and the fetched 3-D k_b/v_b are
 8,388,608 each.  Those are precisely the tensors that stop being copied once the MLA has the hook the KDA has.
+
+THE MLA IS ON THE DEVICE: 1.8x END TO END, 3.4x ON THE MLA BLOCKS, GATE STILL PASSING
+
+    PROFILE 11563.4 ms for 5 tokens = 2312.7 ms/token (0.43 tok/s)      [was 4172.7 ms/token at 0.24 tok/s]
+      stem 0-2 :   3039.6 ms  26.3%
+      34 KDA   :   6403.1 ms  55.4%
+      11 MLA   :   2120.7 ms  18.3%                                     [was 7187.8 ms at 34.5%]
+      staging: 15.54 GB materialised over 5 tokens = 3.11 GB/token      [was 36.16 GB / 7.23 GB per token]
+    argmax = 12089   (logit 17.249516)   expected 12089
+    ENGINE TOKEN: PASS
+
+WHAT WAS DONE, and it was three pieces as predicted rather than a rewrite: MlaWeights gained wq_a_type/wq_b_type/
+kv_a_type/wo_type (it had NO types at all, which is why the MLA had no device path); glm_mla.cpp gained the file-local
+hook, the setter, and four guarded projection sites; the runner fills those types from each bound tensor's native_type,
+installs the SAME native_kda_project function pointer (its signature was already generic), and extends the provider's
+skip list so the MLA's tensors stay quantized on the device instead of being staged to host floats.  The shared projection
+workspace was enlarged from 8192 to 16384 because q_b and wo have a 16384 dimension - the KDA never needed it, and a
+workspace that silently refuses the larger shape would have made the hook look broken rather than undersized.
+
+AND IT BUILT ON THE FIRST ATTEMPT, which is worth noting only because it is evidence that copying a working pattern beats
+reasoning about one: every element had an instance one file over - the types on KdaWeights, the hook signature, the
+skip-list condition, the type-fill lambda - and the port was the substitution of MLA names for KDA ones, with one
+deliberate difference: the MLA's guard has NO cache condition.  The KDA's is `tokens == 1`, but mla_forward takes n_cache,
+and these projections are per-token whatever the cache depth is; gating them on n_cache would have put the device path on
+the first token only and left the rest on the host, which looks like a working port and is not one.
+
+TWO INDEPENDENT PIECES OF EVIDENCE THAT IT IS RIGHT RATHER THAN MERELY FAST: the token gate still passes, and the logit
+MOVED - 17.230408 on the CPU projections, 17.233259 with the CUDA head, 17.249516 now - the same argmax through three
+different arithmetics, which is the relationship to expect between a float32 host GEMM and a quantized MMVQ and is
+stronger than any one of them agreeing with itself.
+
+WHAT REMAINS, by measured cost: the 34 KDA blocks at 55.4% (their projections are already native, so this is the conv,
+the gates and the delta-rule recurrence - the state work, not the GEMMs), the stem at 26.3% (the three dense-FFN blocks,
+whose weights are the only ones in the model that are not routed experts), and the 3.11 GB per token still staged
+(the KDA's ssm_* and hc_* tensors, and the MLA's two fetched 3-D Q8_0 tensors).

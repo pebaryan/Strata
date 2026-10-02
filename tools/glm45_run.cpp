@@ -235,17 +235,17 @@ static bool native_kda_project(int count, const void* const* weights, const int*
     static Workspace ws;
     if (!ws.stream) {
         if (cudaStreamCreateWithFlags(&ws.stream, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaMalloc(&ws.x, (size_t) 8192 * sizeof(float)) != cudaSuccess ||
-            cudaMalloc(&ws.y, (size_t) 3 * 8192 * sizeof(float)) != cudaSuccess ||
-            cudaMalloc(&ws.q, strata::kernels::native_q8_1_bytes(8192)) != cudaSuccess) return false;
+            cudaMalloc(&ws.x, (size_t) 16384 * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&ws.y, (size_t) 3 * 16384 * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&ws.q, strata::kernels::native_q8_1_bytes(16384)) != cudaSuccess) return false;
     }
-    if (count < 1 || count > 3 || n_in > 8192 || n_out > 8192) return false;
+    if (count < 1 || count > 3 || n_in > 16384 || n_out > 16384) return false;
     if (cudaMemcpyAsync(ws.x, x, (size_t) n_in * sizeof(float), cudaMemcpyHostToDevice, ws.stream) != cudaSuccess)
         return false;
     strata::kernels::native_quantize_q8_1(ws.x, ws.q, n_in, 1, (void*) ws.stream);
     for (int i = 0; i < count; ++i) {
         if (!strata::kernels::native_mmvq_supported(types[i])) return false;
-        float* dy = ws.y + (size_t) i * 8192;
+        float* dy = ws.y + (size_t) i * 16384;
         strata::kernels::native_mmvq(types[i], weights[i], ws.q, dy, n_in, n_out, 1, (void*) ws.stream);
         if (cudaMemcpyAsync(out[i], dy, (size_t) n_out * sizeof(float), cudaMemcpyDeviceToHost, ws.stream) != cudaSuccess)
             return false;
@@ -307,7 +307,11 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
                 (t.name == "ffn_gate_shexp.weight" || t.name == "ffn_up_shexp.weight" ||
                  t.name == "ffn_down_shexp.weight") &&
                 strata::kernels::native_mmvq_supported(t.native_type);
-            if (native_projection || native_shared) continue;
+            const bool native_mla = !kda_layer && !dense &&
+                (t.name == "attn_q_a.weight" || t.name == "attn_q_b.weight" ||
+                 t.name == "attn_kv_a_mqa.weight" || t.name == "attn_output.weight") &&
+                strata::kernels::native_mmvq_supported(t.native_type);
+            if (native_projection || native_shared || native_mla) continue;
             // NO EXCEPTIONS, and the measurement is why: I first skipped the dense FFN's three tensors on blocks
             // 0..2, on the assumption that a GPU path consumed them.  It does not - glm_stage_ffn calls the CPU
             // expert_ffn, so the crash simply moved from kda_forward to expert_ffn when the rest were staged.  Every
@@ -336,6 +340,16 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
             K::KdaWeights& kw = p->kda[(size_t) layer];
             kw.wq_type = type_of("attn_q.weight"); kw.wk_type = type_of("attn_k.weight");
             kw.wv_type = type_of("attn_v.weight"); kw.wo_type = type_of("attn_output.weight");
+        } else {
+            // THE MLA'S FOUR PROJECTIONS, typed the same way and for the same reason: a non-zero type tells mla_forward
+            // that the pointer is the artifact's quantized blocks on the device, and the shared native projection hook
+            // reads them in place.  These are the largest tensors in the model - q_b at 25,165,824 elements and wo at
+            // 67,108,864 - so they are also the ones that stop being copied to host floats on every token.
+            K::MlaWeights& mw = p->mla[(size_t) layer];
+            mw.wq_a_type = type_of("attn_q_a.weight");
+            mw.wq_b_type = type_of("attn_q_b.weight");
+            mw.kv_a_type = type_of("attn_kv_a_mqa.weight");
+            mw.wo_type = type_of("attn_output.weight");
         }
         if (routed_layer) {
             C::glm::GlmTrunkLayerWeights& tw = p->w[(size_t) layer];
@@ -459,6 +473,9 @@ int main(int argc, char** argv) {
     // says so in as many words.  A routed pre-activation past 10 would then be passed through unclamped, silently.
     Provider P;
     K::kda_set_native_project(&native_kda_project);
+    // The same function serves the MLA: the signature is already generic (weights, types, shapes), so there is no reason
+    // for a second implementation to exist and drift from this one.
+    K::mla_set_native_project(&native_kda_project);
     C::glm::glm_set_native_ffn(&native_glm_ffn);
     P.kda_g.n_embd = N_EMBD; P.kda_g.nh = NH; P.kda_g.hd = HD; P.kda_g.d_conv = 4;
     P.mla_g.n_embd = N_EMBD;                                   // its defaults are this artifact's MLA geometry

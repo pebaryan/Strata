@@ -9,6 +9,8 @@
 namespace strata::kernels::glm {
 namespace {
 
+MlaNativeProjectFn g_native_project = nullptr;
+
 /// x -> rms_norm(x) * weight, over the whole row (the reference normalizes ne0 and scales by the weight).
 void rms_norm_inplace(float* x, int n, const float* weight) {
     double ss = 0.0;
@@ -19,6 +21,8 @@ void rms_norm_inplace(float* x, int n, const float* weight) {
 
 }  // namespace
 
+void mla_set_native_project(MlaNativeProjectFn fn) { g_native_project = fn; }
+
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
                  float* out, const MlaIntermediates& want) {
     const int n_head = g.n_head, head_dim = g.head_dim, kv_lora = g.kv_lora, q_lora = g.q_lora;
@@ -26,7 +30,17 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
 
     // qr = rms_norm(wq_a @ x)
     std::vector<float> qr((size_t) q_lora, 0.0f);
-    for (int j = 0; j < q_lora; ++j) {
+    // NO CACHE CONDITION HERE, unlike the KDA's `tokens == 1`: these projections are per-token whatever the cache depth
+    // is, so gating them on n_cache would put the device path on the first token only and leave the rest on the host -
+    // which is exactly the kind of thing that looks like a working port and is not one.
+    bool qr_done = false;
+    if (g_native_project != nullptr && w.wq_a_type != 0) {
+        const void* nw[1] = {w.wq_a};
+        const int nt[1] = {w.wq_a_type};
+        float* no[1] = {qr.data()};
+        qr_done = g_native_project(1, nw, nt, x, g.n_embd, q_lora, no);
+    }
+    for (int j = 0; !qr_done && j < q_lora; ++j) {
         const float* row = w.wq_a + (size_t) j * g.n_embd;
         float acc = 0.0f;
         for (int i = 0; i < g.n_embd; ++i) acc += row[i] * x[i];
@@ -37,7 +51,14 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
 
     // q = wq_b @ qr, laid out head-major with the per-head dim innermost (ggml's reshape of [16384, nt])
     std::vector<float> q((size_t) q_dim, 0.0f);
-    for (int i = 0; i < q_dim; ++i) {
+    bool q_done = false;
+    if (g_native_project != nullptr && w.wq_b_type != 0) {
+        const void* nw[1] = {w.wq_b};
+        const int nt[1] = {w.wq_b_type};
+        float* no[1] = {q.data()};
+        q_done = g_native_project(1, nw, nt, qr.data(), q_lora, q_dim, no);
+    }
+    for (int i = 0; !q_done && i < q_dim; ++i) {
         const float* row = w.wq_b + (size_t) i * q_lora;
         float acc = 0.0f;
         for (int j = 0; j < q_lora; ++j) acc += row[j] * qr[(size_t) j];
@@ -62,7 +83,14 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
 
     // kv = rms_norm(wkv_a_mqa @ x): the latent, ONE head
     std::vector<float> kv((size_t) kv_lora, 0.0f);
-    for (int i = 0; i < kv_lora; ++i) {
+    bool kv_done = false;
+    if (g_native_project != nullptr && w.kv_a_type != 0) {
+        const void* nw[1] = {w.kv_a};
+        const int nt[1] = {w.kv_a_type};
+        float* no[1] = {kv.data()};
+        kv_done = g_native_project(1, nw, nt, x, g.n_embd, kv_lora, no);
+    }
+    for (int i = 0; !kv_done && i < kv_lora; ++i) {
         const float* row = w.kv_a + (size_t) i * g.n_embd;
         float acc = 0.0f;
         for (int e = 0; e < g.n_embd; ++e) acc += row[e] * x[e];
@@ -111,7 +139,14 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
         std::copy(attn.begin(), attn.end(), want.attn);
 
     // out = wo @ concat_heads(v)
-    for (int e = 0; e < g.n_embd; ++e) {
+    bool wo_done = false;
+    if (g_native_project != nullptr && w.wo_type != 0) {
+        const void* nw[1] = {w.wo};
+        const int nt[1] = {w.wo_type};
+        float* no[1] = {out};
+        wo_done = g_native_project(1, nw, nt, v.data(), q_dim, g.n_embd, no);
+    }
+    for (int e = 0; !wo_done && e < g.n_embd; ++e) {
         const float* row = w.wo + (size_t) e * q_dim;
         float acc = 0.0f;
         for (int i = 0; i < q_dim; ++i) acc += row[i] * v[(size_t) i];
