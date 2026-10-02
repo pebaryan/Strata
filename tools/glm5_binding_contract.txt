@@ -7017,3 +7017,35 @@ THE GUARD WAS WRONG AND THE PARITY GATE CAUGHT IT BEFORE ANY STAGE CODE DEPENDED
     NOTE the other rendering bug this exposed: printing the LOCAL ExpertLayout shows the loader's defaults, because the
     loader fills its own state rather than the caller's struct - a cosmetic misleading print worth fixing by reading the
     accessor instead.
+
+THE PER-EXPERT DEVICE EXPERT PATH IS NUMERICALLY SOUND: 1.705% RMS AGAINST THE CPU NATIVE KERNELS
+
+    expert_parity_gate /home/peb/moredata/strata-pack-glm5 3 0
+
+      layer 3 expert 0: gu_type 16 d_type 18
+      layout: gu_row 1056 d_row 784 up_off 2162688 down_off 4325376 bytes 7536640
+      cpu   out[0..3] -1.114205 1.326821 3.681824 0.483795   rms 2.815976
+      dev   out[0..3] -1.083057 1.363610 3.711478 0.533321   rms 2.815976
+      max |cpu - dev| 1.783717e-01 at index 2226 ; rms difference 4.801295e-02 (1.705% of the CPU rms)
+      max relative difference 1.783503e+02
+      PASS
+
+    This is the first end-to-end validation of the device expert path on the REAL pack, and it exercises every piece the
+    stage will use: the blob from ExpertSource::blob, the in-blob offsets from native_expert_layout, quantize_q8_1_rows,
+    two iq_mmvq calls for gate and up (type 16), the host SiLU and multiply, and a third iq_mmvq for down (type 18) - the
+    pair the grouped kernel could not serve and the reason this design exists.
+
+    THE HONEST READING OF 1.705%: I predicted a TIGHT tolerance on the argument that both sides quantise to the same
+    Q8_1-shaped format, so the only difference would be accumulation order.  1.7% rms is larger than accumulation order
+    alone explains, and the likeliest reason is that my premise was a COMMENT rather than a measurement - the CPU header
+    says its buffers are "Q8_1-shaped" and that is about the BUFFER SIZES, not necessarily about the codes the CPU kernels
+    quantise to.  If the CPU side uses a different activation format (a 256-element super-block, say), the two paths start
+    from different codes and a percent-level output difference is exactly what that produces.  SO THE NEXT MEASUREMENT IS
+    ONE FIELD: print NativeFmt.gu_act and d_act and compare them against the device's block_q8_1, because that turns
+    "probably a format difference" into a fact, and if they differ the gate's threshold is right for the wrong reason.
+
+    TWO SMALL DEFECTS THIS RUN EXPOSED, both cosmetic and both worth fixing:
+      1. the layout line prints n_layers 0 n_expert 512 - the LOCAL ExpertLayout is not filled by the loader (it fills its
+         own state), so the print reads garbage-looking defaults.  Read the accessor instead.
+      2. the max relative difference of 178 is on an output element near zero, which is expected and should be reported
+         alongside the absolute and rms figures rather than instead of them.

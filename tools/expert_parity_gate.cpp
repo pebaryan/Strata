@@ -128,8 +128,19 @@ int main(int argc, char** argv) {
               cudaMalloc((void**) &dev_out, (size_t) n_embd * 4) == cudaSuccess && cudaStreamCreate(&stream) == cudaSuccess;
     if (!ok) { std::fprintf(stderr, "  device allocation failed: %s\n", cudaGetErrorString(cudaGetLastError())); return 1; }
 
+    // x and h must be ON THE DEVICE: quantize_q8_1_rows's first argument is a device pointer (it is a kernel wrapper),
+    // and the illegal memory access came from handing it host memory - the destination was already device, which is what
+    // made the mistake look like a stream problem.  Two small uploads, one per activation.
+    float* dev_x = nullptr;
+    float* dev_h = nullptr;
+    if (cudaMalloc((void**) &dev_x, (size_t) n_embd * 4) != cudaSuccess ||
+        cudaMalloc((void**) &dev_h, (size_t) n_ff * 4) != cudaSuccess) {
+        std::fprintf(stderr, "  activation upload buffers failed\n");
+        return 1;
+    }
     cudaMemcpy(dev_row, blob, L.bytes, cudaMemcpyHostToDevice);
-    K::quantize_q8_1_rows(x.data(), 1, n_embd, dev_xq, stream);
+    cudaMemcpy(dev_x, x.data(), (size_t) n_embd * 4, cudaMemcpyHostToDevice);
+    K::quantize_q8_1_rows((const float*) dev_x, 1, n_embd, dev_xq, stream);
     K::iq_mmvq(gu_type, dev_row, dev_xq, dev_gate, (int) n_embd, (int) n_ff, 1, stream);
     K::iq_mmvq(gu_type, (const uint8_t*) dev_row + L.up_off, dev_xq, dev_up, (int) n_embd, (int) n_ff, 1, stream);
     cudaStreamSynchronize(stream);
@@ -142,7 +153,8 @@ int main(int argc, char** argv) {
         const float gi = g[(size_t) i];
         h[(size_t) i] = (gi / (1.0f + std::exp(-gi))) * u[(size_t) i];
     }
-    K::quantize_q8_1_rows(h.data(), 1, n_ff, dev_hq, stream);
+    cudaMemcpy(dev_h, h.data(), (size_t) n_ff * 4, cudaMemcpyHostToDevice);
+    K::quantize_q8_1_rows((const float*) dev_h, 1, n_ff, dev_hq, stream);
     K::iq_mmvq(d_type, (const uint8_t*) dev_row + L.down_off, dev_hq, dev_out, (int) n_ff, (int) n_embd, 1, stream);
     cudaStreamSynchronize(stream);
 
