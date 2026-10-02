@@ -5918,3 +5918,55 @@ THE MEASUREMENT THAT JUSTIFIES THE CUDA PORT: 7.23 GB MATERIALISED PER TOKEN
     the block measures 0.6 s.  The gap is the staging: roughly 160 MB per layer per token of dequantisation and copy,
     plus a cudaMalloc/cudaFree pair per tensor per token - about 3,150 allocation pairs over this five-token run.  So the
     device port pays off twice: once for the FLOPs and once for everything that is currently being moved.
+
+THE DEVICE PORT HAS ALREADY STARTED, AND THE KDA IS ITS TEMPLATE - THE MLA IS THE SAME CHANGE
+
+Reading the current tree rather than assuming it: the KDA's four projections ARE ON THE DEVICE already, and the pattern
+is short enough to state exactly.
+
+WHAT EXISTS IN THE KDA (the template):
+
+  glm_kda.hpp   struct KdaWeights { ... const float* wq; ... const float* wo;
+                                    int wq_type = 0, wk_type = 0, wv_type = 0, wo_type = 0; };  // 0 = CPU floats
+                using KdaNativeProjectFn = bool (*)(int count, const void* const* weights, const int* types,
+                                                    const float* x, int n_in, int n_out, float* const* out);
+                void kda_set_native_project(KdaNativeProjectFn fn);
+
+  glm_kda.cpp   static KdaNativeProjectFn g_native_project = nullptr;   // file-local hook
+                if (tokens == 1 && g_native_project && proj_type[0] && proj_type[1] && proj_type[2]) {  // QKV, one call
+                if (tokens == 1 && g_native_project && w.wo_type) {                                     // wo, one call
+
+  glm45_run.cpp static bool native_kda_project(int count, const void* const* weights, const int* types,
+                                               const float* x, int n_in, int n_out, float* const* out);
+                kda_set_native_project(&native_kda_project);
+                native_kda_project does: H2D the activations, native_quantize_q8_1, then per weight
+                native_mmvq(types[i], weights[i], q8_1, dy, n_in, n_out, 1, stream), then D2H each output,
+                then ONE stream synchronise.  A static Workspace owns the stream and three device buffers, so nothing
+                is allocated per call - which is the point: the earlier profile's cost was exactly per-tensor
+                allocation and transfer.
+                native_glm_ffn reuses it for gate+up, does SiLU and the clamp on the host, then a third projection for
+                down - so the dense FFN has a device path through the same hook.
+
+  glm45_run.cpp provider: the skip list is the other half, and it is what keeps those tensors QUANTIZED ON THE DEVICE
+                instead of staging them: attn_q/attn_k/attn_v/attn_output on a KDA layer, and ffn_gate_shexp /
+                ffn_up_shexp / ffn_down_shexp on a routed layer, each skipped when native_mmvq_supported(t.native_type).
+
+WHAT THE MLA NEEDS, WHICH IS THE SAME THREE PIECES AND NOT A NEW IDEA:
+
+  1. glm_mla.hpp  MlaWeights gains the types: wq_a_type, wq_b_type, kv_a_type, wo_type (and wk_b_type / wv_b_type for
+                  the two Q8_0 3-D tensors the binding fetches from the artifact).  Today MlaWeights is all const float*
+                  with no types at all, which is why the MLA has no device path: the kernel has nothing to dispatch on.
+  2. glm_mla.cpp  the file-local hook, the setter, and three guarded call sites - q_a, kv_a and wo are plain GEMVs
+                  (q_b is too, then the absorbed attention uses wk_b/wv_b per head).  The guard shape is the KDA's:
+                  tokens == 1 && g_native_project && <type != 0>.
+  3. glm_layer_weights.cpp  fill those type fields from each bound tensor's native_type, exactly as the KDA's are
+                  filled, and glm45_run.cpp installs the SAME native_kda_project function pointer (the signature is
+                  already generic - it takes weights, types and shapes) and adds the MLA tensors to the provider's skip
+                  list on the same condition.
+
+  NOTHING ABOUT THIS IS SPECULATIVE: every element has a working instance one file over, the signature is shared, and
+  the skip list is what turns "staged to host floats" into "read in place on the device".
+
+WHAT IT BUYS, MEASURED RATHER THAN ASSUMED: the CPU path materialises 7.23 GB per token, and the MLA's tensors are
+among the largest in the model - q_b alone is 25,165,824 elements, wo is 67,108,864, and the fetched 3-D k_b/v_b are
+8,388,608 each.  Those are precisely the tensors that stop being copied once the MLA has the hook the KDA has.
