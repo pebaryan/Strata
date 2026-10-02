@@ -5888,3 +5888,33 @@ WHAT REMAINS, in the order the profile dictates: the 34 KDA blocks at 48.9% (abo
 wq/wk/wv/wo projections, which are exactly native_mmvq's shape over the pack's quantized rows, plus conv, gates and the
 delta-rule recurrence as small kernels), then the 11 MLA blocks at 34.4% with the same treatment, then the stem at 16.7%,
 and the expert type gap (19 IQ1_S over 28 rows, 10 Q2_K and 11 Q3_K one row each) alongside them.
+
+THE MEASUREMENT THAT JUSTIFIES THE CUDA PORT: 7.23 GB MATERIALISED PER TOKEN
+
+    head: native (CUDA) over 154880 x 4096
+    PROFILE 20863.3 ms for 5 tokens = 4172.7 ms/token (0.24 tok/s)
+      stem 0-2 :   3481.5 ms  16.7%
+      34 KDA   :  10194.0 ms  48.9%
+      11 MLA   :   7187.8 ms  34.5%
+      heaviest block: layer 0 at 1250.3 ms
+      staging: 36.16 GB materialised over 5 tokens = 7.23 GB/token
+    argmax = 12089   (logit 17.233259)   expected 12089
+    ENGINE TOKEN: PASS
+
+    THE CPU PATH MOVES 7.2 GIGABYTES PER TOKEN TO COMPUTE ONE TOKEN.  Nothing is wrong with the arithmetic - the token is
+    right, the gate passes - but the per-layer staging dequantizes each layer's quantized tensors into host floats and
+    frees them when the next layer is asked for, so with the token loop OUTER every layer is re-materialised on EVERY
+    token: a device dequant kernel plus a device-to-host copy, per tensor, per token, for forty-five layers.
+
+    A DEVICE MMVQ PATH ELIMINATES ALL OF IT, and that is the case for the port: native_mmvq and iq_mmvq take the
+    artifact's own quantized blocks and the activations as q8_1 and produce the output in place - no float copy of the
+    weights exists at any point, so there is nothing to materialise, nothing to transfer, and nothing to hand to a CPU
+    kernel.  The 1.2 GB of dense weights stays quantized on the device where the binder already put it, and the 86 GB of
+    experts stays in its mmap.  The saving is not a few percent of arithmetic: it is the removal of an entire
+    data-movement axis that exists only because the trunk reads its weights on the wrong side of the bus.
+
+    AND IT REFRAMES THE ORDER OF WORK.  The KDA blocks are 48.9% of the wall time, but that 48.9% is not mostly FLOPs -
+    a KDA layer's projections are about 134M multiply-accumulates, which the host could do in well under 0.1 s, while
+    the block measures 0.6 s.  The gap is the staging: roughly 160 MB per layer per token of dequantisation and copy,
+    plus a cudaMalloc/cudaFree pair per tensor per token - about 3,150 allocation pairs over this five-token run.  So the
+    device port pays off twice: once for the FLOPs and once for everything that is currently being moved.

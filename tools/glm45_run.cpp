@@ -86,6 +86,13 @@ struct StageProfile {
 };
 static StageProfile g_prof;
 
+/// HOW MANY BYTES THE STAGING MATERIALISES, which is the measurement that says what a device MMVQ path is worth.  The
+/// provider dequantizes a layer's quantized tensors to host floats and frees them when the next layer is asked for, so
+/// with the token loop outer EVERY LAYER IS RE-STAGED ON EVERY TOKEN: a device dequant plus a device-to-host copy per
+/// tensor per token.  A device MMVQ path reads the artifact's own blocks in place - no dequantization, no transfer - so
+/// this number is what it eliminates, and it is evidence rather than an argument.
+static unsigned long long g_staged_bytes = 0;
+
 static void stage_cb(void* ctx, int layer, const char* name, const float* data, int n) {
     StageCount* sc = (StageCount*) ctx;
     ++sc->calls;
@@ -310,6 +317,7 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
             float* h = dequant_to_host(t, err);
             if (h == nullptr) return false;
             p->staged.push_back(h);
+            g_staged_bytes += (unsigned long long) t.ne0 * (unsigned long long) (t.ne1 > 0 ? t.ne1 : 1) * 4ull;
             t.ptr = h;
             t.quantized = false;      // for the remainder of THIS visit; restored when the buffers are freed
         }
@@ -783,6 +791,9 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "  34 KDA   : %8.1f ms %5.1f%%\n", kda_ms, 100.0 * kda_ms / total);
             std::fprintf(stderr, "  11 MLA   : %8.1f ms %5.1f%%\n", mla_ms, 100.0 * mla_ms / total);
             std::fprintf(stderr, "  heaviest block: layer %d at %.1f ms\n", worst.first, worst.second);
+            std::fprintf(stderr, "  staging: %.2f GB materialised over %d tokens = %.2f GB/token (dequant + D2H, the cost a device MMVQ removes)\n",
+                         (double) g_staged_bytes / 1073741824.0, TOKENS,
+                         (double) g_staged_bytes / 1073741824.0 / TOKENS);
             std::fprintf(stderr, "  per layer ms:");
             for (const std::pair<const int, double>& kv : g_prof.ms) std::fprintf(stderr, " %d:%.1f", kv.first, kv.second);
             std::fprintf(stderr, "\n");
