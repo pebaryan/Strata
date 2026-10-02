@@ -54,6 +54,7 @@ bool GlmExpertDeviceScratch::alloc(int64_t n_embd_in, int64_t n_ff_in, std::stri
     if (gate == nullptr && cudaMalloc((void**) &gate, (size_t) n_ff * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc gate"); return false; }
     if (up == nullptr && cudaMalloc((void**) &up, (size_t) n_ff * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc up"); return false; }
     if (out == nullptr && cudaMalloc((void**) &out, (size_t) n_embd * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc out"); return false; }
+    if (accum == nullptr && cudaMalloc((void**) &accum, (size_t) n_embd * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc accum"); return false; }
     return true;
 }
 
@@ -66,6 +67,7 @@ void GlmExpertDeviceScratch::release() {
     if (gate != nullptr) { cudaFree(gate); gate = nullptr; }
     if (up != nullptr) { cudaFree(up); up = nullptr; }
     if (out != nullptr) { cudaFree(out); out = nullptr; }
+    if (accum != nullptr) { cudaFree(accum); accum = nullptr; }
     if (stream != nullptr) { cudaStreamDestroy((cudaStream_t) stream); stream = nullptr; }
     n_embd = n_ff = 0;
 }
@@ -110,6 +112,57 @@ bool glm_expert_ffn_device_resident(const uint8_t* blob_device, const kernels::N
     return true;
 }
 
+
+bool glm_expert_moe_device_resident(const uint8_t* const* rows_device, const float* weights, int n_experts,
+                                   const kernels::NativeExpertLayout& layout, int gu_type, int d_type,
+                                   int64_t n_embd, int64_t n_ff, const float* x_host, float* out_host,
+                                   GlmExpertDeviceScratch& s, std::string& err) {
+    if (!rows_device || !weights || n_experts <= 0 || n_experts > 64 || !x_host || !out_host) {
+        err = "device MoE requires rows, weights, activation, output and 1..64 experts";
+        return false;
+    }
+    if (!glm_expert_layer_supported(gu_type, d_type)) {
+        char buf[192];
+        std::snprintf(buf, sizeof buf, "iq_mmvq dispatch does not cover (gu %d, down %d); refusing device MoE", gu_type, d_type);
+        err = buf;
+        return false;
+    }
+    if (layout.bytes == 0 || layout.gu_row == 0 || layout.d_row == 0 ||
+        layout.up_off >= layout.bytes || layout.down_off >= layout.bytes) {
+        err = "device MoE received an invalid native expert layout";
+        return false;
+    }
+    if (s.n_embd != n_embd || s.n_ff != n_ff || !s.x || !s.xq || !s.hq || !s.h ||
+        !s.gate || !s.up || !s.out || !s.accum || !s.stream) {
+        err = "device MoE scratch geometry or allocation is invalid";
+        return false;
+    }
+    cudaStream_t stream = (cudaStream_t) s.stream;
+    if (cudaMemcpyAsync(s.x, x_host, (size_t) n_embd * sizeof(float), cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+        cudaMemsetAsync(s.accum, 0, (size_t) n_embd * sizeof(float), stream) != cudaSuccess) {
+        err = cuda_reason("upload activation or clear MoE accumulator");
+        return false;
+    }
+    kernels::quantize_q8_1_rows((const float*) s.x, 1, n_embd, s.xq, stream);
+    for (int i = 0; i < n_experts; ++i) {
+        if (!rows_device[i]) { err = "device MoE contains a null resident expert row"; return false; }
+        const uint8_t* row = rows_device[i];
+        kernels::iq_mmvq(gu_type, row, s.xq, s.gate, (int) n_embd, (int) n_ff, 1, stream);
+        kernels::iq_mmvq(gu_type, row + layout.up_off, s.xq, s.up, (int) n_embd, (int) n_ff, 1, stream);
+        kernels::silu_mul((const float*) s.gate, (const float*) s.up, s.h, n_ff, stream);
+        kernels::quantize_q8_1_rows((const float*) s.h, 1, n_ff, s.hq, stream);
+        kernels::iq_mmvq(d_type, row + layout.down_off, s.hq, s.out, (int) n_ff, (int) n_embd, 1, stream);
+        kernels::scaled_add_inplace(s.accum, s.out, n_embd, weights[i], stream);
+    }
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { err = cuda_reason("batched expert FFNs"); return false; }
+    if (cudaMemcpy(out_host, s.accum, (size_t) n_embd * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = cuda_reason("download weighted MoE result");
+        return false;
+    }
+    const cudaError_t last = cudaGetLastError();
+    if (last != cudaSuccess) { err = cuda_reason("after batched expert FFNs"); return false; }
+    return true;
+}
 
 bool glm_expert_ffn_device(const uint8_t* blob_host, const kernels::NativeExpertLayout& layout, int gu_type, int d_type,
                            int64_t n_embd, int64_t n_ff, const float* x_host, float* out_host,

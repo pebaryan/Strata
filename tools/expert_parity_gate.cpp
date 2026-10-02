@@ -152,6 +152,34 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // Exercise the shipped batched combine too: two references to one resident expert at weights 1/4 + 3/4
+    // must reproduce the single-expert result while testing its accumulation path.
+    uint8_t* batch_blob = nullptr;
+    if (cudaMalloc(&batch_blob, L.bytes) != cudaSuccess ||
+        cudaMemcpy(batch_blob, blob, L.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        std::fprintf(stderr, "  cannot upload batch parity blob: %s\n", cudaGetErrorString(cudaGetLastError()));
+        if (batch_blob) cudaFree(batch_blob);
+        return 1;
+    }
+    const uint8_t* batch_rows[2] = {batch_blob, batch_blob};
+    const float batch_weights[2] = {0.25f, 0.75f};
+    std::vector<float> out_batch((size_t) n_embd);
+    const bool batch_ok = C::glm_expert_moe_device_resident(batch_rows, batch_weights, 2, L, gu_type, d_type, n_embd, n_ff,
+                                                             x.data(), out_batch.data(), scratch, err);
+    cudaFree(batch_blob);
+    if (!batch_ok) {
+        std::fprintf(stderr, "  glm_expert_moe_device_resident: %s\n", err.c_str());
+        return 1;
+    }
+    double batch_max = 0.0;
+    for (int i = 0; i < n_embd; ++i)
+        batch_max = std::max(batch_max, std::fabs((double) out_batch[(size_t) i] - (double) out_dev[(size_t) i]));
+    std::printf("  batched weighted combine max difference %.6e\n", batch_max);
+    if (batch_max > 1e-5) {
+        std::fprintf(stderr, "  batched combine does not reproduce the single-expert output\n");
+        return 1;
+    }
+
     // ---------------- the comparison ----------------
     double max_abs = 0.0, max_rel = 0.0, norm_cpu = 0.0, norm_diff = 0.0;
     int worst = -1;

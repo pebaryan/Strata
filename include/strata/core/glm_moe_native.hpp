@@ -20,6 +20,11 @@ using GlmDeviceExpertFfnFn = bool (*)(void* ctx, int layer, int expert, const ui
                                       const kernels::cpu::NativeFmt& fmt, const float* x, float* out,
                                       std::string& err);
 void glm_set_device_expert_ffn(GlmDeviceExpertFfnFn fn, void* ctx);
+using GlmDeviceMoeFfnFn = bool (*)(void* ctx, int layer, int n_experts, const int32_t* experts,
+                                   const uint8_t* const* blobs, const float* weights,
+                                   const kernels::cpu::NativeFmt& fmt, const float* x, float* out,
+                                   std::string& err);
+void glm_set_device_moe_ffn(GlmDeviceMoeFfnFn fn, void* ctx);
 
 /// Run the dense feed-forward through the native (device MMVQ) hook if one is installed and all three types are set.
 /// Returns false when the caller should fall back to the host expert_ffn - a missing hook is not an error, it just means

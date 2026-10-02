@@ -58,6 +58,10 @@ __global__ void add_kernel(float* __restrict__ dst, const float* __restrict__ sr
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] += src[i];
 }
+__global__ void scaled_add_kernel(float* __restrict__ dst, const float* __restrict__ src, long long n, float scale) {
+    const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) dst[i] += scale * src[i];
+}
 
 __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -168,6 +172,13 @@ void add_inplace(float* dst, const float* src, int64_t n, void* stream) {
     add_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(dst, src, n);
     check_launch("add_inplace");
     sync_if_needed(stream, "add_inplace");
+}
+
+void scaled_add_inplace(float* dst, const float* src, int64_t n, float scale, void* stream) {
+    if (n <= 0) return;
+    scaled_add_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(dst, src, n, scale);
+    check_launch("scaled_add_inplace");
+    sync_if_needed(stream, "scaled_add_inplace");
 }
 
 void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {

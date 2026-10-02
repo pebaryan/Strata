@@ -37,7 +37,8 @@ struct GlmExpertDeviceScratch {
     float* h = nullptr;         ///< n_ff floats      the hidden, on the device
     float* gate = nullptr;      ///< n_ff floats
     float* up = nullptr;        ///< n_ff floats
-    float* out = nullptr;       ///< n_embd floats
+    float* out = nullptr;       ///< n_embd floats, one expert result
+    float* accum = nullptr;     ///< n_embd floats, weighted layer result
     void* stream = nullptr;     ///< cudaStream_t
     int64_t n_embd = 0, n_ff = 0;
 
@@ -65,6 +66,13 @@ bool glm_expert_ffn_device(const uint8_t* blob_host, const kernels::NativeExpert
 bool glm_expert_ffn_device_resident(const uint8_t* blob_device, const kernels::NativeExpertLayout& layout,
                                    int gu_type, int d_type, int64_t n_embd, int64_t n_ff,
                                    const float* x_host, float* out_host,
+                                   GlmExpertDeviceScratch& scratch, std::string& err);
+
+/// Run all selected routed experts on one resident activation and combine their outputs on-device.
+/// rows_device contains n_experts resident expert blobs; weights are applied exactly once in the combine.
+bool glm_expert_moe_device_resident(const uint8_t* const* rows_device, const float* weights, int n_experts,
+                                   const kernels::NativeExpertLayout& layout, int gu_type, int d_type,
+                                   int64_t n_embd, int64_t n_ff, const float* x_host, float* out_host,
                                    GlmExpertDeviceScratch& scratch, std::string& err);
 
 }  // namespace core

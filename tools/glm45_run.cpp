@@ -305,6 +305,60 @@ static bool run_cached_device_expert(void* raw, int layer, int expert, const uin
     return ok;
 }
 
+static bool run_cached_device_moe(void* raw, int layer, int n_experts, const int32_t* experts,
+                                 const uint8_t* const* blobs, const float* weights,
+                                 const KCPU::NativeFmt& fmt, const float* x, float* out, std::string& err) {
+    GlmExpertDeviceRuntime& runtime = *(GlmExpertDeviceRuntime*) raw;
+    const KN::NativeExpertLayout layout =
+        KN::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
+    if (layout.bytes == 0 || layout.bytes != fmt.bytes || n_experts <= 0 || n_experts > 64) {
+        err = "device MoE layout/count disagrees with NativeFmt";
+        return false;
+    }
+    if (runtime.scratch.n_embd == 0 && !runtime.scratch.alloc(fmt.n_embd, fmt.n_ff, err)) return false;
+    std::vector<const uint8_t*> rows((size_t) n_experts);
+    std::vector<void*> temporary;
+    for (int i = 0; i < n_experts; ++i) {
+        if (!blobs[i]) { err = "device MoE has a null host blob"; return false; }
+        const C::ExpertRowKey key{layer, (int) experts[i]};
+        const C::ExpertRowState state = runtime.cache.lookup(key, layout.bytes);
+        void* device_row = nullptr;
+        if (state == C::ExpertRowState::resident) {
+            const C::ExpertRowEntry* entry = runtime.cache.find(key);
+            if (!entry || !entry->dev || entry->bytes != layout.bytes) {
+                err = "expert cache reported a resident row without a matching device allocation";
+                return false;
+            }
+            device_row = entry->dev;
+        } else {
+            if (cudaMalloc(&device_row, layout.bytes) != cudaSuccess) {
+                err = std::string("cudaMalloc expert row: ") + cudaGetErrorString(cudaGetLastError());
+                return false;
+            }
+            if (cudaMemcpy(device_row, blobs[i], layout.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                err = std::string("upload expert row: ") + cudaGetErrorString(cudaGetLastError());
+                cudaFree(device_row);
+                return false;
+            }
+            if (state == C::ExpertRowState::needs_upload) {
+                runtime.cache.insert(key, C::ExpertRowEntry{device_row, layout.bytes});
+                const C::ExpertRowEntry* entry = runtime.cache.find(key);
+                if (!entry) { err = "expert cache did not retain an accepted row"; return false; }
+                device_row = entry->dev;
+            } else {
+                temporary.push_back(device_row); // oversized rows still run correctly outside the cache
+            }
+        }
+        rows[(size_t) i] = (const uint8_t*) device_row;
+    }
+    const bool ok = C::glm_expert_moe_device_resident(rows.data(), weights, n_experts, layout,
+                                                       fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff,
+                                                       x, out, runtime.scratch, err);
+    for (void* row : temporary) cudaFree(row);
+    if (!ok && !err.empty()) err = "layer " + std::to_string(layer) + " device MoE: " + err;
+    return ok;
+}
+
 static bool native_kda_project(int count, const void* const* weights, const int* types,
                                const float* x, int n_in, int n_out, float* const* out) {
     struct Workspace {
@@ -574,8 +628,9 @@ int main(int argc, char** argv) {
 
     // Keep a bounded set of routed expert rows resident. The default leaves ample room for the model's other CUDA
     // allocations while fitting the measured hot set; misses upload once and then reuse the device pointer.
-    GlmExpertDeviceRuntime expert_device_runtime((size_t) 8 * 1024 * 1024 * 1024);
+    GlmExpertDeviceRuntime expert_device_runtime((size_t) 18 * 1024 * 1024 * 1024);
     C::glm::glm_set_device_expert_ffn(&run_cached_device_expert, &expert_device_runtime);
+    C::glm::glm_set_device_moe_ffn(&run_cached_device_moe, &expert_device_runtime);
 
     // ---- bind and map all 45 blocks
     P.bound.resize(N_LAYERS);
