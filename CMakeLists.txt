@@ -183,6 +183,20 @@ target_include_directories(glm5_bind_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/i
 target_compile_options(glm5_bind_check PRIVATE -O2)
 target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::cudart)
 
+# Per-expert device expert parity (branch glm5next-port): the CPU native kernels versus per-expert iq_mmvq calls on the
+# SAME blob.  This is the gate for the design the grouped kernel cannot serve, since its down switch has no case for the
+# type 18 that 39 of 43 layers use.
+#
+# IT IS COMPILED BUT NOT YET LINKED, AND DELIBERATELY NOT LEFT IN THE BUILD.  It resolves the CPU native kernels against
+# strata_kernels_cpu, but FileExpertSource is not in strata_core - so the one remaining step is the library that already
+# provides src/core/expert_source.cpp to glm45_run.  A target that does not link cannot be left in the tree: every commit
+# here builds, and a permanently red target would train the next reader to ignore a red build.  Re-enable it by adding the
+# missing library and confirming it links.
+# add_executable(expert_parity_gate tools/expert_parity_gate.cpp)
+# target_include_directories(expert_parity_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+# target_compile_options(expert_parity_gate PRIVATE -O2)
+# target_link_libraries(expert_parity_gate PRIVATE strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
+
 # Device expert type guard (branch glm5next-port): which types the GROUPED kernel's switches actually cover, which is
 # not what iq_supported says and not what iq_mmvq's dispatch implies - the grouped down switch covers 20, 23 and 42 while
 # the model's down projection is type 18 on 39 of 43 layers.

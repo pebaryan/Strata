@@ -6947,3 +6947,28 @@ THE CPU REFERENCE AND THE DEVICE PATH USE THE SAME ACTIVATION FORMAT, SO THE PAR
 
       and the guard is glm_expert_layer_supported(gu, d) from include/strata/core/glm_expert_types.hpp, which is generated
       from iq_mmvq's own switch and therefore covers 16 and 18 - the pair the grouped kernel does not.
+
+THE PARITY GATE IS WRITTEN AND COMPILES; IT IS NOT LINKED, AND THAT IS RECORDED RATHER THAN LEFT RED
+
+    tools/expert_parity_gate.cpp implements the comparison the per-expert device design needs:
+
+      host   : native_fmt(gu, d, 4096, 2048) ; native_quant_act ; native_gu_rows (silu included) ; native_quant_h ;
+               native_down_rows                                          -> out_cpu
+      device : native_expert_layout ; upload blob ; quantize_q8_1_rows(x) ; iq_mmvq(gu) ; iq_mmvq(gu, +up_off) ;
+               host silu(gate)*up ; quantize_q8_1_rows(h) ; iq_mmvq(d, +down_off)      -> out_dev
+      report : max |cpu-dev|, its index, the rms difference as a percentage of the CPU rms, and the max relative
+               difference, with PASS at under 2% rms - a threshold that is defensible precisely because both sides
+               quantise to the same Q8_1 shape, so the only difference is accumulation order.
+
+    It also refuses to run on an uncovered type pair, calling glm_expert_layer_supported first, with the reasoning in the
+    message: iq_mmvq's default branch is std::exit(1), so an uncovered pair is a process death and not an error return.
+
+    IT COMPILES.  IT DOES NOT LINK, and the missing piece is one library: the CPU native kernels resolve against
+    strata_kernels_cpu, but FileExpertSource does not - it is not in strata_core, and the library that provides
+    src/core/expert_source.cpp to glm45_run is what has to be added.  The target is therefore COMMENTED OUT rather than
+    left failing, because a permanently red target in a tree whose rule is "every commit builds and passes its gate" would
+    train the next reader to ignore a red build, which costs more than the inconvenience of re-enabling it.
+
+    SO THE NEXT STEP IS TWO MINUTES OF WORK WITH A KNOWN ANSWER: find which target compiles src/core/expert_source.cpp,
+    add it to the gate's link line, and run it on layer 3 expert 0 - where the expected result is agreement to a fraction
+    of a percent and the interesting result would be anything else.
