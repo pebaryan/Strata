@@ -6444,3 +6444,35 @@ expert work - with IQ1_S following to add the other 28 rather than being a prere
 byte sizes, for the row arithmetic the kernel's load path will need:
 
     16 -> 66   18 -> 98   19 -> 50   23 -> 136   10 -> 84   11 -> 110     (bytes per 256 weights)
+
+THE NUMBER THAT DECIDES THE ROUTED-EXPERT DESIGN: A NAIVE UPLOAD IS A WASH, A RESIDENT CACHE IS NOT
+
+    layers 43, 8 experts used per layer per token; blob_bytes is ONE EXPERT's gate+up+down
+      min 6,488,064  max 9,109,504  mean 6,977,297 bytes per expert
+
+    H2D if every selected expert is uploaded every token:  2.40 GB per token
+      at  8 GB/s PCIe -> 300 ms/token
+      at 12 GB/s PCIe -> 200 ms/token
+    the dequantisation share it would replace:            about 360 ms/token
+
+    a device-resident cache of the whole 8-per-layer hot set: 2.40 GB  -> fits 13.3x over in 32 GB of VRAM
+    the full expert pack: 86.4 GB, of which 37% could be resident
+
+SO THE DESIGN IS DECIDED BEFORE A LINE IS WRITTEN, and it is decided against the obvious implementation: uploading each
+token's eight selected experts per layer would move 2.40 GB over PCIe to save about 360 ms of CPU dequantisation, i.e.
+200-300 ms of transfer against 360 ms of work - a wash at best, and a LOSS the moment the MMVQ calls are less than
+perfectly overlapped.  This is the same trap as the host staging, one bus further out: moving bytes to the right side of
+the bus to do work faster, without first asking whether the move itself costs as much as the work.
+
+WITH THE HOT SET RESIDENT ON THE DEVICE IT IS NOT A WASH.  The eight experts per layer that a token actually uses come to
+2.40 GB across all 43 layers, which fits thirteen times over in the V100's 32 GB, and the full pack at 86.4 GB would still
+leave 37% of it resident if one wanted that.  After the first few tokens the PCIe traffic falls to near zero while the
+dequantisation saving is collected in full - so the routed-expert device path is worth building ONLY together with a
+device-resident expert-row cache, and the cache is the cheap part (2.4 GB of 32 GB) while the kernel wiring is the
+expensive part.
+
+THE ORDER THAT FOLLOWS: (1) the device-resident expert-row cache, keyed by (layer, expert) with the rows' own types, since
+types 16, 18 and 23 are already in iq_mmvq's dispatch and cover 14 of the 43 layers entirely - a third of the expert work
+with no new kernel; (2) the stage that drives it with native_mmvq over the resident rows; (3) IQ1_S to add the remaining
+28 layers; (4) Q2_K and Q3_K for the last one.  Each step is gated on the token acceptance test, which has caught every
+wiring error this port has produced.
