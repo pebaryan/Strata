@@ -7100,3 +7100,28 @@ THE ERROR IS A PROPERTY OF THE ACTIVATION FORMAT, NOT THE WEIGHTS: 1.705-1.886% 
     only test that can clear it.  For the other 29 layers, the gap is unchanged and precisely known: IQ1_S (type 19) needs
     a kernel for 28 of them, and Q2_K (10) plus Q3_K (11) for layer 45 - and IQ1_S is already fully transcribed, both
     grids agreeing 2048/2048 and the integer DP4A arithmetic written down.
+
+THE PER-EXPERT DEVICE FFN IS PACKAGED, AND THE GATE NOW TESTS THE FUNCTION RATHER THAN A COPY OF IT
+
+    core::glm_expert_ffn_device(blob_host, layout, gu_type, d_type, n_embd, n_ff, x_host, out_host, scratch, err)
+    in include/strata/core/glm_expert_device.hpp + src/core/glm_expert_device.cpp, with
+    core::GlmExpertDeviceScratch{alloc, release} holding the row, the two q8_1 buffers, the device activation and hidden,
+    gate, up, out and the stream - sized once per geometry and reused, which is what the stage will do across experts and
+    layers.
+
+    WHY IT IS A FUNCTION AND NOT AN INLINE SEQUENCE: a gate that tests a duplicate can pass while the shipped code differs,
+    which is this port's recurring failure mode wearing one more hat.  The gate's device path is now a scratch allocation
+    and ONE call, so its green result is evidence about the artifact.
+
+    THE REFACTOR IS NUMERICALLY INERT, which is the property a refactor must demonstrate rather than assert:
+      before  cpu -1.114205 1.326821 3.681824 0.483795 | dev -1.083057 1.363610 3.711478 0.533321 | 1.783717e-01 @ 2226
+      after   cpu -1.114205 1.326821 3.681824 0.483795 | dev -1.083057 1.363610 3.711478 0.533321 | 1.783717e-01 @ 2226
+    identical to the last digit, 1.705% rms, PASS - so the packaging introduced no arithmetic change and the gate is still
+    measuring what it measured before.
+
+    THE GUARD LIVES INSIDE THE FUNCTION, not with the caller: an uncovered pair returns false with a reason naming both
+    types, rather than reaching iq_mmvq's `default: std::exit(1)`.
+
+    NOT YET DONE, DELIBERATELY: the runner's device-expert hook and the ExpertRowCache wiring.  So the 14-layer argmax
+    test CANNOT BE RUN YET - the device expert path is validated per expert, not in the trunk, and the acceptance gate
+    below measures the trunk with its existing CPU expert path, unchanged.

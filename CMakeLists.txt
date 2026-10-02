@@ -192,8 +192,8 @@ target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::c
 # additionally references RemoteExperts.  So the fix is to add those two - and remote_experts.cpp if the linker still asks -
 # to the add_executable below.  Until that is done and verified, the target stays COMMENTED OUT: a permanently red target
 # in a tree whose rule is that every commit builds would train the next reader to ignore a red build.
-add_executable(expert_parity_gate tools/expert_parity_gate.cpp src/core/expert_source.cpp src/core/expert_cache.cpp
-               src/core/remote_experts.cpp)
+add_executable(expert_parity_gate tools/expert_parity_gate.cpp src/core/glm_expert_device.cpp src/core/expert_source.cpp
+               src/core/expert_cache.cpp src/core/remote_experts.cpp)
 target_include_directories(expert_parity_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(expert_parity_gate PRIVATE -O2)
 target_link_libraries(expert_parity_gate PRIVATE strata_core strata_kernels strata_kernels_cpu CUDA::cudart)

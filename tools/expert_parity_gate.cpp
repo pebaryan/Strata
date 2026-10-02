@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 
 #include "strata/core/expert_source.hpp"
+#include "strata/core/glm_expert_device.hpp"
 #include "strata/core/glm_expert_types.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
@@ -124,55 +125,17 @@ int main(int argc, char** argv) {
     K::cpu::native_down_rows(fmt, blob, hq_row, 1, out_row, 0, (int) n_embd);
 
     // ---------------- the device path, per expert ----------------
-    void* dev_row = nullptr;
-    void* dev_xq = nullptr;
-    void* dev_hq = nullptr;
-    float* dev_gate = nullptr;
-    float* dev_up = nullptr;
-    float* dev_out = nullptr;
-    cudaStream_t stream = nullptr;
-    const size_t xq_bytes = (size_t) (n_embd / 32) * sizeof(K::cpu::NativeFmt) * 0 + (size_t) (n_embd / 32) * 40;
-    const size_t hq_bytes = (size_t) (n_ff / 32) * 40;
-    bool ok = cudaMalloc(&dev_row, L.bytes) == cudaSuccess && cudaMalloc(&dev_xq, xq_bytes) == cudaSuccess &&
-              cudaMalloc(&dev_hq, hq_bytes) == cudaSuccess && cudaMalloc((void**) &dev_gate, (size_t) n_ff * 4) == cudaSuccess &&
-              cudaMalloc((void**) &dev_up, (size_t) n_ff * 4) == cudaSuccess &&
-              cudaMalloc((void**) &dev_out, (size_t) n_embd * 4) == cudaSuccess && cudaStreamCreate(&stream) == cudaSuccess;
-    if (!ok) { std::fprintf(stderr, "  device allocation failed: %s\n", cudaGetErrorString(cudaGetLastError())); return 1; }
-
-    // x and h must be ON THE DEVICE: quantize_q8_1_rows's first argument is a device pointer (it is a kernel wrapper),
-    // and the illegal memory access came from handing it host memory - the destination was already device, which is what
-    // made the mistake look like a stream problem.  Two small uploads, one per activation.
-    float* dev_x = nullptr;
-    float* dev_h = nullptr;
-    if (cudaMalloc((void**) &dev_x, (size_t) n_embd * 4) != cudaSuccess ||
-        cudaMalloc((void**) &dev_h, (size_t) n_ff * 4) != cudaSuccess) {
-        std::fprintf(stderr, "  activation upload buffers failed\n");
+    // THE FUNCTION IS THE ARTIFACT AND THE GATE TESTS IT, not a copy of it: the inline sequence that used to live here is
+    // now core::glm_expert_ffn_device, so a green gate is evidence about the code that will ship rather than about a
+    // duplicate that happened to agree with it.  The scratch is allocated once and reused, which is what the stage will do
+    // across experts and layers.
+    C::GlmExpertDeviceScratch scratch;
+    if (!scratch.alloc(n_embd, n_ff, err)) { std::fprintf(stderr, "  scratch: %s\n", err.c_str()); return 1; }
+    std::vector<float> out_dev((size_t) n_embd);
+    if (!C::glm_expert_ffn_device(blob, L, gu_type, d_type, n_embd, n_ff, x.data(), out_dev.data(), scratch, err)) {
+        std::fprintf(stderr, "  glm_expert_ffn_device: %s\n", err.c_str());
         return 1;
     }
-    cudaMemcpy(dev_row, blob, L.bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_x, x.data(), (size_t) n_embd * 4, cudaMemcpyHostToDevice);
-    K::quantize_q8_1_rows((const float*) dev_x, 1, n_embd, dev_xq, stream);
-    K::iq_mmvq(gu_type, dev_row, dev_xq, dev_gate, (int) n_embd, (int) n_ff, 1, stream);
-    K::iq_mmvq(gu_type, (const uint8_t*) dev_row + L.up_off, dev_xq, dev_up, (int) n_embd, (int) n_ff, 1, stream);
-    cudaStreamSynchronize(stream);
-
-    // silu(gate) * up on the host, the same step native_gu_rows does internally and native_glm_ffn does on the host
-    std::vector<float> g((size_t) n_ff), u((size_t) n_ff), h((size_t) n_ff);
-    cudaMemcpy(g.data(), dev_gate, (size_t) n_ff * 4, cudaMemcpyDeviceToHost);
-    cudaMemcpy(u.data(), dev_up, (size_t) n_ff * 4, cudaMemcpyDeviceToHost);
-    for (int i = 0; i < n_ff; ++i) {
-        const float gi = g[(size_t) i];
-        h[(size_t) i] = (gi / (1.0f + std::exp(-gi))) * u[(size_t) i];
-    }
-    cudaMemcpy(dev_h, h.data(), (size_t) n_ff * 4, cudaMemcpyHostToDevice);
-    K::quantize_q8_1_rows((const float*) dev_h, 1, n_ff, dev_hq, stream);
-    K::iq_mmvq(d_type, (const uint8_t*) dev_row + L.down_off, dev_hq, dev_out, (int) n_ff, (int) n_embd, 1, stream);
-    cudaStreamSynchronize(stream);
-
-    std::vector<float> out_dev((size_t) n_embd);
-    cudaMemcpy(out_dev.data(), dev_out, (size_t) n_embd * 4, cudaMemcpyDeviceToHost);
-    const cudaError_t last = cudaGetLastError();
-    if (last != cudaSuccess) { std::fprintf(stderr, "  cuda: %s\n", cudaGetErrorString(last)); return 1; }
 
     // ---------------- the comparison ----------------
     double max_abs = 0.0, max_rel = 0.0, norm_cpu = 0.0, norm_diff = 0.0;
@@ -197,7 +160,6 @@ int main(int argc, char** argv) {
     const bool pass = (rel_rms < 0.02);
     std::printf("\n  %s - the per-expert device path reproduces the CPU native kernels to %.3f%% rms\n",
                 pass ? "PASS" : "FAIL", 100.0 * rel_rms);
-    cudaFree(dev_row); cudaFree(dev_xq); cudaFree(dev_hq); cudaFree(dev_gate); cudaFree(dev_up); cudaFree(dev_out);
-    cudaStreamDestroy(stream);
+    scratch.release();
     return pass ? 0 : 1;
 }
