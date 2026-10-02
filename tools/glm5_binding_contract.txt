@@ -6161,3 +6161,32 @@ UP TO 20% RUN TO RUN.  The same binary, the same command, measured 1,548.1, 1,55
 minutes.  The negative result above stands because 1.8x is far outside that spread, but any smaller difference - the 18%
 attributed to l_out, the 10% to the MLA stage, most single-stage changes from here - must be measured over repeats before
 it is believed.  Single-run comparisons are no longer evidence in this port.
+
+THE VARIANCE IS BETWEEN BATCHES, NOT RUN TO RUN - AND IT RETROACTIVELY WEAKENS THE NEGATIVE RESULT
+
+    three consecutive runs: 2728, 2780, 2708 ms/token - within-batch spread 2.6%
+      ffn_norm       9473.5 ms  spread  0.3%   69.2% of run
+      l_out          1907.4 ms  spread 11.0%   13.9% of run
+      attn_input     1378.4 ms  spread  1.3%   10.1% of run
+      attn_norm       779.2 ms  spread  0.8%    5.7% of run
+      hc_attn_post    145.5 ms  spread 99.1%    1.1% of run
+
+    the same binary measured 1548.1, 1555.8 and then 1861.8 ms/token in earlier batches, and 2728-2780 in this one.
+
+WITHIN A BATCH THIS ENGINE IS PRECISE.  Per-stage spreads of 0.3-1.3% over three consecutive runs mean the stage table
+can be trusted as a description of the run it came from, and that a change worth more than a few percent inside one
+session will be visible.  BETWEEN BATCHES THE ENTIRE LEVEL MOVES, by up to 1.8x, and the SHARES move with it: ffn_norm is
+55.6% of the run in a fast batch and 69.2% in a slow one, which is the signature of an I/O-driven stage responding to the
+page cache's state rather than of noise.
+
+SO THE NEGATIVE RESULT TWO ENTRIES BACK IS NOT ESTABLISHED.  "Keeping the expert pages is 1.8x slower" compared two runs
+in one batch against a run in another, and 1.8x is exactly the size of the between-batch swing.  It may still be true -
+the mechanism proposed for it, memory pressure on a 31 GB box, is plausible - but the measurement cannot distinguish the
+flag from the machine's state, and it must not be treated as settled.  The default stays as the original release-on-use
+behaviour, which is the status quo rather than the winning option, and settling this needs an INTERLEAVED A/B - alternate
+the flag on and off across several pairs inside one session, so both arms see the same cache state.
+
+WHAT SURVIVES UNAFFECTED: the three ports.  Their deltas were 2-12x on the stages they touched and each was verified by
+the token gate as well as by the clock, so no amount of cache drift accounts for them.  What does NOT survive is any
+conclusion drawn from comparing two different batches - which includes the 18.1% attributed to l_out and the 10% to the
+MLA stage, since those shares were read off a fast batch and the run they describe is the one where ffn_norm was 55.6%.
