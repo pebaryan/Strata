@@ -6305,3 +6305,46 @@ transcription should follow it rather than invent a layout.
 
 REMAINING BEFORE THE KERNEL: ggml_vec_dot_iq1_s_q8_K's integer arithmetic - the accumulation pattern and where the
 per-block scales enter - because that is what bit-exactness must be defined against.
+
+IQ1_S'S DEVICE ARITHMETIC, TRANSCRIBED FROM llama.cpp's OWN CUDA PATH (ggml-cuda/vecdotq.cuh:1244)
+
+    static __device__ float vec_dot_iq1_s_q8_1(const void * vbq, const block_q8_1 * bq8_1, const int & kbx, const int & iqs) {
+        const block_iq1_s * bq1 = (const block_iq1_s *) vbq + kbx;
+        const int       qs_packed = get_int_b2(bq1->qs, iqs);          // two qs bytes, as a 32-bit word
+        const uint8_t * qs        = (const uint8_t *) &qs_packed;
+        const int qh = bq1->qh[iqs];
+        int sumi = 0;
+        for (int l0 = 0; l0 < 8; l0 += 2) {
+            const int grid  = iq1s_grid_gpu[qs[l0/2] | (((qh >> 3*(l0/2)) & 0x07) << 8)];   // 11-bit index again
+            const int grid0 = (grid >> 0) & 0x0F0F0F0F;                                    // low nibbles of 4 bytes
+            const int grid1 = (grid >> 4) & 0x0F0F0F0F;                                    // high nibbles of 4 bytes
+            const int u0 = get_int_b4(bq8_1[iqs].qs, l0 + 0);
+            const int u1 = get_int_b4(bq8_1[iqs].qs, l0 + 1);
+            sumi = ggml_cuda_dp4a(grid0, u0, sumi);                                        // integer 4-way dot
+            sumi = ggml_cuda_dp4a(grid1, u1, sumi);
+        }
+        const float  d1q   = __half2float(bq1->d) * (((qh >> 11) & 0x0E) + 1);
+        const float  delta = -1.0f + IQ1S_DELTA - (qh & 0x8000) * (2.0f*IQ1S_DELTA/0x8000);
+        const float2 ds    = __half22float2(bq8_1[iqs].ds);
+        return d1q * (ds.x*sumi + ds.y*delta);
+    }
+
+FOUR THINGS THIS SETTLES, and each of them changes what the kernel has to do:
+
+  1. THE DEVICE PATH USES THE PACKED TABLE, NOT THE ONE I EXTRACTED.  iq1s_grid_gpu, uint32 per entry, values packed as
+     4-BIT NIBBLES in four bytes - grid0 takes the low nibble of each byte and grid1 the high ones.  The uint64 table I
+     lifted is the CPU form.  The kernel must therefore be written against iq1s_grid_gpu, and the oracle against the
+     uint64 one, with the agreement between those two representations itself a checkable fact rather than an assumption.
+  2. THE ACCUMULATION IS INTEGER, VIA DP4A, so bit-exactness is defined on an integer sumi and not on a float sum.  A
+     gate that dequantises to floats and dots would agree only to within rounding and would pass a subtly wrong kernel.
+  3. iqs IS THE 32-WEIGHT SUB-BLOCK INDEX.  Each iteration of the l0 loop consumes 2 grid bytes (8 nibble-values) and two
+     4-byte q8_1 words (8 int8 activations), i.e. 8 weights, and there are 4 iterations - one 32-weight group, of which a
+     256-weight block has eight.  That fixes the thread/data mapping before a line of the kernel is written.
+  4. THE SCALE AND DELTA FOLD INTO THE Q8_1 BLOCK'S OWN ds.  d1q = d * (((qh >> 11) & 0x0E) + 1) is the same 3-bit scale
+     as the decode's d * (2*((qh >> 12) & 7) + 1) - the 0x0E mask is that expression with the +1 factored out - and the
+     result is d1q * (ds.x*sumi + ds.y*delta), which is the standard MMVQ form: one integer dot and one small float
+     correction.
+
+NOTE ALSO: the CPU has this function only in per-architecture files (x86/arm/loongarch/riscv/powerpc) plus arch-fallback.h,
+so on the host side there is no single generic reference to compare against - which is another reason the oracle has to be
+a transcription and the comparison has to be bit-exact against THAT, not against a convenient host implementation.
