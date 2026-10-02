@@ -183,6 +183,14 @@ target_include_directories(glm5_bind_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/i
 target_compile_options(glm5_bind_check PRIVATE -O2)
 target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::cudart)
 
+# Expert row-bytes gate (branch glm5next-port): does iq_row_bytes reproduce the sizes the pack actually holds for the
+# expert projections, and does iq_supported name the right types?  The routed experts have never gone through the native
+# path, so this bridge has never been exercised - and the expected sizes come from the pack, not from iq_row_bytes.
+add_executable(expert_row_bytes_gate tools/expert_row_bytes_gate.cpp)
+target_include_directories(expert_row_bytes_gate PRIVATE /include)
+target_compile_options(expert_row_bytes_gate PRIVATE -O2)
+target_link_libraries(expert_row_bytes_gate PRIVATE strata_core strata_kernels CUDA::cudart)
+
 # KDA gate (branch glm5next-port): kda_forward against the reference implementation's own weights, input and
 # expected intermediates, fed from the fixture the oracle writes.  kda_forward is host code, so this target needs
 # no CUDA sources beyond the runtime it links.

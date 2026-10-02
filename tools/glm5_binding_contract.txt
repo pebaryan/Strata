@@ -6495,3 +6495,41 @@ between gate_off, up_off and down_off, but those are ABSOLUTE offsets in a shard
 tensors, so their differences cannot validate the per-expert layout.  It was left as a block of no-ops that READ like a
 check, which is worse than having no check at all - an instrument that reports nothing while looking like it verified
 something.  It is gone, with a note saying why, so nobody re-adds it.
+
+THE EXPERT ROW-BYTES GATE: THE BRIDGE IS EXACT FOR 14 LAYERS, AND IT FOUND A TRAP ON THE PATH
+
+    tools/expert_row_bytes_gate.cpp, target expert_row_bytes_gate
+
+      IQ2_XXS gate/up (4096->2048)  supported yes   2162688 == 2162688   ok
+      IQ1_S   gate/up (4096->2048)  supported no          0 vs 1638400   GAP
+      Q2_K    gate/up (4096->2048)  supported no          0 vs 2752512   GAP
+      IQ3_XXS down    (2048->4096)  supported yes   3211264 == 3211264   ok
+      IQ4_XS  down    (2048->4096)  supported yes   4456448 == 4456448   ok
+      Q3_K    down    (2048->4096)  supported yes   3604480 == 3604480   ok
+
+    and, run with --bad so that every expectation is deliberately wrong: 6 of 6 disagree, PASS - so the gate's ability to
+    fail is verified rather than assumed.
+
+WHAT THE PASSES BUY: iq_row_bytes reproduces the pack's own expert sizes exactly for types 16, 18 and 23 - the three
+types that cover 14 of the 43 layers - so the bridge the upload path will use, from a (layer, expert) pair to a byte range
+the kernel accepts, is verified against the pack rather than against itself.
+
+WHAT THE FAILURES NAME: types 19 (IQ1_S, 28 layers) and 10 (Q2_K, 1 layer) return a row size of ZERO.  That is not a
+mystery, it is the missing-kernel gap already scoped - but it is now measured at the exact function the port calls, which
+is the difference between knowing a kernel is missing and knowing what the port will do when it reaches it.
+
+AND THE TRAP: iq_supported(11) RETURNS TRUE, iq_row_bytes(11) RETURNS THE RIGHT SIZE, AND iq_mmvq HAS NO CASE 11.
+Its switch covers 16, 17, 18, 20, 21, 22, 23, 29 and 42, and its default is `std::exit(1)`.  So the guard a caller would
+naturally write -
+
+    if (iq_supported(type)) iq_mmvq(type, ...);
+
+- PASSES for type 11 and then TERMINATES THE PROCESS.  Type 11 is layer 45's down projection, so this is not a
+hypothetical: a device expert path guarding on iq_supported would die on that layer, and the failure would look like a
+crash rather than a missing kernel.  THE PORT MUST THEREFORE GUARD ON THE DISPATCH LIST ITSELF, NOT ON iq_supported, and
+the gate says so in its own output rather than leaving the inconsistency inside a green line.  Note also that a hard
+std::exit in a serving engine is the worst available failure mode for this, which is why it is recorded here and not
+merely worked around.
+
+ALSO CORRECTED: an earlier note in this contract said type 11 was covered by iq_mmvq's dispatch alongside 23.  It is not,
+and the gate is what caught the difference between what the library claims and what it does.
