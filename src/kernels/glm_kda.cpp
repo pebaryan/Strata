@@ -16,6 +16,7 @@ namespace {
 
 KdaNativeProjectFn g_native_project = nullptr;
 bool g_device_recurrence = false;
+bool g_device_gates = false;
 
 /// WHERE THE KDA STAGE'S HOST TIME GOES, phase by phase.  The blocks are 69.9% of the wall time and their projections are
 /// already native, so the remainder is the non-GEMM work - and there are four distinct candidates in here (the input
@@ -75,10 +76,16 @@ void conv1d_silu(const float* conv_w, const float* proj /* [tokens][d_inner] */,
 
 void kda_set_native_project(KdaNativeProjectFn fn) { g_native_project = fn; }
 void kda_set_device_recurrence(bool enabled) { g_device_recurrence = enabled; }
+void kda_set_device_gates(bool enabled) { g_device_gates = enabled; }
 
 #if !defined(STRATA_ENABLE_CUDA)
 bool kda_recurrence_cuda(const float*, const float*, const float*, const float*, const float*, int, int, int,
                          float*, float*, char* error, size_t error_capacity) {
+    if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return false;
+}
+bool kda_gates_cuda(const float*, const float*, const float*, const float*, const float*, const float*, int, int, int, int,
+                    float*, float*, char* error, size_t error_capacity) {
     if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
     return false;
 }
@@ -155,20 +162,29 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     // reference's `sigmoid(-(ssm_a * (...)))` is sigmoid(exp(A_log) * (...)), and the magnitude of the
     // exponent then multiplies the gate's lower bound.
     std::vector<float> gv((size_t) tokens * nh * hd), beta((size_t) tokens * nh);
-    std::vector<float> fa((size_t) hd), fb((size_t) di);
-    for (int t = 0; t < tokens; ++t) {
-        const float* xt = xn.data() + (size_t) t * ne;
-        matvec(w.ssm_f_a, xt, fa.data(), hd, ne);
-        matvec(w.ssm_f_b, fa.data(), fb.data(), di, hd);
-        for (int h = 0; h < nh; ++h) {
-            for (int i = 0; i < hd; ++i) {
-                const float v = fb[(size_t) h * hd + i] + w.dt_bias[(size_t) h * hd + i];
-                gv[((size_t) t * nh + h) * hd + i] = KDA_GATE_LOWER * sigmoid(-(w.ssm_a[h] * v));
+    bool gates_done = false;
+    if (g_device_gates) {
+        char cuda_err[256] = {};
+        gates_done = kda_gates_cuda(xn.data(),w.ssm_f_a,w.ssm_f_b,w.ssm_beta,w.ssm_a,w.dt_bias,
+                                    tokens,ne,nh,hd,gv.data(),beta.data(),cuda_err,sizeof(cuda_err));
+        if (!gates_done) std::fprintf(stderr,"GLM KDA CUDA gates unavailable: %s; using host gates\n",cuda_err);
+    }
+    if (!gates_done) {
+        std::vector<float> fa((size_t) hd), fb((size_t) di);
+        for (int t = 0; t < tokens; ++t) {
+            const float* xt = xn.data() + (size_t) t * ne;
+            matvec(w.ssm_f_a, xt, fa.data(), hd, ne);
+            matvec(w.ssm_f_b, fa.data(), fb.data(), di, hd);
+            for (int h = 0; h < nh; ++h) {
+                for (int i = 0; i < hd; ++i) {
+                    const float v = fb[(size_t) h * hd + i] + w.dt_bias[(size_t) h * hd + i];
+                    gv[((size_t) t * nh + h) * hd + i] = KDA_GATE_LOWER * sigmoid(-(w.ssm_a[h] * v));
+                }
+                const float* b_row = w.ssm_beta + (size_t) h * ne;
+                float acc = 0.0f;
+                for (int c = 0; c < ne; ++c) acc += b_row[c] * xt[c];
+                beta[(size_t) t * nh + h] = sigmoid(acc);
             }
-            const float* b_row = w.ssm_beta + (size_t) h * ne;
-            float acc = 0.0f;
-            for (int c = 0; c < ne; ++c) acc += b_row[c] * xt[c];
-            beta[(size_t) t * nh + h] = sigmoid(acc);
         }
     }
     if (mid && mid->g) std::memcpy(mid->g, gv.data(), gv.size() * sizeof(float));

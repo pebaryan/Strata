@@ -68,6 +68,10 @@ void kda_set_device_recurrence(bool enabled);
 bool kda_recurrence_cuda(const float* q, const float* k, const float* v, const float* g, const float* beta,
                          int tokens, int nh, int hd, float* state, float* attn,
                          char* error, size_t error_capacity);
+bool kda_gates_cuda(const float* xn, const float* ssm_f_a, const float* ssm_f_b, const float* ssm_beta,
+                    const float* ssm_a, const float* dt_bias, int tokens, int n_embd, int nh, int hd,
+                    float* g, float* beta, char* error, size_t error_capacity);
+void kda_set_device_gates(bool enabled);
 
 /// Print the KDA stage's host-time breakdown, phase by phase.  Diagnostics only.
 void kda_print_profile();

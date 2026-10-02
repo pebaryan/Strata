@@ -635,6 +635,10 @@ int main(int argc, char** argv) {
     const bool kda_cuda = !kda_cuda_env || std::strcmp(kda_cuda_env,"0") != 0;
     K::kda_set_device_recurrence(kda_cuda);
     std::printf("KDA recurrence: %s\n",kda_cuda?"CUDA":"host");
+    const char* kda_gates_env = std::getenv("STRATA_GLM_KDA_GATES");
+    const bool kda_gates_cuda = !kda_gates_env || std::strcmp(kda_gates_env,"0") != 0;
+    K::kda_set_device_gates(kda_gates_cuda);
+    std::printf("KDA gates: %s\n",kda_gates_cuda?"CUDA":"host");
 
     // ---- bind and map all 45 blocks
     P.bound.resize(N_LAYERS);
