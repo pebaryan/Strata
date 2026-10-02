@@ -6533,3 +6533,40 @@ merely worked around.
 
 ALSO CORRECTED: an earlier note in this contract said type 11 was covered by iq_mmvq's dispatch alongside 23.  It is not,
 and the gate is what caught the difference between what the library claims and what it does.
+
+THE DEVICE-RESIDENT EXPERT CACHE'S POLICY HALF IS BUILT AND GATED, AND THE HOT SET PREMISE IS CHECKED
+
+    include/strata/core/expert_row_cache.hpp, src/core/expert_row_cache.cpp, tools/expert_row_cache_gate.cpp
+
+      17 checks pass, covering: the budget is never exceeded; resident entries never exceed budget/row size; 25 inserts
+      into a 10-row budget evict exactly 15; every eviction is reported to the caller with its bytes; an oversized row
+      reports cannot_fit and is refused by insert as well as by lookup; re-inserting a key charges the new size and not
+      the sum; clear() hands back every resident row so the caller can free the device memory; and the measured hot set
+      - 43 layers x 8 experts at the measured mean expert size - is admitted by an 8 GB budget with ZERO evictions.
+
+      and run with --bad, which skips the touch() that makes an entry most-recently-used, 2 checks fail and the gate
+      reports PASS for its own ability to fail.
+
+    expert rows: 344 resident, 2.24 of 8.00 GB used, hits 0 misses 344 evictions 0 refusals 0
+
+WHY THE POLICY IS SEPARATE FROM THE UPLOAD, and it is not for tidiness: this class contains no CUDA, no allocation and no
+copy, so its policy can be tested without a GPU and - more importantly - a policy bug cannot hide behind a cudaMalloc
+that happens to work.  The three ways this cache can be wrong are that it exceeds its budget, evicts the wrong row, or
+fails to hand back rows it drops, and all three are checked here.  What it does NOT yet have is the upload half and the
+stage that drives it, which is the next piece.
+
+THE HOT-SET PREMISE IS NOW A CHECKED FACT RATHER THAN AN ESTIMATE: 344 rows, 2.24 GB, zero evictions inside an 8 GB
+budget.  That is the number the whole device-expert decision rests on - a naive upload-per-token would be 2.40 GB of PCIe
+per token and a wash against the ~360 ms of dequantisation it replaces - so having it verified by the policy that will
+actually enforce it is worth more than the arithmetic that predicted it.
+
+TWO ERRORS OF MINE ON THE WAY, BOTH INSTRUMENT-SIDE:
+  1. The gate's first run reported two FAILs in the LRU test, and the CACHE WAS RIGHT: insert() pushes to the front, so
+     after inserting 0,1,2 the order is [2,1,0] and touch(0) makes it [0,2,1] - the least recently used row is expert 1,
+     not expert 2 as the test asserted.  I had the victim wrong by one position in my own mental model of my own cache.
+     The gate caught it, which is what a gate is for, and the corrected expectation is now in the file with the ordering
+     written out so the next reader does not repeat it.
+  2. ${CMAKE_CURRENT_SOURCE_DIR} inside a heredoc was SHELL-EXPANDED to nothing, leaving `target_include_directories(... PRIVATE /include)`
+     in CMakeLists.txt.  The target that had been added earlier survived only because it links strata_core, whose include
+     directories propagate - i.e. it was building by luck.  Both lines are now correct, and the rule already in this
+     port's notes holds again: edit files with the patch tool, not with a scripted write inside a shell heredoc.
