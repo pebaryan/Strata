@@ -6840,3 +6840,35 @@ source->blob(layer, expert) if not, builds the five arrays native_expert_grouped
 addresses, allocates scratch by native_expert_scratch_bytes, calls it, and lets moe_combine apply the weights; guarded by
 an EXPLICIT type list (16, 18, 23 - the three whose kernels exist) rather than iq_supported, and gated against the CPU
 expert path on the 14 layers those types cover, with the cache cold in one run and warm in the other.
+
+THE PARITY GATE'S CPU REFERENCE EXISTS AND MATCHES THE DEVICE CALL ONE TO ONE
+
+    include/strata/kernels/cpu/native_expert.hpp
+
+      bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
+      void native_quant_act(const NativeFmt& f, const float* x, void* dst);        // quantise the activation
+      void native_gu_rows(const NativeFmt& f, const uint8_t* blob, const void* const* act, int nt,
+                          float* const* ff, ...);                                   // gate+up over rows of the blob
+      void native_quant_h(const NativeFmt& f, const float* h, void* dst);          // quantise the hidden
+      void native_down_rows(const NativeFmt& f, const uint8_t* blob, const void* const* hq, int nt,
+                            float* const* out, ...);                                // down over rows of the blob
+
+    This is the CPU path's own native-pack expert FFN, and it takes THE SAME BLOB the device call would upload - so the
+    parity gate is a direct comparison rather than a reconstruction:
+
+      host   : native_fmt(16, 18, 4096, 2048, f) ; native_quant_act(f, x, act) ; native_gu_rows(f, blob, {act}, 1, {ff})
+               ; [SiLU] ; native_quant_h(f, h, hq) ; native_down_rows(f, blob, {hq}, 1, {out})
+      device : native_expert_layout(16, 18, 4096, 2048) ; upload blob ; quantize_q8_1_rows(x) ;
+               native_expert_grouped(L, {row}, {0}, {1}, {dst}, {tok}, 1, 1, xq, scratch, out_dev, stream)
+
+    and the two differ in the ACTIVATION QUANTISATION (the CPU fmt's own format versus the device's q8_1), so the gate's
+    criterion cannot be bit-identity - it has to be agreement comparable to the paths' own precision, which is the
+    criterion glm_moe_parity already used for the shared expert: there, "native vs oracle 0.0116011" equalled "native vs
+    float 0.0116012", i.e. the native path matched the oracle as closely as it matched the float path, and THAT equality
+    was the proof.  The same shape applies here.
+
+    ALSO WORTH NOTING, because it nearly misled this reading: expert_pool_dispatch - the OTHER model family's adapter in
+    the same translation unit - refuses a native pack outright ("the single-token expert path does not take a native (IQ)
+    pack") and is compiled for a 2560-wide activation.  Its refusal is not a statement about GLM's path; GLM's CPU expert
+    path goes through the runner's blob_fn adapter instead, and it is the native CPU kernels above that the device stage
+    must be compared against.
