@@ -6413,3 +6413,34 @@ SO THE ORDER IS: resolve those three rows before the device expert path relies o
 resolve them is a decode of one block from each layer's blob and a comparison against the same weights read from the
 GGUF through the reference's own reader - a measurement rather than an inference from arithmetic, since the arithmetic
 has already told us it cannot decide.
+
+THE THREE "OUTLIER" ROWS WERE MY ARITHMETIC'S FAULT, NOT THE PACK'S - AND THE CORRECTION IMPROVES THE SCOPE
+
+    blk.11.ffn_gate_exps.weight   type 16   shape [4096, 2048, 288]
+    blk.11.ffn_up_exps.weight     type 16   shape [4096, 2048, 288]
+    blk.11.ffn_down_exps.weight   type 23   shape [2048, 4096, 288]
+    blk.3  has the same gate and up, and type 18 for down.
+
+SO THE DECLARED TYPES ARE RIGHT AND MY CANDIDATE TABLE WAS WRONG.  Type 23 is 136 bytes per 256 weights (IQ4_XS), not
+the 110 my candidate list guessed, and with it the arithmetic closes exactly:
+
+    2 * 8,388,608 * 66/256  +  8,388,608 * 136/256  =  4,325,376 + 4,456,448  =  8,781,824   == the pack's blob_bytes
+
+Layer 3's down at 98 bytes per 256 gives 4,325,376 + 3,211,264 = 7,536,640, also exact, so the method is sound and the
+single wrong constant was mine.  THE LESSON IS THE ONE THIS PORT KEEPS PAYING FOR: an inference from a table I wrote down
+is not evidence, and the measurement - the GGUF's own tensor list - decided it in one command after the arithmetic had
+already said it could not.  This is the tenth time in this session that the instrument, not the engine, was wrong.
+
+AND THE CORRECTION CHANGES THE SCOPE FOR THE BETTER, because type 23 IS in iq_mmvq's dispatch list:
+
+    gu 19 (IQ1_S) + down 18 (IQ3_XXS) : 28 layers   needs IQ1_S
+    gu 16 (IQ2_XXS) + down 18         : 11 layers   ALREADY SERVABLE
+    gu 16           + down 23 (IQ4_XS):  3 layers   ALREADY SERVABLE
+    gu 10 (Q2_K)    + down 11 (Q3_K)  :  1 layer    needs Q2_K and Q3_K
+
+SO FOURTEEN OF FORTY-THREE LAYERS ARE FULLY SERVABLE BY THE KERNELS THAT ALREADY EXIST (16, 18 and 23 are all in
+iq_mmvq's dispatch), which means the device expert path can be built and gated on those layers FIRST - a third of the
+expert work - with IQ1_S following to add the other 28 rather than being a prerequisite for any of it.  The corrected
+byte sizes, for the row arithmetic the kernel's load path will need:
+
+    16 -> 66   18 -> 98   19 -> 50   23 -> 136   10 -> 84   11 -> 110     (bytes per 256 weights)
