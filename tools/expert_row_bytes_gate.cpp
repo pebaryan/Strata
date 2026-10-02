@@ -38,16 +38,11 @@ int main(int argc, char** argv) {
     const std::vector<Case> cases = {
         // type, n_in, n_out, bytes the pack holds for that projection, what it is, whether iq_supported should say yes
         {16, 4096, 2048, 2162688ull, "IQ2_XXS gate/up  (4096->2048)", true},
-        {19, 4096, 2048, 1638400ull, "IQ1_S   gate/up  (4096->2048)", false},
-        {10, 4096, 2048, 2752512ull, "Q2_K    gate/up  (4096->2048)", false},
+        {19, 4096, 2048, 1638400ull, "IQ1_S   gate/up  (4096->2048)", true},
+        {10, 4096, 2048, 2752512ull, "Q2_K    gate/up  (4096->2048)", true},
         {18, 2048, 4096, 3211264ull, "IQ3_XXS down     (2048->4096)", true},
         {23, 2048, 4096, 4456448ull, "IQ4_XS  down     (2048->4096)", true},
-        // TYPE 11 IS THE TRAP THIS GATE EXISTS FOR.  iq_supported(11) returns TRUE and iq_row_bytes(11) returns the
-        // right size, but iq_mmvq's switch has no case 11 and its default calls std::exit(1) - so the guard a caller
-        // would naturally write (if (iq_supported(type)) iq_mmvq(...)) passes the check and then TERMINATES THE PROCESS.
-        // The expectation here is therefore the library's own claim (true), and the inconsistency is reported as a
-        // warning below rather than hidden inside a pass: this gate cannot call iq_mmvq(11) to prove it, because doing
-        // so would exit the gate itself.
+        // Q3_K type 11 now has an MMVQ case as well as the pre-existing row-size entry.
         {11, 2048, 4096, 3604480ull, "Q3_K    down     (2048->4096)", true},
     };
 
@@ -69,8 +64,10 @@ int main(int argc, char** argv) {
     // compared a per-row figure against a whole-projection figure and reported the helper as wrong when it was not.
     std::printf("\n  native_expert_layout, for the two type pairs that matter (gu_row/d_row are BYTES PER ROW):\n");
     const struct { int gu, d; unsigned long long gu_row, d_row, bytes; const char* what; } layouts[] = {
-        {16, 18, 1056ull, 784ull, 7536640ull, "IQ2_XXS / IQ3_XXS - 14 layers"},
-        {19, 18, 0ull, 784ull, 3211264ull, "IQ1_S / IQ3_XXS   - 28 layers"},
+        {16, 18, 1056ull, 784ull, 7536640ull, "IQ2_XXS / IQ3_XXS - 11 layers"},
+        {16, 23, 1056ull, 1088ull, 8781824ull, "IQ2_XXS / IQ4_XS - 3 layers"},
+        {19, 18, 800ull, 784ull, 6488064ull, "IQ1_S / IQ3_XXS - 28 layers"},
+        {10, 11, 1344ull, 880ull, 9109504ull, "Q2_K / Q3_K - 1 layer"},
     };
     for (const auto& L : layouts) {
         const strata::kernels::NativeExpertLayout lay = strata::kernels::native_expert_layout(L.gu, L.d, 4096, 2048);
@@ -94,9 +91,6 @@ int main(int argc, char** argv) {
     std::printf("\n  %d of %zu case(s) disagree%s\n", failures, cases.size(), bad ? " (expected: all of them)" : "");
 
     // the known inconsistency, stated rather than buried
-    std::printf("  WARNING: type 11 (Q3_K) is CLAIMED by iq_supported and has a row size, but iq_mmvq has no case for it\n");
-    std::printf("           and its default calls std::exit(1) - so iq_supported is NOT a safe guard before iq_mmvq,\n");
-    std::printf("           and the port must guard on the dispatch list itself.  Type 11 is layer 45's down projection.\n");
     if (bad) {
         std::printf("  %s - the gate's ability to fail is verified\n",
                     failures == (int) cases.size() ? "PASS" : "FAIL (it did not notice the wrong expectations)");

@@ -1,30 +1,28 @@
 // include/strata/core/glm_expert_types.hpp - WHICH expert types the device kernels actually implement.
 //
-// THIS EXISTS BECAUSE iq_supported IS NOT A SAFE GUARD.  Three of the types this port needs are handled as follows:
+// The model's expert types are now fully covered by per-expert iq_mmvq: IQ1_S (19), Q2_K (10), and Q3_K (11)
+// were added to the dispatch with measured row-byte gates and real-pack CPU/device parity tests. This helper records
+// the explicit dispatch lists so future formats cannot be enabled by row-size support alone.
 //
-//   type 19 (IQ1_S, the gate/up of 28 of 43 layers)   iq_supported false, iq_row_bytes 0, no kernel
-//   type 10 (Q2_K, the gate/up of 1 layer)            iq_supported false, iq_row_bytes 0, no kernel
-//   type 11 (Q3_K)                                    iq_supported TRUE, iq_row_bytes CORRECT, NO KERNEL CASE
+// The grouped native_expert_grouped kernel remains a distinct, narrower API; its down switch is still only 20, 23, 42.
+// A capability must always be scoped to the entrypoint that will actually run.
 //
-// and every one of those dispatch switches ends in `default: ... std::exit(1)`.  So a guard written as
-// `if (iq_supported(t))` passes for type 11 and TERMINATES THE PROCESS, and a guard written as "not supported, fall back"
-// is right for 19 and 10 but would never have noticed 11.  The lists below are transcribed from the switch statements
-// themselves, not from documentation, and the gate beside this header checks them against the live kernels.
-//
-// The model's own types, for reference (tools/check_expert_rows.py):
+// // The model's own types, for reference (tools/check_expert_rows.py):
 //   gate/up : 19 on 28 layers, 16 on 14, 10 on 1        down : 18 on 39 layers, 23 on 3, 11 on 1
-// so the device path can serve every expert of 14 of the 43 layers today (16/18 and 16/23), and the rest need kernels.
+// so the per-expert device path can now serve all 43 routed layers; the grouped path remains narrower.
 #pragma once
 
 namespace strata {
 namespace core {
 
-/// Does a native_expert_grouped gate/up dispatch case exist for this type?
+/// Does iq_mmvq have a gate/up dispatch case for this type?
 inline bool glm_expert_gu_supported(int ggml_type) {
     switch (ggml_type) {
+        case 10:
         case 16:
         case 17:
         case 18:
+        case 19:
         case 21:
         case 22:
         case 23:
@@ -37,7 +35,7 @@ inline bool glm_expert_gu_supported(int ggml_type) {
     }
 }
 
-/// iq_mmvq's dispatch - the PER-EXPERT path, and the set a per-expert stage must guard on.
+/// iq_mmvq's down dispatch - the PER-EXPERT path, and the set a per-expert stage must guard on.
 ///
 /// CORRECTION: the first version of this function was generated from native_expert_grouped's DOWN switch, which covers
 /// only 20, 23 and 42, and it therefore refused (16, 18) - the pair that 39 of this model's 43 layers use and that iq_mmvq
@@ -45,6 +43,7 @@ inline bool glm_expert_gu_supported(int ggml_type) {
 /// it.  Both switches are now recorded, separately and honestly: this one is iq_mmvq's.
 inline bool glm_expert_down_supported(int ggml_type) {
     switch (ggml_type) {
+        case 11:
         case 16:
         case 17:
         case 18:

@@ -34,6 +34,8 @@
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/glm_bind.hpp"
+#include "strata/core/expert_row_cache.hpp"
+#include "strata/core/glm_expert_device.hpp"
 #include "strata/core/glm_layer.hpp"
 #include "strata/core/glm_layer_weights.hpp"
 #include "strata/core/glm_moe_native.hpp"
@@ -46,10 +48,12 @@
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 
 namespace C = strata::core;
 namespace K = strata::kernels::glm;
 namespace KCPU = strata::kernels::cpu;
+namespace KN = strata::kernels;
 
 static const int N_LAYERS = 45;      // blocks 0..44; 45 is the MTP head and not part of the trunk
 static const int N_EMBD = 4096;
@@ -177,19 +181,11 @@ struct Provider {
     K::MlaGeometry mla_g;
     K::MoeGeometry dense_g, moe_g, shexp_g;
     C::ExpertSource* src = nullptr;
-    /// ONE STAGED TENSOR, AND HOW TO PUT IT BACK.  The staging does not merely add a buffer: it MUTATES the bound block,
-    /// re-pointing a tensor at a host buffer and clearing its quantized flag so it is not dequantized twice.  Both
-    /// mutations outlive the buffer, which is freed when the next layer is asked for - so on the next token the block
-    /// holds a dangling pointer and, the flag having been cleared, never re-stages.  Token 0 passes (each layer visited
-    /// once, so nothing reads the freed pointers) and token 1 faults on the first dereference.
-    struct StagedRecord {
-        C::GlmBoundBlock* block;
-        size_t idx;
-        const float* ptr;
-        bool quantized;
-    };
-    std::vector<float*> staged;      ///< this layer's host floats; freed when the next layer is asked for
-    std::vector<StagedRecord> records;
+    std::vector<std::vector<float*> > staged_by_layer;
+    ~Provider() {
+        for (std::vector<float*>& layer : staged_by_layer)
+            for (float* f : layer) std::free(f);
+    }
 };
 
 /// Dequantize one quantized bound tensor to HOST floats.  The kernels are device kernels (dequant_q5_K was gated
@@ -232,6 +228,81 @@ static float* dequant_to_host(const C::GlmBoundBlock::Tensor& t, std::string& er
 
 static const uint8_t* blob_adapter(void* ctx, int layer, int expert) {
     return ((C::ExpertSource*) ctx)->blob(layer, expert);
+}
+
+static void free_expert_row(void*, const C::ExpertRowKey&, const C::ExpertRowEntry& entry) {
+    if (entry.dev != nullptr) (void) cudaFree(entry.dev);
+}
+
+static C::ExpertRowCacheConfig expert_cache_config(size_t budget) {
+    C::ExpertRowCacheConfig cfg;
+    cfg.budget_bytes = budget;
+    cfg.on_evict = &free_expert_row;
+    return cfg;
+}
+
+struct GlmExpertDeviceRuntime {
+    C::ExpertRowCache cache;
+    C::GlmExpertDeviceScratch scratch;
+
+    explicit GlmExpertDeviceRuntime(size_t budget) : cache(expert_cache_config(budget)) {}
+    ~GlmExpertDeviceRuntime() {
+        cache.clear();
+        scratch.release();
+    }
+};
+
+static bool run_cached_device_expert(void* raw, int layer, int expert, const uint8_t* blob,
+                                     const KCPU::NativeFmt& fmt, const float* x, float* out, std::string& err) {
+    GlmExpertDeviceRuntime& runtime = *(GlmExpertDeviceRuntime*) raw;
+    const KN::NativeExpertLayout layout =
+        KN::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
+    if (layout.bytes == 0 || layout.bytes != fmt.bytes) {
+        err = "device expert layout disagrees with NativeFmt byte count";
+        return false;
+    }
+    if (runtime.scratch.n_embd == 0 && !runtime.scratch.alloc(fmt.n_embd, fmt.n_ff, err)) return false;
+
+    const C::ExpertRowKey key{layer, expert};
+    const C::ExpertRowState state = runtime.cache.lookup(key, layout.bytes);
+    void* device_row = nullptr;
+    bool temporary = false;
+    if (state == C::ExpertRowState::resident) {
+        const C::ExpertRowEntry* entry = runtime.cache.find(key);
+        if (entry == nullptr || entry->dev == nullptr || entry->bytes != layout.bytes) {
+            err = "expert cache reported resident without a matching device row";
+            return false;
+        }
+        device_row = entry->dev;
+    } else {
+        if (cudaMalloc(&device_row, layout.bytes) != cudaSuccess) {
+            err = std::string("cudaMalloc expert row: ") + cudaGetErrorString(cudaGetLastError());
+            return false;
+        }
+        if (cudaMemcpy(device_row, blob, layout.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            err = std::string("upload expert row: ") + cudaGetErrorString(cudaGetLastError());
+            cudaFree(device_row);
+            return false;
+        }
+        if (state == C::ExpertRowState::needs_upload) {
+            runtime.cache.insert(key, C::ExpertRowEntry{device_row, layout.bytes});
+            const C::ExpertRowEntry* entry = runtime.cache.find(key);
+            if (entry == nullptr) {
+                err = "expert cache did not retain a row it accepted";
+                return false;
+            }
+            device_row = entry->dev;
+        } else {
+            temporary = true;  // correctness-preserving path for a row larger than the configured cache budget
+        }
+    }
+
+    const bool ok = C::glm_expert_ffn_device_resident((const uint8_t*) device_row, layout, fmt.gu_type, fmt.d_type,
+                                                       fmt.n_embd, fmt.n_ff, x, out, runtime.scratch, err);
+    if (temporary) cudaFree(device_row);
+    if (!ok && !err.empty())
+        err = "layer " + std::to_string(layer) + " expert " + std::to_string(expert) + ": " + err;
+    return ok;
 }
 
 static bool native_kda_project(int count, const void* const* weights, const int* types,
@@ -284,24 +355,8 @@ static bool native_glm_ffn(const void* const* weights, const int* types, const K
 static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, std::string& err) {
     Provider* p = (Provider*) raw;
     if (layer < 0 || layer >= N_LAYERS) { err = "layer out of range"; return false; }
-    // ---- STAGE THIS LAYER'S WEIGHTS TO HOST, one layer at a time, releasing the previous layer's.
-    //
-    // The trunk's kernels are CPU-side, so every weight they read has to be host-resident floats - but materialising
-    // all forty-five layers at once is 20-30 GB and OOM-kills the box (measured: exit -9, no output).  The provider is
-    // the right place because glm_trunk_forward calls it once per layer, before that layer runs, which guarantees a
-    // layer's weights are needed only while that layer runs.
-    //
-    // Every quantized tensor is staged EXCEPT the dense FFN's three on blocks 0..2: those are consumed by the GPU path,
-    // which wants the quantized device blocks as they are, so they keep them.
-    // RESTORE BEFORE FREEING.  A bound block must go back to the state the binder left it in, because the next visit
-    // has to see a quantized tensor it can stage again - not one that claims already to be host floats.
-    for (const Provider::StagedRecord& r : p->records) {
-        r.block->tensors[r.idx].ptr = r.ptr;
-        r.block->tensors[r.idx].quantized = r.quantized;
-    }
-    p->records.clear();
-    for (float* f : p->staged) std::free(f);
-    p->staged.clear();
+    // Retain CPU-consumed dequantized tensors per layer across tokens/requests. The current sweep materializes
+    // about 1.55 GiB; freeing it each layer forced that same work to repeat for every prompt and decode token.
     {
         C::GlmBoundBlock& B = p->bound[(size_t) layer];
         const bool dense = (layer < 3);
@@ -331,13 +386,12 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
             // expert_ffn, so the crash simply moved from kda_forward to expert_ffn when the rest were staged.  Every
             // quantized tensor is staged, and the per-layer lifetime is what keeps it affordable.
             (void) dense;
-            p->records.push_back(Provider::StagedRecord{&B, i, t.ptr, t.quantized});
             float* h = dequant_to_host(t, err);
             if (h == nullptr) return false;
-            p->staged.push_back(h);
+            p->staged_by_layer[(size_t) layer].push_back(h);
             g_staged_bytes += (unsigned long long) t.ne0 * (unsigned long long) (t.ne1 > 0 ? t.ne1 : 1) * 4ull;
             t.ptr = h;
-            t.quantized = false;      // for the remainder of THIS visit; restored when the buffers are freed
+            t.quantized = false;      // cached host representation remains valid for the provider lifetime
         }
         // re-map: glm_fill_layer_weights is pure assignment, so doing it per layer costs nothing
         if (!C::glm::glm_fill_layer_weights(B, layer, p->kda_g, p->mla_g, p->kda[(size_t) layer],
@@ -492,6 +546,7 @@ int main(int argc, char** argv) {
     // ---- geometry.  The clamps are set EXPLICITLY: their defaults are 0.0f, which DISABLES them, and the header
     // says so in as many words.  A routed pre-activation past 10 would then be passed through unclamped, silently.
     Provider P;
+    P.staged_by_layer.resize(N_LAYERS);
     K::kda_set_native_project(&native_kda_project);
     // The same function serves the MLA: the signature is already generic (weights, types, shapes), so there is no reason
     // for a second implementation to exist and drift from this one.
@@ -516,6 +571,11 @@ int main(int argc, char** argv) {
     C::FileExpertSource src;
     if (!src.open(pack, 46, N_EXPERT, err)) { std::fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
     P.src = &src;
+
+    // Keep a bounded set of routed expert rows resident. The default leaves ample room for the model's other CUDA
+    // allocations while fitting the measured hot set; misses upload once and then reuse the device pointer.
+    GlmExpertDeviceRuntime expert_device_runtime((size_t) 8 * 1024 * 1024 * 1024);
+    C::glm::glm_set_device_expert_ffn(&run_cached_device_expert, &expert_device_runtime);
 
     // ---- bind and map all 45 blocks
     P.bound.resize(N_LAYERS);
@@ -798,6 +858,7 @@ int main(int argc, char** argv) {
         cudaFree(d_hidden);
         cudaFree(d_logits);
         cudaStreamDestroy(head_stream);
+        std::fprintf(stderr, "%s\n", expert_device_runtime.cache.report().c_str());
         return 0;
     }
 
@@ -828,9 +889,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "  34 KDA   : %8.1f ms %5.1f%%\n", kda_ms, 100.0 * kda_ms / total);
             std::fprintf(stderr, "  11 MLA   : %8.1f ms %5.1f%%\n", mla_ms, 100.0 * mla_ms / total);
             std::fprintf(stderr, "  heaviest block: layer %d at %.1f ms\n", worst.first, worst.second);
-            std::fprintf(stderr, "  staging: %.2f GB materialised over %d tokens = %.2f GB/token (dequant + D2H, the cost a device MMVQ removes)\n",
-                         (double) g_staged_bytes / 1073741824.0, TOKENS,
-                         (double) g_staged_bytes / 1073741824.0 / TOKENS);
+            std::fprintf(stderr, "  host staging: %.2f GB cached across layers and materialised once\n",
+                         (double) g_staged_bytes / 1073741824.0);
                     {
             std::vector<std::pair<std::string, double> > v(g_prof.by_stage.begin(), g_prof.by_stage.end());
             std::sort(v.begin(), v.end(), [](const std::pair<std::string, double>& a,
@@ -863,5 +923,6 @@ int main(int argc, char** argv) {
     K::kda_print_profile();
     std::printf("\nargmax = %d   (logit %.6f)   expected 12089\n", best, best_logit);
     std::printf("ENGINE TOKEN: %s\n", best == 12089 ? "PASS" : "MISMATCH");
+    std::fprintf(stderr, "%s\n", expert_device_runtime.cache.report().c_str());
     return best == 12089 ? 0 : 1;
 }

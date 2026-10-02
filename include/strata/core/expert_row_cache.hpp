@@ -68,6 +68,8 @@ public:
     explicit ExpertRowCache(const ExpertRowCacheConfig& cfg) : cfg_(cfg) {}
 
     ExpertRowState lookup(const ExpertRowKey& key, std::size_t bytes);
+    /// Read a resident entry after lookup() reports resident; nullptr when the key is absent.
+    const ExpertRowEntry* find(const ExpertRowKey& key) const;
 
     /// Record a row as resident.  Pays for it by dropping least-recently-used entries; the caller is expected to have
     /// called lookup() first and to upload only when it said needs_upload.

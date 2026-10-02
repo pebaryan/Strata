@@ -15,6 +15,7 @@
 #include <cmath>
 #include <cstdio>
 #include <vector>
+#include "strata/kernels/elementwise.hpp"
 
 namespace strata {
 namespace core {
@@ -69,10 +70,11 @@ void GlmExpertDeviceScratch::release() {
     n_embd = n_ff = 0;
 }
 
-bool glm_expert_ffn_device(const uint8_t* blob_host, const kernels::NativeExpertLayout& layout, int gu_type, int d_type,
-                           int64_t n_embd, int64_t n_ff, const float* x_host, float* out_host,
-                           GlmExpertDeviceScratch& s, std::string& err) {
-    if (blob_host == nullptr) { err = "expert blob is null"; return false; }
+bool glm_expert_ffn_device_resident(const uint8_t* blob_device, const kernels::NativeExpertLayout& layout,
+                                    int gu_type, int d_type, int64_t n_embd, int64_t n_ff,
+                                    const float* x_host, float* out_host,
+                                    GlmExpertDeviceScratch& s, std::string& err) {
+    if (blob_device == nullptr) { err = "resident expert blob is null"; return false; }
     if (x_host == nullptr || out_host == nullptr) { err = "activation or output is null"; return false; }
 
     // THE GUARD, and it must be this one rather than iq_supported: type 11 is claimed supported, is sized correctly, and
@@ -86,39 +88,19 @@ bool glm_expert_ffn_device(const uint8_t* blob_host, const kernels::NativeExpert
         return false;
     }
     if (s.n_embd != n_embd || s.n_ff != n_ff) { err = "scratch geometry does not match the requested geometry"; return false; }
-    if (s.row == nullptr) {
-        if (cudaMalloc(&s.row, layout.bytes) != cudaSuccess) { err = cuda_reason("cudaMalloc row"); return false; }
-    }
-    if (x_host == nullptr || out_host == nullptr) { err = "null activation or output"; return false; }
-
-    if (cudaMemcpy(s.row, blob_host, layout.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
-        err = cuda_reason("upload the expert blob"); return false;
-    }
     if (cudaMemcpy(s.x, x_host, (size_t) n_embd * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
         err = cuda_reason("upload the activation"); return false;
     }
 
     kernels::quantize_q8_1_rows((const float*) s.x, 1, n_embd, s.xq, s.stream);
-    kernels::iq_mmvq(gu_type, (const uint8_t*) s.row, s.xq, s.gate, (int) n_embd, (int) n_ff, 1, s.stream);
-    kernels::iq_mmvq(gu_type, (const uint8_t*) s.row + layout.up_off, s.xq, s.up, (int) n_embd, (int) n_ff, 1, s.stream);
-    if (cudaStreamSynchronize((cudaStream_t) s.stream) != cudaSuccess) { err = cuda_reason("gate and up"); return false; }
+    kernels::iq_mmvq(gu_type, blob_device, s.xq, s.gate, (int) n_embd, (int) n_ff, 1, s.stream);
+    kernels::iq_mmvq(gu_type, blob_device + layout.up_off, s.xq, s.up, (int) n_embd, (int) n_ff, 1, s.stream);
+    // Keep the intermediate on-device; the prior host SiLU added gate/up downloads, hidden upload, and a sync per expert.
+    kernels::silu_mul((const float*) s.gate, (const float*) s.up, (float*) s.h, n_ff, s.stream);
 
-    // silu(gate) * up on the host - the same step native_gu_rows does internally and native_glm_ffn does on the host.
-    std::vector<float> g((size_t) n_ff), u((size_t) n_ff), h((size_t) n_ff);
-    if (cudaMemcpy(g.data(), s.gate, (size_t) n_ff * 4, cudaMemcpyDeviceToHost) != cudaSuccess ||
-        cudaMemcpy(u.data(), s.up, (size_t) n_ff * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
-        err = cuda_reason("download gate and up"); return false;
-    }
-    for (int64_t i = 0; i < n_ff; ++i) {
-        const float gi = g[(size_t) i];
-        h[(size_t) i] = (gi / (1.0f + std::exp(-gi))) * u[(size_t) i];
-    }
-    if (cudaMemcpy(s.h, h.data(), (size_t) n_ff * 4, cudaMemcpyHostToDevice) != cudaSuccess) {
-        err = cuda_reason("upload the hidden"); return false;
-    }
 
     kernels::quantize_q8_1_rows((const float*) s.h, 1, n_ff, s.hq, s.stream);
-    kernels::iq_mmvq(d_type, (const uint8_t*) s.row + layout.down_off, s.hq, s.out, (int) n_ff, (int) n_embd, 1, s.stream);
+    kernels::iq_mmvq(d_type, blob_device + layout.down_off, s.hq, s.out, (int) n_ff, (int) n_embd, 1, s.stream);
     if (cudaStreamSynchronize((cudaStream_t) s.stream) != cudaSuccess) { err = cuda_reason("down"); return false; }
     if (cudaMemcpy(out_host, s.out, (size_t) n_embd * 4, cudaMemcpyDeviceToHost) != cudaSuccess) {
         err = cuda_reason("download the output"); return false;
@@ -126,6 +108,21 @@ bool glm_expert_ffn_device(const uint8_t* blob_host, const kernels::NativeExpert
     const cudaError_t last = cudaGetLastError();
     if (last != cudaSuccess) { err = cuda_reason("after the expert FFN"); return false; }
     return true;
+}
+
+
+bool glm_expert_ffn_device(const uint8_t* blob_host, const kernels::NativeExpertLayout& layout, int gu_type, int d_type,
+                           int64_t n_embd, int64_t n_ff, const float* x_host, float* out_host,
+                           GlmExpertDeviceScratch& s, std::string& err) {
+    if (blob_host == nullptr) { err = "expert blob is null"; return false; }
+    if (s.row == nullptr && cudaMalloc(&s.row, layout.bytes) != cudaSuccess) {
+        err = cuda_reason("cudaMalloc row"); return false;
+    }
+    if (cudaMemcpy(s.row, blob_host, layout.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+        err = cuda_reason("upload the expert blob"); return false;
+    }
+    return glm_expert_ffn_device_resident((const uint8_t*) s.row, layout, gu_type, d_type, n_embd, n_ff,
+                                          x_host, out_host, s, err);
 }
 
 }  // namespace core

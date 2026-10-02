@@ -11,11 +11,20 @@
 
 #include "strata/kernels/glm_moe.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/core/glm_expert_types.hpp"
 
 namespace strata::core::glm {
 
-namespace { GlmNativeFfnFn g_native_ffn = nullptr; }
+namespace {
+GlmNativeFfnFn g_native_ffn = nullptr;
+GlmDeviceExpertFfnFn g_device_expert_ffn = nullptr;
+void* g_device_expert_ctx = nullptr;
+}
 void glm_set_native_ffn(GlmNativeFfnFn fn) { g_native_ffn = fn; }
+void glm_set_device_expert_ffn(GlmDeviceExpertFfnFn fn, void* ctx) {
+    g_device_expert_ffn = fn;
+    g_device_expert_ctx = ctx;
+}
 
 bool glm_try_native_ffn(const void* const* weights, const int* types, const kernels::glm::MoeGeometry& g,
                         const float* x, float* out, float clamp_limit) {
@@ -87,12 +96,23 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
             err = "glm_stage_moe_native: no blob for selected expert " + std::to_string(ids[i]);
             return false;
         }
+        float* expert_out = parts.data() + (size_t) i * g.n_embd;
+        // Only dispatch pairs proven by iq_mmvq enter the CUDA path. The remaining expert formats stay on the
+        // validated CPU path until their kernels exist; a CUDA failure for a supported pair is an error, not a silent
+        // CPU fallback that would disguise a broken device stage.
+        if (g_device_expert_ffn != nullptr && glm_expert_layer_supported(fmt.gu_type, fmt.d_type)) {
+            if (!g_device_expert_ffn(g_device_expert_ctx, layer, (int) ids[i], blob, fmt, xn, expert_out, err)) {
+                if (err.empty()) err = "glm_stage_moe_native: device expert FFN failed";
+                return false;
+            }
+            continue;
+        }
         const void* act_p[1] = { act.data() };
         float* ff_p[1] = { ff.data() };
         kernels::cpu::native_gu_rows(fmt, blob, act_p, 1, ff_p, 0, (int) g.ff);
         kernels::cpu::native_quant_h(fmt, ff.data(), hq.data());
         const void* hq_p[1] = { hq.data() };
-        float* out_p[1] = { parts.data() + (size_t) i * g.n_embd };
+        float* out_p[1] = { expert_out };
         kernels::cpu::native_down_rows(fmt, blob, hq_p, 1, out_p, 0, (int) g.n_embd);
     }
 

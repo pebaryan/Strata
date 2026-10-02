@@ -35,6 +35,21 @@ namespace K = strata::kernels;
 namespace C = strata::core;
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--guard-test") {
+        uint8_t dummy_blob = 0;
+        float dummy_x[4096] = {};
+        float dummy_out[4096] = {};
+        C::GlmExpertDeviceScratch scratch;
+        std::string guard_error;
+        const K::NativeExpertLayout dummy_layout{};
+        const bool accepted = C::glm_expert_ffn_device_resident(&dummy_blob, dummy_layout, 99, 18,
+                                                                 4096, 2048, dummy_x, dummy_out,
+                                                                 scratch, guard_error);
+        const bool passed = !accepted && guard_error.find("gu 99, down 18") != std::string::npos;
+        std::printf("device guard test: %s (%s)\n", passed ? "PASS" : "FAIL",
+                    guard_error.empty() ? "no refusal reason" : guard_error.c_str());
+        return passed ? 0 : 1;
+    }
     const std::string pack = (argc > 1) ? argv[1] : "/home/peb/moredata/strata-pack-glm5";
     const int layer = (argc > 2) ? std::atoi(argv[2]) : 3;
     const int expert = (argc > 3) ? std::atoi(argv[3]) : 0;

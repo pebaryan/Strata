@@ -54,11 +54,18 @@ struct GlmExpertDeviceScratch {
 /// than a re-derivation.  `x_host` is n_embd floats, `out_host` receives n_embd floats.
 ///
 /// Returns false with a reason on an uncovered type pair, on a CUDA failure, or on a geometry that disagrees with the
-/// scratch.  The router weights are deliberately NOT applied here: they belong with the MoE combination, which the engine
-/// already does on the device.
+/// scratch. The router weights are deliberately NOT applied here: glm_stage_moe_native combines the unweighted expert
+/// outputs with the router weights after this call returns.
 bool glm_expert_ffn_device(const uint8_t* blob_host, const kernels::NativeExpertLayout& layout, int gu_type, int d_type,
                            int64_t n_embd, int64_t n_ff, const float* x_host, float* out_host,
                            GlmExpertDeviceScratch& scratch, std::string& err);
+
+/// Same FFN when the expert blob is already resident on the device. The caller owns blob_device; this is the entry
+/// point used by the routed-stage cache so cache hits do not copy the row over PCIe again.
+bool glm_expert_ffn_device_resident(const uint8_t* blob_device, const kernels::NativeExpertLayout& layout,
+                                   int gu_type, int d_type, int64_t n_embd, int64_t n_ff,
+                                   const float* x_host, float* out_host,
+                                   GlmExpertDeviceScratch& scratch, std::string& err);
 
 }  // namespace core
 }  // namespace strata

@@ -1014,9 +1014,9 @@ target_link_libraries(block3_gate PRIVATE strata_kernels strata_kernels_cpu CUDA
 # ending in a token.  The acceptance test is argmax == 12089, not a per-layer float match, because the
 # engine accumulates the quantization of 43 routed blocks (~5% of rms worst element, measured).
 add_executable(glm45_run tools/glm45_run.cpp src/core/glm_trunk.cpp src/core/glm_layer.cpp
-               src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_bind.cpp
-               src/core/native_dense.cpp src/core/native_head.cpp src/core/expert_source.cpp src/core/expert_cache.cpp
-               src/core/remote_experts.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
+               src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_expert_device.cpp
+               src/core/expert_row_cache.cpp src/core/glm_bind.cpp src/core/native_dense.cpp src/core/native_head.cpp
+               src/core/expert_source.cpp src/core/expert_cache.cpp src/core/remote_experts.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
                src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu)
 target_include_directories(glm45_run PRIVATE /include)
 target_link_libraries(glm45_run PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
@@ -1025,9 +1025,9 @@ target_link_libraries(glm45_run PRIVATE strata_kernels strata_kernels_cpu CUDA::
 # binding path as glm45_run, exposed under the engine-facing name used by
 # deployment scripts.
 add_executable(strata-glm tools/glm45_run.cpp src/core/glm_trunk.cpp src/core/glm_layer.cpp
-               src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_bind.cpp
-               src/core/native_dense.cpp src/core/native_head.cpp src/core/expert_source.cpp src/core/expert_cache.cpp
-               src/core/remote_experts.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
+               src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_expert_device.cpp
+               src/core/expert_row_cache.cpp src/core/glm_bind.cpp src/core/native_dense.cpp src/core/native_head.cpp
+               src/core/expert_source.cpp src/core/expert_cache.cpp src/core/remote_experts.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
                src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu)
 target_include_directories(strata-glm PRIVATE /include)
 target_link_libraries(strata-glm PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)

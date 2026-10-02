@@ -6,6 +6,11 @@
 namespace strata {
 namespace core {
 
+const ExpertRowEntry* ExpertRowCache::find(const ExpertRowKey& key) const {
+    const auto it = map_.find(key);
+    return it == map_.end() ? nullptr : &it->second;
+}
+
 ExpertRowState ExpertRowCache::lookup(const ExpertRowKey& key, std::size_t bytes) {
     if (bytes > cfg_.budget_bytes) {
         ++refusals_;

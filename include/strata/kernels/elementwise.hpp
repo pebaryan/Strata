@@ -66,6 +66,10 @@ void f32_to_bf16_bulk(const float* x, uint16_t* y, int64_t n, void* stream);
 /// `x[i] = x[i] / (1 + exp(-x[i]))`, in place.
 void silu_inplace(float* x, int64_t n, void* stream);
 
+/// y[i] = silu(gate[i]) * up[i], using the device FP32 exponential.
+/// gate, up, and y are device pointers; launch asynchronously on stream.
+void silu_mul(const float* gate, const float* up, float* y, int64_t n, void* stream);
+
 /// `build_norm`: `y[r][c] = x[r][c] / sqrt(MEAN_c(x[r]^2) + eps) * w[c]`, over the LAST axis.
 ///
 /// QSA's norm, used on `attn_q` (24x256), `attn_k` (2x256) and `indexer.q_proj` (4x128). `w` may be null.

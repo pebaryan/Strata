@@ -78,6 +78,14 @@ __global__ void silu_kernel(float* __restrict__ x, int64_t n) {
     x[i] = (float) (v / (1.0 + exp(-v)));
 }
 
+__global__ void silu_mul_kernel(const float* __restrict__ gate, const float* __restrict__ up,
+                                float* __restrict__ y, int64_t n) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    const float v = gate[i];
+    y[i] = (v / (1.0f + expf(-v))) * up[i];
+}
+
 /// A bounded launch: a zero-length grid is illegal, and `n == 0` is a real call (an empty selection).
 inline unsigned grid_for(int64_t n) { return (unsigned) ((n + THREADS - 1) / THREADS); }
 
@@ -180,6 +188,13 @@ void silu_inplace(float* x, int64_t n, void* stream) {
     silu_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(x, n);
     check_launch("silu_inplace");
     sync_if_needed(stream, "silu_inplace");
+}
+
+void silu_mul(const float* gate, const float* up, float* y, int64_t n, void* stream) {
+    if (n <= 0) return;
+    silu_mul_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(gate, up, y, n);
+    check_launch("silu_mul");
+    sync_if_needed(stream, "silu_mul");
 }
 
 /// THE DOORBELL.  One thread, one INCREMENT - the cost is the launch, and inside a graph that is paid once.
