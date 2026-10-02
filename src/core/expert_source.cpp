@@ -586,7 +586,20 @@ bool FileExpertSource::pin_cache_complement(
         const uint64_t end_remainder = layer_end % page;
         const uint64_t extra = end_remainder == 0 ? 0 : page - end_remainder;
         const uint64_t advice_end = extra > mapped_bytes_ - layer_end ? mapped_bytes_ : layer_end + extra;
-        if (advice_end > advice_start &&
+        // THE PAGE-CACHE RELEASE IS OPT-IN, BECAUSE WITH A TOKEN LOOP IT GUARANTEES A MISS.  Measured, not argued: one
+        // five-token run read 2.18 GB from the device - 0.44 GB per token - and the routed-expert stage cost 861.7 ms
+        // per token, which is 0.44 GB at about 510 MB/s, so the stage is I/O bound rather than dequant- or FLOP-bound.
+        // Releasing each expert layer's pages after use makes EVERY token re-read them, and with the rows a token
+        // actually touches at ~0.44 GB against a 27 GB page cache there is nothing to gain by evicting them.  Set
+        // AND SO IS THIS DEAD END, WHICH IS WHY THE FLAG IS INVERTED: I first made keeping the pages the DEFAULT, on the
+        // theory that the rows a token touches (~0.44 GB) fit the 27 GB page cache - and it made the engine 1.8x SLOWER,
+        // 1,548 -> 2,862 ms per token with ffn_norm at 10,250 ms, while the device read stayed at 3.55 GB on two
+        // consecutive runs.  Identical reads twice in a row means the pages are not being retained whatever this flag
+        // says, so there is an eviction path still active elsewhere and withholding MADV_DONTNEED only added memory
+        // pressure.  The default is therefore the ORIGINAL release-on-use behaviour, and STRATA_EXPERT_KEEP=1 is left in
+        // place as the experiment, not as a setting.
+        static const bool release_pages = std::getenv("STRATA_EXPERT_KEEP") == nullptr;
+        if (release_pages && advice_end > advice_start &&
             madvise((void*) (base_ + (size_t) advice_start), (size_t) (advice_end - advice_start), MADV_DONTNEED) != 0) {
             err = "FileExpertSource: madvise could not release mapped expert layer " + std::to_string(layer);
             if (arena != nullptr) {
@@ -595,7 +608,9 @@ bool FileExpertSource::pin_cache_complement(
             }
             return false;
         }
-        const int advice = posix_fadvise(fd_, (off_t) layer_offset, (off_t) layer_bytes, POSIX_FADV_DONTNEED);
+        const int advice = release_pages
+            ? posix_fadvise(fd_, (off_t) layer_offset, (off_t) layer_bytes, POSIX_FADV_DONTNEED)
+            : 0;
         if (advice != 0) {
             err = "FileExpertSource: posix_fadvise could not release expert layer " + std::to_string(layer);
             if (arena != nullptr) {

@@ -6112,3 +6112,29 @@ ggml-backed CPU expert path when iq_mmvq exists for their shape; the residual 1.
 the MLA's two fetched 3-D Q8_0 tensors, which are staged because nothing yet reads them in place.  Between them that is
 73.7% of the run, and neither needs a new algorithm - the experts need three types (19 IQ1_S, 10 Q2_K, 11 Q3_K) and a
 device expert path, the staging needs the type fields and the skip-list entries the other stages already have.
+
+A NEGATIVE RESULT, RECORDED: KEEPING THE EXPERT PAGES IS 1.8x SLOWER, SO THE RELEASE STAYS THE DEFAULT
+
+    release on use (original)   PROFILE 7779.0 ms = 1555.8 ms/token   ffn_norm  4308.7 ms   disk 2.18 GB/run
+    keep the pages              PROFILE 14325.9 ms = 2865.2 ms/token  ffn_norm 10250.3 ms   disk 3.55 GB/run
+
+I FOUND A SELF-INFLICTED COST AND THEN FOUND THAT MY FIX FOR IT WAS WORSE.  expert_source.cpp releases each expert
+layer's page cache after use - madvise(MADV_DONTNEED) over the mapped range and posix_fadvise(POSIX_FADV_DONTNEED) over
+the layer - so with a token loop every token re-reads the layer.  A five-token run reads 2.18 GB from the device, 0.44 GB
+per token, and the routed-expert stage costs 861.7 ms per token, which is 0.44 GB at about 510 MB/s: the stage is I/O
+bound, and the obvious fix is to stop evicting pages a token will need again - 0.44 GB of rows against a 27 GB page cache.
+
+IT MADE IT 1.8x SLOWER.  2,865 ms per token against 1,556, with ffn_norm at 10,250 ms against 4,309.  And the decisive
+detail is in the disk counter, not the timing: two consecutive runs with the release disabled BOTH read 3.55 GB.  If the
+pages were being retained, the second run would have read almost nothing.  So the pages are not retained whatever the flag
+says - there is an eviction path still active elsewhere - and all that withholding MADV_DONTNEED achieved was to add
+memory pressure to a 31 GB box, which is what the 1.8x is.
+
+THEREFORE THE DEFAULT IS THE ORIGINAL RELEASE-ON-USE, and STRATA_EXPERT_KEEP=1 is left in the source as an experiment
+rather than a setting.  The honest summary of this step is that it cost two runs and taught one thing: the eviction that
+matters is not this one, and the 0.44 GB per token is being read from the device every token for a reason that is still
+unidentified.
+
+WHAT THIS DOES NOT CHANGE: the stage-level profile, the 55.6% attribution, and the fact that ffn_norm is I/O shaped
+rather than compute shaped.  What it removes is the obvious explanation, and with it the tempting next step of just
+deleting the release call.
