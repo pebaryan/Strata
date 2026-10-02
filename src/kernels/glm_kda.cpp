@@ -6,10 +6,15 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 namespace strata::kernels::glm {
 
 namespace {
+
+KdaNativeProjectFn g_native_project = nullptr;
 
 inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
@@ -59,8 +64,13 @@ void conv1d_silu(const float* conv_w, const float* proj /* [tokens][d_inner] */,
 
 }  // namespace
 
+void kda_set_native_project(KdaNativeProjectFn fn) { g_native_project = fn; }
+
 void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int tokens, float* out,
                  float* state, const KdaIntermediates* mid, float* conv_state) {
+    using Clock = std::chrono::steady_clock;
+    auto mark = Clock::now();
+    auto lap = [&]() { auto n = Clock::now(); double ms = std::chrono::duration<double, std::milli>(n-mark).count(); mark=n; return ms; };
     const int ne = g.n_embd, nh = g.nh, hd = g.hd, di = g.d_inner();
     const float scale = 1.0f / std::sqrt((float) hd);
 
@@ -73,26 +83,38 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
         for (int i = 0; i < ne; ++i) xn[(size_t) t * ne + i] = xt[i] * inv * w.attn_norm[i];
     }
     if (mid && mid->xn) std::memcpy(mid->xn, xn.data(), xn.size() * sizeof(float));
+    const double tm_norm = lap();
 
     // q, k, v: project, then a separate causal conv each, then SiLU.  The conv reads earlier rows, so the
     // raw projection and the convolved output must be different buffers (run this in place and iteration
     // t+1 would read rows that iteration t already overwrote).
     std::vector<float> qc((size_t) tokens * di), kc((size_t) tokens * di), vc((size_t) tokens * di);
-    std::vector<float> raw((size_t) tokens * di), proj((size_t) di);
+    std::vector<float> raw_q((size_t) tokens * di), raw_k((size_t) tokens * di), raw_v((size_t) tokens * di);
     const float* conv_w[3] = {w.conv_q, w.conv_k, w.conv_v};
     const float* proj_w[3] = {w.wq, w.wk, w.wv};
+    const int proj_type[3] = {w.wq_type, w.wk_type, w.wv_type};
     float* conv_dst[3] = {qc.data(), kc.data(), vc.data()};
-    for (int which = 0; which < 3; ++which) {
-        for (int t = 0; t < tokens; ++t) {
-            matvec(proj_w[which], xn.data() + (size_t) t * ne, proj.data(), di, ne);
-            std::memcpy(raw.data() + (size_t) t * di, proj.data(), (size_t) di * sizeof(float));
+    float* raw_dst[3] = {raw_q.data(), raw_k.data(), raw_v.data()};
+    if (tokens == 1 && g_native_project && proj_type[0] && proj_type[1] && proj_type[2]) {
+        const void* native_w[3] = {proj_w[0], proj_w[1], proj_w[2]};
+        if (!g_native_project(3, native_w, proj_type, xn.data(), ne, di, raw_dst)) {
+            std::fprintf(stderr, "GLM KDA native QKV projection failed\n");
+            std::exit(1);
         }
+    } else {
+        for (int which = 0; which < 3; ++which)
+            for (int t = 0; t < tokens; ++t)
+                matvec(proj_w[which], xn.data() + (size_t) t * ne,
+                       raw_dst[which] + (size_t) t * di, di, ne);
+    }
+    for (int which = 0; which < 3; ++which) {
         float* history = conv_state ? conv_state + (size_t) which * (g.d_conv - 1) * di : nullptr;
-        conv1d_silu(conv_w[which], raw.data(), conv_dst[which], tokens, di, g.d_conv, history);
+        conv1d_silu(conv_w[which], raw_dst[which], conv_dst[which], tokens, di, g.d_conv, history);
     }
     if (mid && mid->qc) std::memcpy(mid->qc, qc.data(), qc.size() * sizeof(float));
     if (mid && mid->kc) std::memcpy(mid->kc, kc.data(), kc.size() * sizeof(float));
     if (mid && mid->vc) std::memcpy(mid->vc, vc.data(), vc.size() * sizeof(float));
+    const double tm_qkv = lap();
 
     // the forget gate: per (head, channel), in [KDA_GATE_LOWER, 0].  ssm_a holds -exp(A_log), so the
     // reference's `sigmoid(-(ssm_a * (...)))` is sigmoid(exp(A_log) * (...)), and the magnitude of the
@@ -116,6 +138,7 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     }
     if (mid && mid->g) std::memcpy(mid->g, gv.data(), gv.size() * sizeof(float));
     if (mid && mid->beta) std::memcpy(mid->beta, beta.data(), beta.size() * sizeof(float));
+    const double tm_gates = lap();
 
     // the recurrence, per head.  Decay first (S[i][:] *= exp(g[i]) - the gate index is S's FIRST index),
     // then the delta-rule correction, then the read, which happens AFTER the update.
@@ -180,6 +203,7 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     if (state)
         for (size_t i = 0; i < S.size(); ++i) state[i] = (float) S[i];
     if (mid && mid->attn) std::memcpy(mid->attn, attn.data(), attn.size() * sizeof(float));
+    const double tm_rec = lap();
 
     // the gated norm: rms over ne0 = head_dim, per head, then a SIGMOID gate (not SiLU), then wo
     std::vector<float> og((size_t) di), ga((size_t) hd), gb((size_t) di);
@@ -201,9 +225,24 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
         std::memcpy(o.data() + (size_t) t * di, og.data(), (size_t) di * sizeof(float));
     }
     if (mid && mid->o) std::memcpy(mid->o, o.data(), o.size() * sizeof(float));
+    const double tm_gateout = lap();
 
-    for (int t = 0; t < tokens; ++t)
-        matvec(w.wo, o.data() + (size_t) t * di, out + (size_t) t * ne, ne, di);
+    if (tokens == 1 && g_native_project && w.wo_type) {
+        const void* native_w[1] = {w.wo};
+        const int native_type[1] = {w.wo_type};
+        float* native_out[1] = {out};
+        if (!g_native_project(1, native_w, native_type, o.data(), di, ne, native_out)) {
+            std::fprintf(stderr, "GLM KDA native output projection failed\n");
+            std::exit(1);
+        }
+    } else {
+        for (int t = 0; t < tokens; ++t)
+            matvec(w.wo, o.data() + (size_t) t * di, out + (size_t) t * ne, ne, di);
+    }
+    const double tm_wo = lap();
+    if (std::getenv("STRATA_GLM_TIMING"))
+        std::fprintf(stderr, "KDA_TIMING norm=%.3f qkv=%.3f gates=%.3f rec=%.3f outgate=%.3f wo=%.3f\n",
+                     tm_norm, tm_qkv, tm_gates, tm_rec, tm_gateout, tm_wo);
 }
 
 }  // namespace strata::kernels::glm

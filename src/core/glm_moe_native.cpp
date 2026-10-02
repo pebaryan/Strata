@@ -14,6 +14,9 @@
 
 namespace strata::core::glm {
 
+namespace { GlmNativeFfnFn g_native_ffn = nullptr; }
+void glm_set_native_ffn(GlmNativeFfnFn fn) { g_native_ffn = fn; }
+
 /// Stage 4c: the MoE site for STREAMED (quantized) experts - the path the 86 GB pack actually takes.
 ///
 /// Not interchangeable with glm_stage_moe.  That one takes float pointers to gate/up/down and is right for resident
@@ -33,7 +36,8 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
                           const kernels::glm::MoeGeometry& g, int layer,
                           const kernels::cpu::NativeFmt& fmt,
                           const uint8_t* (*blob_fn)(void*, int, int), void* blob_ctx,
-                          const kernels::glm::MoeGeometry* shexp_g, const float* const* shared, float shexp_clamp,
+                          const kernels::glm::MoeGeometry* shexp_g, const float* const* shared,
+                          const int* shared_types, float shexp_clamp,
                           float* out, std::string& err, int* ids_out) {
     if (!xn || !router || !out || !blob_fn) {
         err = "glm_stage_moe_native: null argument";
@@ -95,7 +99,15 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
     // the shared expert, added UNWEIGHTED (the reference adds the parallel-SiLU shared expert with no router weight)
     if (shared && shared[0] && shared[1] && shared[2] && shexp_g) {
         std::vector<float> shr((size_t) g.n_embd);
-        kernels::glm::expert_ffn(shared[0], shared[1], shared[2], *shexp_g, xn, shr.data(), shexp_clamp);
+        if (shared_types && shared_types[0] && shared_types[1] && shared_types[2] && g_native_ffn) {
+            const void* nw[3] = {shared[0], shared[1], shared[2]};
+            if (!g_native_ffn(nw, shared_types, *shexp_g, xn, shr.data(), shexp_clamp)) {
+                err = "glm_stage_moe_native: native shared expert failed";
+                return false;
+            }
+        } else {
+            kernels::glm::expert_ffn(shared[0], shared[1], shared[2], *shexp_g, xn, shr.data(), shexp_clamp);
+        }
         for (int j = 0; j < g.n_embd; ++j) out[j] += shr[j];
     }
     return true;

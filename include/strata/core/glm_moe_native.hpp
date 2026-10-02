@@ -11,6 +11,11 @@ namespace strata::kernels::cpu { struct NativeFmt; }   // defined in native_expe
 
 namespace strata::core::glm {
 
+using GlmNativeFfnFn = bool (*)(const void* const* weights, const int* types,
+                                const kernels::glm::MoeGeometry& g, const float* x,
+                                float* out, float clamp_limit);
+void glm_set_native_ffn(GlmNativeFfnFn fn);
+
 /// Stage 4c: the MoE site for streamed, quantized experts - what the 86 GB pack actually takes.
 ///
 /// Unlike glm_stage_moe (float pointers, resident weights), this computes from the quantized blob via ggml-cpu, which
@@ -25,7 +30,8 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
                           const kernels::glm::MoeGeometry& g, int layer,
                           const kernels::cpu::NativeFmt& fmt,
                           const uint8_t* (*blob_fn)(void*, int, int), void* blob_ctx,
-                          const kernels::glm::MoeGeometry* shexp_g, const float* const* shared, float shexp_clamp,
+                          const kernels::glm::MoeGeometry* shexp_g, const float* const* shared,
+                          const int* shared_types, float shexp_clamp,
                           float* out, std::string& err, int* ids_out = nullptr);
 
 }  // namespace strata::core::glm

@@ -54,7 +54,12 @@ struct KdaWeights {
     const float* ssm_g_b = nullptr;    ///< [d_inner][hd]
     const float* o_norm = nullptr;     ///< [hd], the gain of ssm_norm
     const float* wo = nullptr;         ///< [n_embd][d_inner]
+    int wq_type = 0, wk_type = 0, wv_type = 0, wo_type = 0; ///< native device-block GGML types, or zero
 };
+
+using KdaNativeProjectFn = bool (*)(int count, const void* const* weights, const int* types,
+                                    const float* x, int n_in, int n_out, float* const* out);
+void kda_set_native_project(KdaNativeProjectFn fn);
 
 /// The model's constants, named by the metadata key each comes from so the two eps cannot be swapped.
 inline constexpr float KDA_RMS_EPS = 1e-5f;   ///< attention.layer_norm_rms_epsilon

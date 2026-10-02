@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -42,6 +43,7 @@
 #include "strata/core/weights.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/quantize_act.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 
 namespace C = strata::core;
@@ -67,10 +69,32 @@ struct StageCount {
     std::map<std::string, long> by_name;
 };
 
+/// WALL-CLOCK PER LAYER, AT FILE SCOPE because the stage counter is local to the token lambda while a profile is a
+/// property of the whole run.  The callback fires at known points inside each block, so the interval between two
+/// consecutive calls is the cost of what ran between them, and attributing it to the layer that was live gives a
+/// per-layer profile with no profiler attached - which is what decides where the CUDA port should start.
+struct StageProfile {
+    int last_layer = -1;
+    std::chrono::steady_clock::time_point last_time;
+    std::map<int, double> ms;
+    void note(int layer) {
+        const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
+        if (last_layer >= 0) ms[last_layer] += std::chrono::duration<double, std::milli>(now - last_time).count();
+        last_layer = layer;
+        last_time = now;
+    }
+};
+static StageProfile g_prof;
+
 static void stage_cb(void* ctx, int layer, const char* name, const float* data, int n) {
     StageCount* sc = (StageCount*) ctx;
     ++sc->calls;
     sc->by_name[name] += 1;
+    // ---- WALL-CLOCK PER LAYER.  The callback fires at known points inside each block, so the interval between two
+    // consecutive callbacks is the cost of what ran between them, and attributing that to the layer that was live gives
+    // a per-layer profile with no profiler attached.  This is what decides which stage the CUDA port should take first,
+    // and it is measured rather than guessed, like everything else in this port.
+    g_prof.note(layer);
     // ---- AND REPORT THE MAGNITUDE, because counting stages proves the loop ran and says nothing about what it produced.
     // The oracle's own per-layer dumps for these same four families are on disk, and the runner's input IS the oracle's
     // hc_init - so the two runs are comparable stage by stage from block 0, which is the bisection that found block 0's
@@ -192,6 +216,53 @@ static const uint8_t* blob_adapter(void* ctx, int layer, int expert) {
     return ((C::ExpertSource*) ctx)->blob(layer, expert);
 }
 
+static bool native_kda_project(int count, const void* const* weights, const int* types,
+                               const float* x, int n_in, int n_out, float* const* out) {
+    struct Workspace {
+        float* x = nullptr;
+        float* y = nullptr;
+        void* q = nullptr;
+        cudaStream_t stream = nullptr;
+        ~Workspace() { if (x) cudaFree(x); if (y) cudaFree(y); if (q) cudaFree(q); if (stream) cudaStreamDestroy(stream); }
+    };
+    static Workspace ws;
+    if (!ws.stream) {
+        if (cudaStreamCreateWithFlags(&ws.stream, cudaStreamNonBlocking) != cudaSuccess ||
+            cudaMalloc(&ws.x, (size_t) 8192 * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&ws.y, (size_t) 3 * 8192 * sizeof(float)) != cudaSuccess ||
+            cudaMalloc(&ws.q, strata::kernels::native_q8_1_bytes(8192)) != cudaSuccess) return false;
+    }
+    if (count < 1 || count > 3 || n_in > 8192 || n_out > 8192) return false;
+    if (cudaMemcpyAsync(ws.x, x, (size_t) n_in * sizeof(float), cudaMemcpyHostToDevice, ws.stream) != cudaSuccess)
+        return false;
+    strata::kernels::native_quantize_q8_1(ws.x, ws.q, n_in, 1, (void*) ws.stream);
+    for (int i = 0; i < count; ++i) {
+        if (!strata::kernels::native_mmvq_supported(types[i])) return false;
+        float* dy = ws.y + (size_t) i * 8192;
+        strata::kernels::native_mmvq(types[i], weights[i], ws.q, dy, n_in, n_out, 1, (void*) ws.stream);
+        if (cudaMemcpyAsync(out[i], dy, (size_t) n_out * sizeof(float), cudaMemcpyDeviceToHost, ws.stream) != cudaSuccess)
+            return false;
+    }
+    return cudaStreamSynchronize(ws.stream) == cudaSuccess;
+}
+
+static bool native_glm_ffn(const void* const* weights, const int* types, const K::MoeGeometry& g,
+                           const float* x, float* out, float clamp_limit) {
+    std::vector<float> gate((size_t) g.ff), up((size_t) g.ff), h((size_t) g.ff);
+    float* gu_out[2] = {gate.data(), up.data()};
+    if (!native_kda_project(2, weights, types, x, g.n_embd, g.ff, gu_out)) return false;
+    const bool clamp = clamp_limit > 1e-6f;
+    for (int i = 0; i < g.ff; ++i) {
+        float a = gate[(size_t) i], u = up[(size_t) i];
+        if (clamp) { a = std::min(a, clamp_limit); u = std::max(-clamp_limit, std::min(u, clamp_limit)); }
+        h[(size_t) i] = (a / (1.0f + std::exp(-a))) * u;
+    }
+    const void* down[1] = {weights[2]};
+    const int down_type[1] = {types[2]};
+    float* down_out[1] = {out};
+    return native_kda_project(1, down, down_type, h.data(), g.ff, g.n_embd, down_out);
+}
+
 static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, std::string& err) {
     Provider* p = (Provider*) raw;
     if (layer < 0 || layer >= N_LAYERS) { err = "layer out of range"; return false; }
@@ -216,9 +287,20 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
     {
         C::GlmBoundBlock& B = p->bound[(size_t) layer];
         const bool dense = (layer < 3);
+        const bool kda_layer = C::glm::glm_attention_is_mla(layer) == 0;
+        const bool routed_layer = !dense;
         for (size_t i = 0; i < B.tensors.size(); ++i) {
             C::GlmBoundBlock::Tensor& t = B.tensors[i];
             if (!t.quantized || t.ptr == nullptr) continue;
+            const bool native_projection = kda_layer &&
+                (t.name == "attn_q.weight" || t.name == "attn_k.weight" ||
+                 t.name == "attn_v.weight" || t.name == "attn_output.weight") &&
+                strata::kernels::native_mmvq_supported(t.native_type);
+            const bool native_shared = routed_layer &&
+                (t.name == "ffn_gate_shexp.weight" || t.name == "ffn_up_shexp.weight" ||
+                 t.name == "ffn_down_shexp.weight") &&
+                strata::kernels::native_mmvq_supported(t.native_type);
+            if (native_projection || native_shared) continue;
             // NO EXCEPTIONS, and the measurement is why: I first skipped the dense FFN's three tensors on blocks
             // 0..2, on the assumption that a GPU path consumed them.  It does not - glm_stage_ffn calls the CPU
             // expert_ffn, so the crash simply moved from kda_forward to expert_ffn when the rest were staged.  Every
@@ -237,6 +319,21 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
                                            p->w[(size_t) layer], err)) {
             err = "provider: re-mapping layer " + std::to_string(layer) + ": " + err;
             return false;
+        }
+        auto type_of = [&](const char* name) {
+            for (const auto& t : B.tensors) if (t.name == name) return t.quantized ? t.native_type : 0;
+            return 0;
+        };
+        if (kda_layer) {
+            K::KdaWeights& kw = p->kda[(size_t) layer];
+            kw.wq_type = type_of("attn_q.weight"); kw.wk_type = type_of("attn_k.weight");
+            kw.wv_type = type_of("attn_v.weight"); kw.wo_type = type_of("attn_output.weight");
+        }
+        if (routed_layer) {
+            C::glm::GlmTrunkLayerWeights& tw = p->w[(size_t) layer];
+            tw.shexp_types[0] = type_of("ffn_gate_shexp.weight");
+            tw.shexp_types[1] = type_of("ffn_up_shexp.weight");
+            tw.shexp_types[2] = type_of("ffn_down_shexp.weight");
         }
     }
     out = p->w[(size_t) layer];                      // assembled from the staged host weights
@@ -346,6 +443,8 @@ int main(int argc, char** argv) {
     // ---- geometry.  The clamps are set EXPLICITLY: their defaults are 0.0f, which DISABLES them, and the header
     // says so in as many words.  A routed pre-activation past 10 would then be passed through unclamped, silently.
     Provider P;
+    K::kda_set_native_project(&native_kda_project);
+    C::glm::glm_set_native_ffn(&native_glm_ffn);
     P.kda_g.n_embd = N_EMBD; P.kda_g.nh = NH; P.kda_g.hd = HD; P.kda_g.d_conv = 4;
     P.mla_g.n_embd = N_EMBD;                                   // its defaults are this artifact's MLA geometry
     P.dense_g.n_embd = N_EMBD; P.dense_g.ff = FF_DENSE; P.dense_g.n_expert = N_EXPERT; P.dense_g.n_used = N_USED;
@@ -519,7 +618,7 @@ int main(int argc, char** argv) {
     st.mla_len = mla_len;
     st.mla_index = mla_index;
 
-    // ---- the head: load its small norm and large projection once.  Serve mode keeps both resident across requests.
+        // ---- the head: load its small norm and large projection once.  Serve mode keeps both resident across requests.
     std::vector<float> onorm;
     int ne_n[4] = {0, 0, 0, 0};
     // ---- output_norm: read it, and REFUSE rather than pass an empty vector on.
@@ -659,6 +758,28 @@ int main(int argc, char** argv) {
         if (!run_x(inp.data() + (size_t) t * N_EMBD * HC, t, true, best, best_logit)) {
             std::fprintf(stderr, "trunk failed at token %d: %s\n", t, err.c_str()); return 1;
         }
+    {
+        double total = 0.0, stem = 0.0, kda_ms = 0.0, mla_ms = 0.0;
+        for (const std::pair<const int, double>& kv : g_prof.ms) {
+            total += kv.second;
+            if (kv.first < 3) stem += kv.second;
+            else if (C::glm::glm_attention_is_mla(kv.first) == 1) mla_ms += kv.second;
+            else kda_ms += kv.second;
+        }
+        if (total > 0.0) {
+            std::pair<int, double> worst(-1, -1.0);
+            for (const std::pair<const int, double>& kv : g_prof.ms) if (kv.second > worst.second) worst = kv;
+            std::fprintf(stderr, "PROFILE %.1f ms for %d tokens = %.1f ms/token (%.2f tok/s)\n",
+                         total, TOKENS, total / TOKENS, 1000.0 * TOKENS / total);
+            std::fprintf(stderr, "  stem 0-2 : %8.1f ms %5.1f%%\n", stem, 100.0 * stem / total);
+            std::fprintf(stderr, "  34 KDA   : %8.1f ms %5.1f%%\n", kda_ms, 100.0 * kda_ms / total);
+            std::fprintf(stderr, "  11 MLA   : %8.1f ms %5.1f%%\n", mla_ms, 100.0 * mla_ms / total);
+            std::fprintf(stderr, "  heaviest block: layer %d at %.1f ms\n", worst.first, worst.second);
+            std::fprintf(stderr, "  per layer ms:");
+            for (const std::pair<const int, double>& kv : g_prof.ms) std::fprintf(stderr, " %d:%.1f", kv.first, kv.second);
+            std::fprintf(stderr, "\n");
+        }
+    }
     std::printf("\nargmax = %d   (logit %.6f)   expected 12089\n", best, best_logit);
     std::printf("ENGINE TOKEN: %s\n", best == 12089 ? "PASS" : "MISMATCH");
     return best == 12089 ? 0 : 1;

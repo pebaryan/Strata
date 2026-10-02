@@ -5767,3 +5767,42 @@ inputs is the signature of an output that does not depend on its input - which i
 the token loop, the KDA recurrence, or the wiring of x into block 0.  Compare the engine's per-layer outputs against the
 oracle's at token 0 first: token 0 is where the lifetime and state questions do not arise, and if token 0 already
 disagrees, the defect is in a stage rather than in the state.
+
+THE CPU PATH IS COMPLETE: THE ENGINE'S OWN CHAIN PRODUCES THE MODEL'S TOKEN, AT 0.21 TOKENS PER SECOND
+
+    argmax = 12089   (logit 17.230408)   expected 12089
+    ENGINE TOKEN: PASS
+
+    PROFILE 23860.1 ms for 5 tokens = 4772.0 ms/token (0.21 tok/s)
+      stem 0-2 :   3458.0 ms  14.5%
+      34 KDA   :  13077.7 ms  54.8%
+      11 MLA   :   7324.4 ms  30.7%
+      heaviest block: layer 44 at 3094.9 ms
+      per layer ms: 0:1247 1:1208 2:1003 3:678 4:199 5:192 6:646 7:678 8:185 9:168 10:695 11:679 12:230 13:160
+                    14:666 15:657 16:156 17:162 18:635 19:654 20:155 21:164 22:661 23:662 24:162 25:159 26:645
+                    27:656 28:187 29:189 30:629 31:682 32:183 33:184 34:625 35:662 36:161 37:153 38:636 39:660
+                    40:161 41:203 42:633 43:657 44:3095
+
+THE ACCEPTANCE GATE PASSES, and it is the single number this port has been aimed at since the runner was written: the
+engine's own trunk, forty-five blocks of the real artifact, five tokens of the oracle's own input, through its own head,
+produces 12089 for the prompt 785 6722 315 9621 374.  Everything upstream of that number is now load-bearing: the pack
+binding, the per-layer staging, the managed allocations, the slot-keyed state, the MLA cache, the KDA recurrence, the
+routed experts read at their own quantized blocks, the dense stem, and the head.
+
+THE CPU PATH IS THEREFORE DONE, AND THE PROFILE SAYS WHERE THE CUDA PORT MUST GO.  Four measurements, all wall-clock,
+attributed per layer from the stage callback:
+
+  * 0.21 tokens/second.  A 46-block 312B-A17B mixture running on the host at 4.8 seconds per token.
+  * THE HEAD IS 3.1 SECONDS PER TOKEN - the largest single item, and it appears as layer 44 because it runs after the
+    last callback of block 44 and is therefore attributed to that interval.  It is one 154,880 x 4,096 projection,
+    1.27 GFLOP, on the CPU.  It is also the one part of this chain that ALREADY HAS a device path: serve mode calls
+    native_head.run on a CUDA stream.  So this is not a port, it is wiring - and it is the cheapest 3 seconds available.
+  * THE 34 KDA BLOCKS ARE 55% OF THE TOTAL, about 0.77 s per block per token.  Per block that is the conv, the gates,
+    the delta-rule recurrence over 64 heads of 128x128 state, and the {wq,wk,wv,wo} projections - the projections being
+    the part that is pure GEMM and the part a device kernel wins at.
+  * THE 11 MLA BLOCKS ARE 31%, about 1.5 s per token across them.  Same shape: q_a/q_b, kv_a, k_b/v_b, wo.
+  * THE STEM IS 15%: the three dense-FFN blocks, and the only blocks whose weights are not routed experts.
+
+  The profiles alternate in the per-layer list because the attribution is by interval: a callback reports the stage that
+  just finished, so each number covers whatever ran between two consecutive callbacks, and the ~3-block periodicity in
+  the KDA numbers is the hc_pre / attention / hc_post rhythm of the block, not noise.

@@ -50,6 +50,7 @@ struct GlmTrunkLayerWeights {
     const kernels::glm::MoeGeometry* moe_g = nullptr;
     const kernels::glm::MoeGeometry* shexp_g = nullptr;
     const float* const* shexp = nullptr;              ///< {gate, up, down} of the shared expert, or null
+    int shexp_types[3] = {0, 0, 0};                   ///< native GGML types, all zero for host floats
     const kernels::cpu::NativeFmt* moe_fmt = nullptr;
     const uint8_t* (*blob_fn)(void*, int, int) = nullptr;
     void* blob_ctx = nullptr;

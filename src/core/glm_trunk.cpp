@@ -12,6 +12,9 @@
 #include "strata/core/glm_trunk.hpp"
 
 #include <vector>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 
 #include "strata/core/glm_layer.hpp"
 #include "strata/core/glm_moe_native.hpp"
@@ -57,6 +60,13 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
     copy_floats(buf_a.data(), x, (size_t) hc * ne);
     float* cur = buf_a.data();
     float* nxt = buf_b.data();
+    using Clock = std::chrono::steady_clock;
+    const bool timing = std::getenv("STRATA_GLM_TIMING") != nullptr;
+    double tm_provider = 0, tm_hca = 0, tm_attn = 0, tm_hcap = 0;
+    double tm_hcf = 0, tm_ffn = 0, tm_hcfp = 0;
+    auto elapsed = [](Clock::time_point a) {
+        return std::chrono::duration<double, std::milli>(Clock::now() - a).count();
+    };
 
     for (int i = 0; i < layers; ++i) {
         // the artifact's layer number, not the loop's counter: every dispatch and lookup below is keyed by it
@@ -65,10 +75,12 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
         const bool is_dense = glm_ffn_is_dense(layer);
 
         GlmTrunkLayerWeights w;
+        auto tick = Clock::now();
         if (!provider(provider_ctx, layer, w, err)) {
             err = "glm_trunk_forward: layer " + std::to_string(layer) + ": " + err;
             return false;
         }
+        tm_provider += elapsed(tick);
         // A missing weight for the kind this layer IS, is a wiring bug rather than a fallback: an MLA layer driven
         // down the KDA path would compute plausible numbers from the wrong weights.
         const bool common_ok = w.hc_attn_fn && w.hc_attn_base && w.hc_attn_scale && w.attn_norm &&
@@ -91,11 +103,13 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
         // normed value here as well normalised the KDA's input TWICE, which is invisible to the KDA's own gate - that
         // fixture feeds it a raw input, as the oracle does - and to every other stage gate, because each of them is
         // correct in isolation.  It is exactly the class of mistake only an assembly test can find.
+        tick = Clock::now();
         if (!glm_stage_hc_norm(cur, ne, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, is_mla ? w.attn_norm : nullptr,
                                xn.data(), &mix_a[0], hc_rms_eps, stream, err)) {
             err = "glm_trunk_forward: layer " + std::to_string(layer) + " attention site: " + err;
             return false;
         }
+        tm_hca += elapsed(tick);
         // Report each stage as it is produced.  Defaulted to nullptr, so a caller that does not ask for the
         // stream is unaffected - the loop's behaviour must not change because a test is watching.
         auto stage = [&](const char* nm, const float* data, int n) {
@@ -104,6 +118,7 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
         stage("hc_attn_pre", cur, (int) (hc * (size_t) ne));
         stage("attn_input", xn.data(), ne);
         if (is_mla) stage("attn_norm", xn.data(), ne);
+        tick = Clock::now();
         if (is_mla) {
             const int slot = state.mla_index ? state.mla_index[layer] : -1;
             if (slot < 0 || !state.mla_cache || !state.mla_len) {
@@ -133,22 +148,28 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
                 return false;
             }
         }
+        tm_attn += elapsed(tick);
         stage("attn_output", attn_out.data(), ne);
+        tick = Clock::now();
         if (!glm_stage_hc_post(attn_out.data(), cur, mix_a[0], ne, mid.data(), err)) {
             err = "glm_trunk_forward: layer " + std::to_string(layer) + " attention hc_post: " + err;
             return false;
         }
+        tm_hcap += elapsed(tick);
 
         stage("hc_attn_post", mid.data(), (int) (hc * (size_t) ne));
 
         // ---- the FFN site ----
+        tick = Clock::now();
         if (!glm_stage_hc_norm(mid.data(), ne, w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm, ffn_in.data(),
                                &mix_f[0], hc_rms_eps, stream, err)) {
             err = "glm_trunk_forward: layer " + std::to_string(layer) + " FFN site: " + err;
             return false;
         }
+        tm_hcf += elapsed(tick);
         stage("hc_ffn_pre", mid.data(), (int) (hc * (size_t) ne));
         stage("ffn_norm", ffn_in.data(), ne);
+        tick = Clock::now();
         if (is_dense) {
             if (!glm_stage_ffn(ffn_in.data(), w.ffn_gate, w.ffn_up, w.ffn_down, *w.moe_g, ffn_out.data(),
                                w.clamp_limit, err)) {
@@ -159,7 +180,8 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
             int moe_ids[64];
             for (int k = 0; k < 64; ++k) moe_ids[k] = -1;
             if (!glm_stage_moe_native(ffn_in.data(), w.moe_router, w.moe_probs_b, *w.moe_g, layer, *w.moe_fmt,
-                                      w.blob_fn, w.blob_ctx, w.shexp_g, w.shexp, w.shexp_clamp, ffn_out.data(), err, moe_ids)) {
+                                      w.blob_fn, w.blob_ctx, w.shexp_g, w.shexp, w.shexp_types,
+                                      w.shexp_clamp, ffn_out.data(), err, moe_ids)) {
                 err = "glm_trunk_forward: layer " + std::to_string(layer) + " routed FFN: " + err;
                 return false;
             }
@@ -170,17 +192,24 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
             for (int k = 0; k < n_report; ++k) ids_f[k] = (float) moe_ids[k];
             stage("moe_ids", ids_f, n_report);
         }
+        tm_ffn += elapsed(tick);
         stage("ffn_out", ffn_out.data(), ne);
+        tick = Clock::now();
         if (!glm_stage_hc_post(ffn_out.data(), mid.data(), mix_f[0], ne, nxt, err)) {
             err = "glm_trunk_forward: layer " + std::to_string(layer) + " FFN hc_post: " + err;
             return false;
         }
+        tm_hcfp += elapsed(tick);
         stage("l_out", nxt, (int) (hc * (size_t) ne));
 
         float* swap = cur; cur = nxt; nxt = swap;   // this layer's output is the next layer's input
     }
 
     copy_floats(l_out, cur, (size_t) hc * ne);
+    if (timing)
+        std::fprintf(stderr, "GLM_TIMING provider=%.3f hca=%.3f attn=%.3f hcap=%.3f hcf=%.3f ffn=%.3f hcfp=%.3f total=%.3f ms\n",
+                     tm_provider, tm_hca, tm_attn, tm_hcap, tm_hcf, tm_ffn, tm_hcfp,
+                     tm_provider + tm_hca + tm_attn + tm_hcap + tm_hcf + tm_ffn + tm_hcfp);
     return true;
 }
 
