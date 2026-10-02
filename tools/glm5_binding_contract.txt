@@ -6803,3 +6803,40 @@ SO THE STAGE IS NOW FULLY SPECIFIED AND SMALL: allocate scratch for cap_entries 
 five small host arrays, upload the activations once, call this, then combine.  Everything it needs from today's work is
 the residency policy that decides which grp_ptr values can point into the cache instead of a fresh upload - which is the
 thing that separates a wash from a gain, and which is already built and gated.
+
+THE STAGE'S WIRING POINT IS ALREADY IN THE RUNNER, AND THE SOURCE IS ALREADY CONSTRUCTED
+
+    FileExpertSource::open(pack_dir, n_layers, n_expert, err)     // expert_source.hpp:315
+      "Maps <pack_dir>/experts.bin and checks its size against the loaded expert layout.  Canonical packs use
+       n_layers * n_expert * BLOB; native packs use their variable per-layer blob sizes and offsets.  The size check is
+       not a formality: a short file would fault at the END of a long sequence, and an over-long one means the pack is not
+       the one the geometry came from.  Refuses with the two numbers."
+
+    and in the runner, already present and already used:
+
+      tools/glm45_run.cpp:516    C::FileExpertSource src;                       // constructed
+      tools/glm45_run.cpp:234    return ((C::ExpertSource*) ctx)->blob(layer, expert);   // the adapter's body
+
+    So the source is built, opened, and the ONLY thing currently consuming blob() is the CPU expert adapter.  The device
+    stage does not need to construct, open or locate anything - it needs a hook beside that adapter, exactly as
+    glm_set_native_ffn sits beside the CPU expert_ffn path, with the same signature shape and the same fallback rule
+    (device attempt, host on refusal).
+
+AND THE CLASS'S OWN COMMENT SAYS THE RESIDENCY OBJECT WAS ALWAYS THE PLAN:
+
+    "IT IS NOT AN LRU, AN LFU OR A PREFETCHER.  Phase 3 replaces this object with those.  Phase 2 is hit rate h = 0 on
+     purpose, so that the CPU path and the host round trip are exercised on every layer of every token - which is the only
+     way they get debugged before speed matters."
+
+    So a keyed, budgeted, least-recently-used residency layer is not an invention of this session's - it is the documented
+    Phase 3, and what this session built is its device-side counterpart (ExpertRowCache), which is already gated.  The
+    h = 0 discipline in that comment is also a warning worth heeding for the device path: the CPU path's correctness was
+    established by exercising it on EVERY layer of every token, so the device stage should be gated with the cache both
+    cold and warm, not only in the state that makes it fast.
+
+THE NEXT UNIT, THEREFORE, IN ONE PARAGRAPH: add a device-expert hook beside the blob_fn adapter (mirroring
+glm_set_native_ffn), which for each selected expert asks the ExpertRowCache whether its blob is resident, uploads it from
+source->blob(layer, expert) if not, builds the five arrays native_expert_grouped wants with grp_ptr holding device row
+addresses, allocates scratch by native_expert_scratch_bytes, calls it, and lets moe_combine apply the weights; guarded by
+an EXPLICIT type list (16, 18, 23 - the three whose kernels exist) rather than iq_supported, and gated against the CPU
+expert path on the 14 layers those types cover, with the cache cold in one run and warm in the other.
