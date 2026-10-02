@@ -23,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <sys/resource.h>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -842,6 +843,21 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "  per layer ms:");
             for (const std::pair<const int, double>& kv : g_prof.ms) std::fprintf(stderr, " %d:%.1f", kv.first, kv.second);
             std::fprintf(stderr, "\n");
+        }
+    }
+    // MAJOR VS MINOR FAULTS, because it is the number that says whether the routed-expert stage's 861.7 ms per token is
+    // really disk I/O: a major fault is a page that had to come from the device, a minor fault is one that was already
+    // in the page cache.  0.44 GB per token at 4 KB pages is about 115,000 major faults per token if the expert rows are
+    // genuinely cold every time; far fewer means they are cache hits and the stage is CPU dequantisation after all,
+    // which would send the work back to a device MMVQ kernel rather than to a residency plan.
+    {
+        struct rusage ru;
+        std::memset(&ru, 0, sizeof ru);
+        if (getrusage(RUSAGE_SELF, &ru) == 0) {
+            std::fprintf(stderr, "FAULTS minflt %ld majflt %ld inblock %ld oublock %ld\n", ru.ru_minflt, ru.ru_majflt,
+                         ru.ru_inblock, ru.ru_oublock);
+            std::fprintf(stderr, "       majflt x 4096 = %.2f GB of pages faulted in from the device\n",
+                         (double) ru.ru_majflt * 4096.0 / 1073741824.0);
         }
     }
     K::kda_print_profile();
