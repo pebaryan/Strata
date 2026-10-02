@@ -6872,3 +6872,31 @@ THE PARITY GATE'S CPU REFERENCE EXISTS AND MATCHES THE DEVICE CALL ONE TO ONE
     pack") and is compiled for a 2560-wide activation.  Its refusal is not a statement about GLM's path; GLM's CPU expert
     path goes through the runner's blob_fn adapter instead, and it is the native CPU kernels above that the device stage
     must be compared against.
+
+CORRECTION: THE GROUPED KERNEL'S DOWN SWITCH COVERS THREE TYPES, SO THE DEVICE PATH SERVES 3 LAYERS, NOT 14
+
+    transcribed from the switch statements in native_expert_grouped (src/kernels/cuda/iq_kernels.cu):
+      gu cases   : 16, 17, 18, 21, 22, 23, 29, 42
+      down cases : 20, 23, 42                      <-- THREE
+    and from iq_mmvq, for comparison:
+      mmvq cases : 16, 17, 18, 20, 21, 22, 23, 29, 42
+
+    THE MODEL'S DOWN PROJECTION IS TYPE 18 ON 39 OF 43 LAYERS AND THERE IS NO GROUPED DOWN CASE FOR 18.  The "14 of 43
+    layers are fully servable with no new kernel" figure - which I derived from iq_mmvq's dispatch - is therefore wrong
+    for the path the stage was being built on: iq_mmvq does cover 18, native_expert_grouped does not.  The grouped path
+    serves the THREE layers whose down type is 23, and every one of its switches ends in std::exit(1), so a stage wired to
+    it without this guard would die on the first layer whose down type is 18 - i.e. on layer 3, the first routed layer.
+
+    THIS IS THE SIXTH INTENDED CONSTRUCTION RETIRED BY MEASUREMENT TODAY, and it retires one of my own conclusions in the
+    opposite direction from the last five: those removed work I was about to do, and this one RESTORES work I had
+    DISMISSED.  I had written off a per-expert loop of iq_mmvq calls as "reinventing a slower version of a kernel that
+    exists" - and iq_mmvq's own dispatch is exactly the set that covers the model's types (16 and 18 both present), so the
+    per-expert design was the right one and the grouped kernel is the one that does not fit this model's down projection.
+    The lesson is not "measure before you build" - it is that a capability claim has to be checked against the SPECIFIC
+    entry point you intend to call, because iq_supported, iq_row_bytes and iq_mmvq all agreed that type 18 was fine, and
+    the function I actually planned to call does not accept it.
+
+    include/strata/core/glm_expert_types.hpp holds the two lists and glm_expert_layer_supported(gu, d), generated from the
+    switches rather than from memory, and tools/glm_expert_types_gate.cpp asserts the model's three real type pairs
+    against it - (16,23) servable, (16,18) and (19,18) not, (10,11) not - with the gate shown to fail by inverting every
+    expectation.

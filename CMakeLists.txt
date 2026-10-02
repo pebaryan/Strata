@@ -183,6 +183,13 @@ target_include_directories(glm5_bind_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/i
 target_compile_options(glm5_bind_check PRIVATE -O2)
 target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::cudart)
 
+# Device expert type guard (branch glm5next-port): which types the GROUPED kernel's switches actually cover, which is
+# not what iq_supported says and not what iq_mmvq's dispatch implies - the grouped down switch covers 20, 23 and 42 while
+# the model's down projection is type 18 on 39 of 43 layers.
+add_executable(glm_expert_types_gate tools/glm_expert_types_gate.cpp)
+target_include_directories(glm_expert_types_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm_expert_types_gate PRIVATE -O2)
+
 # Expert row upload gate (branch glm5next-port): is the range the table describes actually IN the shard, and does a real
 # expert row survive an H2D/D2H round trip byte-for-byte?  The offsets have only ever been checked by arithmetic; a
 # truncated shard or a wrong shard name would read garbage that no kernel would flag.
