@@ -12,6 +12,9 @@ namespace {
 
 MlaNativeProjectFn g_native_project = nullptr;
 bool g_device_attention = false;
+// The V100 launch/copy overhead exceeds the host loop at short cache depths.  Long-context scoring is
+// the target of this kernel; keep the measured short-context path on host.
+constexpr int MLA_CUDA_MIN_CACHE = 256;
 
 /// x -> rms_norm(x) * weight, over the whole row (the reference normalizes ne0 and scales by the weight).
 void rms_norm_inplace(float* x, int n, const float* weight) {
@@ -114,7 +117,7 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
     std::vector<float> attn((size_t) n_head * kv_lora, 0.0f);
     std::vector<float> v((size_t) q_dim, 0.0f);
     bool attention_done = false;
-    if (g_device_attention) {
+    if (g_device_attention && n_cache >= MLA_CUDA_MIN_CACHE) {
         char cuda_err[256] = {};
         attention_done = mla_attention_cuda(qcur.data(),cache,n_cache,n_head,head_dim,kv_lora,
                                             attn.data(),cuda_err,sizeof(cuda_err));
