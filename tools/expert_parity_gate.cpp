@@ -100,6 +100,17 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::vector<uint8_t> act(fmt.act_bytes), hq(fmt.h_bytes);
+    // THE FORMAT QUESTION, asked as a measurement rather than read off a comment: is the CPU side's activation the same
+    // block_q8_1 the device uses (40 B per 32 elements = n/32*40), or a different format of a different size?  The header
+    // calling its buffers "Q8_1-shaped" describes the SIZES it reserves, not necessarily the codes it produces, and the
+    // 1.7% rms this gate measures is larger than accumulation order alone explains.
+    const size_t q8_1_act = (size_t) (n_embd / 32) * 40;
+    const size_t q8_1_h = (size_t) (n_ff / 32) * 40;
+    std::printf("  formats: gu_act %d d_act %d ; act_bytes %zu (block_q8_1 would be %zu %s) ; h_bytes %zu (would be "
+                "%zu %s)\n", fmt.gu_act, fmt.d_act, fmt.act_bytes, q8_1_act, fmt.act_bytes == q8_1_act ? "SAME" : "DIFFERENT",
+                fmt.h_bytes, q8_1_h, fmt.h_bytes == q8_1_h ? "SAME" : "DIFFERENT");
+    std::printf("          the device side quantises with quantize_q8_1_rows into block_q8_1, %zu and %zu bytes\n", q8_1_act,
+                q8_1_h);
     std::vector<float> ff((size_t) n_ff), out_cpu((size_t) n_embd);
     K::cpu::native_quant_act(fmt, x.data(), act.data());
     // the API takes `const void* const*` and `float* const*` - arrays of pointers - so the addresses must be named

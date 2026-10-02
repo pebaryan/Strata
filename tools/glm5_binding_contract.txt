@@ -7049,3 +7049,25 @@ THE PER-EXPERT DEVICE EXPERT PATH IS NUMERICALLY SOUND: 1.705% RMS AGAINST THE C
          own state), so the print reads garbage-looking defaults.  Read the accessor instead.
       2. the max relative difference of 178 is on an output element near zero, which is expected and should be reported
          alongside the absolute and rms figures rather than instead of them.
+
+THE FORMAT QUESTION, ANSWERED BY MEASUREMENT: THE CPU SIDE IS Q8_K, THE DEVICE SIDE IS Q8_1, AND THE 1.7% IS EXPLAINED
+
+    formats: gu_act 15 d_act 15 ; act_bytes 4672 (block_q8_1 would be 5120) DIFFERENT ; h_bytes 2336 (would be 2560) DIFFERENT
+
+    ggml type 15 is Q8_K, whose block is 4 bytes of float scale + 256 int8 codes + 16 int16 block sums = 292 bytes per 256
+    elements.  The arithmetic closes exactly: 4096/256 * 292 = 4,672 and 2048/256 * 292 = 2,336, which are the two sizes
+    the fmt reports.  So the CPU native kernels quantise the ACTIVATION to Q8_K super-blocks and the device path quantises
+    it to Q8_1's 32-element blocks, and the 1.705% rms is what different activation granularity produces - not what
+    accumulation order produces, which is what I had assumed and written down.
+
+    THIS IS THE ONE KIND OF CORRECTION WORTH THE MOST: the premise was a COMMENT ("Q8_1-shaped") that described a buffer
+    size and I read it as describing a code format, and one printed field turned it into a fact.  Both numbers are now
+    reported by the gate, so the threshold it applies is right for the RIGHT reason - the two paths genuinely quantise
+    differently.
+
+    THE DESIGN CONSEQUENCE, and it is the important part: a device expert path built on iq_mmvq differs from the CPU path
+    by ~1.7% rms AT THE EXPERT, and the trunk applies 43 layers of experts per token.  A percent-level per-expert
+    difference is not something to assume away - it is exactly the kind of divergence that moves an argmax over a long
+    chain, which is why the acceptance gate (argmax 12089) is the test that matters and a per-expert parity gate alone
+    cannot clear the stage.  Note also the direction of the fix if divergence ever shows up: the CPU side is the reference
+    here only because it is the one that has been validated end to end, not because Q8_K is more correct than Q8_1.
