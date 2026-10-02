@@ -2,14 +2,17 @@
 #include <cmath>
 #include <cstdio>
 #include <mutex>
+#include <unordered_map>
 
 namespace strata::kernels::glm {
 namespace {
 struct Scratch {
-    float *q=nullptr,*cache=nullptr,*attn=nullptr,*scores=nullptr;
-    size_t q_cap=0,cache_cap=0,attn_cap=0,scores_cap=0;
+    struct ResidentCache { float* device=nullptr; size_t capacity=0; int last_n=0; };
+    float *q=nullptr,*attn=nullptr,*scores=nullptr;
+    size_t q_cap=0,attn_cap=0,scores_cap=0;
+    std::unordered_map<const float*,ResidentCache> resident_caches;
     std::mutex mutex;
-    ~Scratch(){cudaFree(q);cudaFree(cache);cudaFree(attn);cudaFree(scores);}
+    ~Scratch(){cudaFree(q);cudaFree(attn);cudaFree(scores);for(auto& kv:resident_caches)cudaFree(kv.second.device);}
     bool reserve(float*& p,size_t& cap,size_t n){
         if(p&&n<=cap)return true;
         if(p)cudaFree(p);
@@ -55,12 +58,36 @@ bool mla_attention_cuda(const float* qcur,const float* cache,int n_cache,int n_h
         return fail("invalid MLA attention geometry or pointers");
     Scratch& s=scratch();std::lock_guard<std::mutex> lock(s.mutex);
     const size_t qn=(size_t)n_head*kv_lora,cn=(size_t)n_cache*kv_lora,on=qn,sn=(size_t)n_head*n_cache;
-    if(!s.reserve(s.q,s.q_cap,qn)||!s.reserve(s.cache,s.cache_cap,cn)||
-       !s.reserve(s.attn,s.attn_cap,on)||!s.reserve(s.scores,s.scores_cap,sn))return fail("MLA attention scratch allocation failed");
+    if(!s.reserve(s.q,s.q_cap,qn)||!s.reserve(s.attn,s.attn_cap,on)||
+       !s.reserve(s.scores,s.scores_cap,sn))return fail("MLA attention scratch allocation failed");
+    auto it=s.resident_caches.find(cache);
+    bool full_upload=false;
+    if(it==s.resident_caches.end()){
+        Scratch::ResidentCache entry;
+        size_t cap=1;while(cap<cn)cap*=2;
+        if(cudaMalloc(&entry.device,cap*sizeof(float))!=cudaSuccess)return fail("MLA resident cache allocation failed");
+        entry.capacity=cap;entry.last_n=0;
+        it=s.resident_caches.emplace(cache,entry).first;
+        full_upload=true;
+    }else if(cn>it->second.capacity){
+        size_t cap=it->second.capacity?it->second.capacity:1;while(cap<cn)cap*=2;
+        float* grown=nullptr;
+        if(cudaMalloc(&grown,cap*sizeof(float))!=cudaSuccess)return fail("MLA resident cache growth failed");
+        cudaFree(it->second.device);it->second.device=grown;it->second.capacity=cap;it->second.last_n=0;
+        full_upload=true;
+    }else if(n_cache!=it->second.last_n+1){
+        // A repeated depth or a reset (depth moving backwards) means the host cache may have been rewritten.
+        full_upload=true;
+    }
     cudaError_t e=cudaMemcpy(s.q,qcur,qn*sizeof(float),cudaMemcpyHostToDevice);
-    if(e==cudaSuccess)e=cudaMemcpy(s.cache,cache,cn*sizeof(float),cudaMemcpyHostToDevice);
+    if(e==cudaSuccess){
+        const size_t first=full_upload?0:(size_t)it->second.last_n;
+        const size_t count=full_upload?cn:(size_t)kv_lora;
+        e=cudaMemcpy(it->second.device+first,cache+first,count*sizeof(float),cudaMemcpyHostToDevice);
+    }
     if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
-    mla_latent_attention<<<n_head,256>>>(s.q,s.cache,n_cache,kv_lora,1.0f/std::sqrt((float)head_dim),s.scores,s.attn);
+    it->second.last_n=n_cache;
+    mla_latent_attention<<<n_head,256>>>(s.q,it->second.device,n_cache,kv_lora,1.0f/std::sqrt((float)head_dim),s.scores,s.attn);
     if((e=cudaGetLastError())!=cudaSuccess||(e=cudaDeviceSynchronize())!=cudaSuccess)return fail(cudaGetErrorString(e));
     if((e=cudaMemcpy(attn,s.attn,on*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)return fail(cudaGetErrorString(e));
     if(error&&error_capacity)error[0]='\0';return true;
