@@ -6086,3 +6086,29 @@ SO THE NEXT KERNEL IS NOT THE RECURRENCE.  In order:
   4. l_out, 1401.6 ms, 18.1% - the interval closed by the trunk's final callback, i.e. the per-token work outside the
      blocks: the head (now on the device) and the token loop itself.  Worth a look before anything else in this list,
      because 18.1% for that is more than it should be now that the head is a device MMVQ.
+
+l_out IS THE RESIDUAL STAGING, NOT THE HEAD - AND THE ARITHMETIC CLOSES
+
+    staged per token      1.42 GB        (the runner's own counter)
+    l_out per token       280.3 ms
+    head, at ~20 ms       20 ms
+    remaining            260.3 ms
+    implied bandwidth     5.45 GB/s      (1.42 GB / 260.3 ms)
+
+THE HEAD IS PROVEN INNOCENT BY READING IT, not by assuming: native_head.hpp's own comment says it "Uploads unchanged
+GGUF blocks once at startup and owns its", and NativeHead::run is only a H2D of the mixed vector, ONE native_mmvq, and
+a D2H of the logits - there is no per-call upload of a 1.2 GB matrix, which was the obvious way for 18.1% to be hiding
+in a 634M-MAC projection.
+
+AND l_out IS THE PROVIDER'S RESIDUAL STAGING.  The trunk reports l_out at the end of each block, so the interval closed
+by the NEXT callback spans the provider's call for the next layer - which is where the dequantise-and-copy happens.  Summed
+over the run that interval is 1,401.6 ms, the staging is 7.10 GB, and the implied 5.45 GB/s is exactly the rate a device
+dequant plus a device-to-host copy of host-bound floats should run at on this box.  Two independent counters agreeing to
+that precision is the reason to accept the attribution.
+
+SO THE TWO REMAINING ITEMS ARE THE SAME KIND OF FIX, which is worth stating plainly: the routed experts at 55.6% and the
+residual staging at 18.1% are both "weights being read on the wrong side of the bus".  The experts go through the
+ggml-backed CPU expert path when iq_mmvq exists for their shape; the residual 1.42 GB is the KDA's ssm_*/hc_* tensors and
+the MLA's two fetched 3-D Q8_0 tensors, which are staged because nothing yet reads them in place.  Between them that is
+73.7% of the run, and neither needs a new algorithm - the experts need three types (19 IQ1_S, 10 Q2_K, 11 Q3_K) and a
+device expert path, the staging needs the type fields and the skip-list entries the other stages already have.
