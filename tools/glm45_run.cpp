@@ -307,11 +307,14 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
                 (t.name == "ffn_gate_shexp.weight" || t.name == "ffn_up_shexp.weight" ||
                  t.name == "ffn_down_shexp.weight") &&
                 strata::kernels::native_mmvq_supported(t.native_type);
+            const bool native_dense_ffn = dense &&
+                (t.name == "ffn_gate.weight" || t.name == "ffn_up.weight" || t.name == "ffn_down.weight") &&
+                strata::kernels::native_mmvq_supported(t.native_type);
             const bool native_mla = !kda_layer && !dense &&
                 (t.name == "attn_q_a.weight" || t.name == "attn_q_b.weight" ||
                  t.name == "attn_kv_a_mqa.weight" || t.name == "attn_output.weight") &&
                 strata::kernels::native_mmvq_supported(t.native_type);
-            if (native_projection || native_shared || native_mla) continue;
+            if (native_projection || native_shared || native_mla || native_dense_ffn) continue;
             // NO EXCEPTIONS, and the measurement is why: I first skipped the dense FFN's three tensors on blocks
             // 0..2, on the assumption that a GPU path consumed them.  It does not - glm_stage_ffn calls the CPU
             // expert_ffn, so the crash simply moved from kda_forward to expert_ffn when the rest were staged.  Every
@@ -350,6 +353,12 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
             mw.wq_b_type = type_of("attn_q_b.weight");
             mw.kv_a_type = type_of("attn_kv_a_mqa.weight");
             mw.wo_type = type_of("attn_output.weight");
+        }
+        if (dense) {
+            C::glm::GlmTrunkLayerWeights& tw = p->w[(size_t) layer];
+            tw.ffn_types[0] = type_of("ffn_gate.weight");
+            tw.ffn_types[1] = type_of("ffn_up.weight");
+            tw.ffn_types[2] = type_of("ffn_down.weight");
         }
         if (routed_layer) {
             C::glm::GlmTrunkLayerWeights& tw = p->w[(size_t) layer];

@@ -172,7 +172,7 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
         tick = Clock::now();
         if (is_dense) {
             if (!glm_stage_ffn(ffn_in.data(), w.ffn_gate, w.ffn_up, w.ffn_down, *w.moe_g, ffn_out.data(),
-                               w.clamp_limit, err)) {
+                               w.clamp_limit, err, w.ffn_types)) {
                 err = "glm_trunk_forward: layer " + std::to_string(layer) + " dense FFN: " + err;
                 return false;
             }

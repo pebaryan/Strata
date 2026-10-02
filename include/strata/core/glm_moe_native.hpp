@@ -16,6 +16,12 @@ using GlmNativeFfnFn = bool (*)(const void* const* weights, const int* types,
                                 float* out, float clamp_limit);
 void glm_set_native_ffn(GlmNativeFfnFn fn);
 
+/// Run the dense feed-forward through the native (device MMVQ) hook if one is installed and all three types are set.
+/// Returns false when the caller should fall back to the host expert_ffn - a missing hook is not an error, it just means
+/// this build has no device path, so the caller degrades rather than failing.
+bool glm_try_native_ffn(const void* const* weights, const int* types, const kernels::glm::MoeGeometry& g,
+                        const float* x, float* out, float clamp_limit);
+
 /// Stage 4c: the MoE site for streamed, quantized experts - what the 86 GB pack actually takes.
 ///
 /// Unlike glm_stage_moe (float pointers, resident weights), this computes from the quantized blob via ggml-cpu, which

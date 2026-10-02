@@ -17,6 +17,13 @@ namespace strata::core::glm {
 namespace { GlmNativeFfnFn g_native_ffn = nullptr; }
 void glm_set_native_ffn(GlmNativeFfnFn fn) { g_native_ffn = fn; }
 
+bool glm_try_native_ffn(const void* const* weights, const int* types, const kernels::glm::MoeGeometry& g,
+                        const float* x, float* out, float clamp_limit) {
+    if (g_native_ffn == nullptr || types == nullptr || weights == nullptr) return false;
+    if (!types[0] || !types[1] || !types[2]) return false;
+    return g_native_ffn(weights, types, g, x, out, clamp_limit);
+}
+
 /// Stage 4c: the MoE site for STREAMED (quantized) experts - the path the 86 GB pack actually takes.
 ///
 /// Not interchangeable with glm_stage_moe.  That one takes float pointers to gate/up/down and is right for resident

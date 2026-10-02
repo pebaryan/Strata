@@ -56,7 +56,8 @@ bool glm_stage_hc_post(const float* site_out, const float* residual, const kerne
 /// Stage 4: the FFN site's feed-forward - one expert_ffn call, serving both a leading dense block and a routed
 /// expert.  `clamp_limit` is the artifact's swiglu clamp for this site (10.0 for this model).
 bool glm_stage_ffn(const float* xn, const float* wg, const float* wu, const float* wd,
-                   const kernels::glm::MoeGeometry& g, float* out, float clamp_limit, std::string& err);
+                   const kernels::glm::MoeGeometry& g, float* out, float clamp_limit, std::string& err,
+                   const int* types = nullptr);
 
 /// One block's weights, as plain pointers.  Deliberately NOT the binding layer's structures: every gate in this port
 /// drives code with plain arrays loaded from fixture files, and a loop that takes plain pointers can be driven by

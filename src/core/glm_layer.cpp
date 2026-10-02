@@ -1,6 +1,7 @@
 // GLM-5.3 block chain, stage 1: the hyper-connection front end.  See glm_layer.hpp for the contract.
 
 #include "strata/core/glm_layer.hpp"
+#include "strata/core/glm_moe_native.hpp"
 
 #include <cmath>
 #include <vector>
@@ -96,7 +97,8 @@ bool glm_stage_hc_post(const float* site_out, const float* residual, const kerne
 /// No arithmetic: expert_ffn is verified on block 0 at the fp32 floor with its clamp proven by a demonstrated
 /// failure, and matches on block 1 at the same floor.
 bool glm_stage_ffn(const float* xn, const float* wg, const float* wu, const float* wd,
-                   const kernels::glm::MoeGeometry& g, float* out, float clamp_limit, std::string& err) {
+                   const kernels::glm::MoeGeometry& g, float* out, float clamp_limit, std::string& err,
+                   const int* types) {
     if (!xn || !wg || !wu || !wd || !out) {
         err = "glm_stage_ffn: null argument";
         return false;
@@ -104,6 +106,12 @@ bool glm_stage_ffn(const float* xn, const float* wg, const float* wu, const floa
     if (g.n_embd <= 0 || g.ff <= 0) {
         err = "glm_stage_ffn: geometry must have positive n_embd and ff";
         return false;
+    }
+    // The device path when it is available, the host one otherwise - and the host one is also the fallback if the
+    // device call reports failure, so a device fault costs speed rather than correctness.
+    if (types != nullptr) {
+        const void* nw[3] = {wg, wu, wd};
+        if (glm_try_native_ffn(nw, types, g, xn, out, clamp_limit)) return true;
     }
     kernels::glm::expert_ffn(wg, wu, wd, g, xn, out, clamp_limit);
     return true;

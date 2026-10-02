@@ -6005,3 +6005,38 @@ WHAT REMAINS, by measured cost: the 34 KDA blocks at 55.4% (their projections ar
 the gates and the delta-rule recurrence - the state work, not the GEMMs), the stem at 26.3% (the three dense-FFN blocks,
 whose weights are the only ones in the model that are not routed experts), and the 3.11 GB per token still staged
 (the KDA's ssm_* and hc_* tensors, and the MLA's two fetched 3-D Q8_0 tensors).
+
+THE DENSE STEM IS ON THE DEVICE TOO: 12x ON THOSE BLOCKS, 0.63 TOKENS/SECOND, GATE STILL PASSING
+
+    PROFILE 7944.9 ms for 5 tokens = 1589.0 ms/token (0.63 tok/s)     [2312.7 ms/token before this change]
+      stem 0-2 :    254.1 ms   3.2%                                   [3039.6 ms at 26.3%]
+      34 KDA   :   5556.2 ms  69.9%
+      11 MLA   :   2134.6 ms  26.9%
+      staging: 7.10 GB materialised over 5 tokens = 1.42 GB/token     [15.54 GB / 3.11 GB per token]
+    argmax = 12089   (logit 17.236195)   expected 12089
+    ENGINE TOKEN: PASS
+
+CUMULATIVE, and the shape of it is the same every time - a component that had a device path for the OTHER model and no
+types on the GLM side, so the trunk kept dequantising it to host floats on every token:
+
+    4172.7 ms/token  ->  2312.7  (MLA typed + hooked)  ->  1589.0  (dense FFN typed + hooked)
+    0.24 tok/s       ->  0.43    ->  0.63
+    staging 7.23 GB/token  ->  3.11  ->  1.42
+
+THE DENSE FFN WAS FIVE SMALL EDITS, all substituting GLM names into an existing pattern: ffn_types[3] on
+GlmTrunkLayerWeights (Shexp had types, the dense FFN did not); glm_try_native_ffn declared in glm_moe_native.hpp and
+implemented beside the hook it wraps, returning false rather than failing when there is no hook or no types; glm_stage_ffn
+gaining a defaulted `const int* types` so no existing caller changes, preferring the device and falling back to
+expert_ffn on failure; the trunk's single call site passing w.ffn_types; and the runner filling them plus adding the
+three tensors to the provider's skip list.  THE DEFAULTED PARAMETER IS THE POINT: it makes the change invisible to every
+caller that has no types, which is what let a five-file edit land without touching the gates.
+
+AND THE LOGIT MOVED AGAIN, 17.249516 -> 17.236195, with the same argmax: four arithmetics now - two host GEMMs, the CUDA
+head, the native dense FFN - all producing 12089 for the prompt, which is a set of independent agreements rather than
+one implementation checked against itself.
+
+WHAT REMAINS IS NOW ONE THING.  The 34 KDA blocks are 69.9% of the wall time at 5,556 ms, and their PROJECTIONS ARE
+ALREADY NATIVE - so what is left in them is the non-GEMM work: the conv, the gates, the l2/rms norms and the delta-rule
+recurrence over 64 heads of 128x128 state, all still on the host, plus the small ssm_*/hc_* staging that survives in the
+1.42 GB per token.  That is the first stage in this port that needs a kernel WRITTEN rather than wired, and gdn.cu beside
+it is the closest existing thing - the same delta-rule family, already on the device for the other model.

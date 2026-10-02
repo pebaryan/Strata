@@ -51,6 +51,11 @@ struct GlmTrunkLayerWeights {
     const kernels::glm::MoeGeometry* shexp_g = nullptr;
     const float* const* shexp = nullptr;              ///< {gate, up, down} of the shared expert, or null
     int shexp_types[3] = {0, 0, 0};                   ///< native GGML types, all zero for host floats
+    /// The DENSE feed-forward's three types, for blocks 0..2.  The shared expert had types and the dense FFN did not,
+    /// which is the whole reason the stem was still being dequantised to host floats every token: ffn_gate/up/down at
+    /// 12,288 x 4,096 are about 201 MB each, and three of them across three layers is 1.8 GB per token of materialisation
+    /// that a device MMVQ read removes entirely.
+    int ffn_types[3] = {0, 0, 0};
     const kernels::cpu::NativeFmt* moe_fmt = nullptr;
     const uint8_t* (*blob_fn)(void*, int, int) = nullptr;
     void* blob_ctx = nullptr;
