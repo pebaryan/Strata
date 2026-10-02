@@ -183,6 +183,14 @@ target_include_directories(glm5_bind_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/i
 target_compile_options(glm5_bind_check PRIVATE -O2)
 target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::cudart)
 
+# Expert row upload gate (branch glm5next-port): is the range the table describes actually IN the shard, and does a real
+# expert row survive an H2D/D2H round trip byte-for-byte?  The offsets have only ever been checked by arithmetic; a
+# truncated shard or a wrong shard name would read garbage that no kernel would flag.
+add_executable(expert_row_upload_gate tools/expert_row_upload_gate.cpp)
+target_include_directories(expert_row_upload_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(expert_row_upload_gate PRIVATE -O2)
+target_link_libraries(expert_row_upload_gate PRIVATE CUDA::cudart)
+
 # Device-resident expert cache, policy half (branch glm5next-port): keys, bytes, a budget and least-recently-used
 # eviction, with no CUDA anywhere in it - so the policy can be tested without a GPU and the upload half cannot hide a
 # policy bug behind a cudaMalloc.  The cache is what makes the device expert path worth having rather than a wash.

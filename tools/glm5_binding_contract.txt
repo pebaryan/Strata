@@ -6570,3 +6570,33 @@ TWO ERRORS OF MINE ON THE WAY, BOTH INSTRUMENT-SIDE:
      in CMakeLists.txt.  The target that had been added earlier survived only because it links strata_core, whose include
      directories propagate - i.e. it was building by luck.  Both lines are now correct, and the rule already in this
      port's notes holds again: edit files with the patch tool, not with a scripted write inside a shell heredoc.
+
+THE UPLOAD HALF'S FOUNDATION: THE RANGE IS REAL, AND AN EXPERT ROW SURVIVES THE ROUND TRIP
+
+    expert_row_upload_gate <pack_dir> 3
+      layer 3: gu_type 16 d_type 18, blob_bytes 7536640 per expert, shard GLM-...-00002-of-00003.gguf
+      reading from the pack's own consolidated experts.bin
+      shard size 86406856704 bytes (80.47 GB)
+      expert region: offset 0 + 288 x 7536640 = 2170552320  fits inside the file
+      expert 7 of layer 3: H2D+D2H of 7536640 bytes, 0 byte(s) differ (byte-identical)
+      content check: the uploaded bytes vary, so agreement is meaningful
+      first 16 bytes: 560d7d899e3ff3c340fcc389a06d52d5
+      PASS
+
+THREE THINGS ARE CHECKED AND EACH OF THEM COULD HAVE BEEN WRONG: that the region the table's offsets describe is actually
+inside the file (a truncated shard or a wrong offset would otherwise be read as garbage that no kernel would flag); that
+one expert's 7,536,640 bytes can be moved to the device and back byte-for-byte; and that the bytes are not a constant run,
+because an all-zeros round trip would agree perfectly and prove nothing.  That last check is the one that makes the PASS
+mean something rather than merely look like one.
+
+AND IT FOUND WHERE THE EXPERT BYTES ACTUALLY LIVE, WHICH THE TABLE MISDESCRIBES.  The first version looked for
+GLM-...-00002-of-00003.gguf beside the pack, did not find it, and stopped - the header says the offsets are "absolute
+offsets in GLM-...gguf, or in the named shard beside it", and that is not how the pack is laid out.  The pack ships its
+OWN consolidated experts.bin, 86,406,856,704 bytes, which is EXACTLY the total the table's header declares, and the
+per-layer offsets index into that.  So the shard name in the table records PROVENANCE, not the read path.  This matters
+beyond this gate: anything that uploads an expert row - the stage this gate is preparing for - must read from
+experts.bin, and a reader that trusted the table's wording would open a file that is not there.  The gate now prefers
+experts.bin and falls back to the named shard, printing which it used so the choice is never implicit.
+
+ALSO WORTH NOTING FOR ANYONE READING A ROW: the first 16 bytes of layer 3's expert 7 begin 560d7d899e3ff3c340fcc389a06d52d5,
+and they will be different every time the pack is rebuilt - they are a fingerprint of this pack's cut, not a constant.
