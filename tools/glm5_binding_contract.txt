@@ -6628,3 +6628,35 @@ AND THE UPLOAD GATE'S OWN LABEL WAS CORRECTED RATHER THAN LEFT: it said it uploa
 layout unknown that slice is simply blob_bytes read from a non-first offset, and a gate that mislabels what it tested is
 the instrument failure this port has now recorded eleven times.  It reads, checks bounds, round trips and requires the
 bytes to be non-degenerate - and says so, including that the layout is ExpertSource::blob's business and not its own.
+
+THE DEVICE EXPERT PATH'S INTERFACE ALREADY EXISTS AND NOTHING CALLS IT - AGAIN WIRING, NOT INVENTION
+
+    const uint8_t* FileExpertSource::device_alias(int64_t layer, int64_t expert) const {     // expert_source.cpp:666
+        if (!pinned(layer, expert) || complement_device_ == nullptr) return nullptr;
+        const size_t index = (size_t) layer * n_expert_ + (size_t) expert;
+        return complement_device_ + complement_offsets_[index];
+    }
+
+    and beside it, src/core/expert_source.cpp:674
+    void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd,
+                              int64_t k, float* out);
+
+WHAT THIS MEANS, and it is the same finding as the KDA and the MLA, the fourth time in this port:
+
+  1. A DEVICE POINTER FOR AN EXPERT'S BLOB IS ALREADY AN INTERFACE METHOD.  It returns non-null when the expert is
+     PINNED into the device complement arena, which is what pin_cache_complement already builds and what
+     complement_device_/complement_offsets_ already address.  So the upload half of the stage does not need to be written
+     for pinned experts - it needs to be WIRED to this, with an upload only as the fallback for unpinned ones.
+  2. AN ADAPTER FOR DISPATCHING A POOL OF EXPERTS ALREADY EXISTS, with comments naming clauses ("clause 2: moe_combine
+     applies it on the device", "clause 3: the blob's internal offsets are compile-time constants, so a mismatched
+     geometry does not produce a wrong answer - it produces a walk off the end of the blob into the next expert's bytes,
+     which is finite and plausible").  That clause 3 note is the same class of failure as this port's own: plausible
+     output rather than a crash, which is why the guard names the geometry instead of trusting it.
+  3. NOTHING CALLS device_alias.  Grepping the whole tree finds it only in this contract's own notes.  So the path was
+     DESIGNED - interface, pinning, device arena, adapter, and a refusal clause for the geometry - and never connected to
+     the trunk that runs the model.
+
+SO THE STAGE'S FIRST JOB IS NOT TO BUILD AN UPLOADER.  It is to look at what pinning has already put on the device, ask
+device_alias for each selected expert, and only arrange an upload for the ones it declines.  That is exactly the shape of
+the three ports that worked today - the KDA hook, the MLA types, the dense FFN's ffn_types - each of which took minutes
+because the pattern existed one file over and the work was naming it correctly.
