@@ -6226,3 +6226,25 @@ WHAT TO USE IT FOR NEXT: every remaining stage change is worth less than the 1.8
 nothing below that should be claimed from single runs.  The expert dequantisation share is the next thing to measure with
 it, and the way to do that is to compare the current CPU expert path against a device MMVQ path for the same stage rather
 than to compare two builds measured at different times.
+
+THE EXPERT PORT'S SCOPE, SETTLED FROM THE PACK'S OWN TABLE RATHER THAN FROM A CENSUS
+
+Reading native_experts.txt properly - one row per LAYER, so a layer's 288 experts all share its two types:
+
+    gu_type 19 (IQ1_S) -> 28 of 43 layers   UNSUPPORTED   (the gate and up projections)
+    gu_type 16         -> 14 layers          supported     (iq_mmvq dispatches it)
+    gu_type 10 (Q2_K)  ->  1 layer           UNSUPPORTED
+    d_type  18         -> 39 layers          supported
+    d_type  23         ->  3 layers          supported
+    d_type  11 (Q3_K)  ->  1 layer           UNSUPPORTED
+
+AND THE STRUCTURE IS FAVOURABLE, which is worth knowing before writing anything: because the type belongs to the LAYER and
+not to the expert, a layer is either entirely servable by the device path or not at all - there is no per-expert fallback
+to design, and no mixture of paths inside one block.  With IQ1_S alone (the single largest item, and the one carrying 65%
+of the layers) the device path covers the 14 type-16 layers and those 28 at once, i.e. 42 of the 43 layers whose gate and
+up are the problem; Q2_K adds the last one and Q3_K only affects a single layer's down projection.
+
+SO THE FIRST KERNEL TO WRITE IS IQ1_S AND NOTHING ELSE, and the discipline for it is the one that already worked twice in
+this port: transcribe the reference's block layout and vec_dot into a CUDA kernel, then gate it BIT-EXACT against a numpy
+transcription of ggml's own code - the way dequant_q5_K (16fd02f) and dequant_q6_K were gated, not against the code it was
+transcribed from.  The other two types are single-layer follow-ups and are not on the critical path.
