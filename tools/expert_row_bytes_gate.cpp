@@ -63,6 +63,34 @@ int main(int argc, char** argv) {
         std::printf("  %-34s %-8s %12llu %12llu  %s%s\n", c.what, supported ? "yes" : "no", got, want,
                     size_ok ? "" : "SIZE," , supp_ok ? "ok" : (size_ok ? "SUPPORT" : "SIZE+SUPPORT"));
     }
+    // units matter here and I got them wrong the first time: gu_row and d_row are BYTES PER ROW (1,056 and 784), while
+    // up_off and down_off are whole-projection byte offsets inside the blob - up_off is n_ff rows of the gate, down_off
+    // is that twice over, and bytes is the three concatenated, which is exactly the pack's blob_bytes.  The first run
+    // compared a per-row figure against a whole-projection figure and reported the helper as wrong when it was not.
+    std::printf("\n  native_expert_layout, for the two type pairs that matter (gu_row/d_row are BYTES PER ROW):\n");
+    const struct { int gu, d; unsigned long long gu_row, d_row, bytes; const char* what; } layouts[] = {
+        {16, 18, 1056ull, 784ull, 7536640ull, "IQ2_XXS / IQ3_XXS - 14 layers"},
+        {19, 18, 0ull, 784ull, 3211264ull, "IQ1_S / IQ3_XXS   - 28 layers"},
+    };
+    for (const auto& L : layouts) {
+        const strata::kernels::NativeExpertLayout lay = strata::kernels::native_expert_layout(L.gu, L.d, 4096, 2048);
+        const bool rows_ok = ((unsigned long long) lay.gu_row == L.gu_row) && ((unsigned long long) lay.d_row == L.d_row);
+        const bool bytes_ok = ((unsigned long long) lay.bytes == L.bytes);
+        const unsigned long long gate_total = L.gu_row * 2048ull;                 // n_ff rows of the gate
+        const bool off_ok = ((unsigned long long) lay.up_off == gate_total) &&
+                            ((unsigned long long) lay.down_off == 2ull * gate_total);
+        std::printf("    %-34s gu_row %6llu %s  d_row %6llu %s  up_off %8llu  down_off %8llu  bytes %9llu %s%s\n",
+                    L.what, (unsigned long long) lay.gu_row, rows_ok ? "ok" : "MISMATCH",
+                    (unsigned long long) lay.d_row, rows_ok ? "" : "MISMATCH", (unsigned long long) lay.up_off,
+                    (unsigned long long) lay.down_off, (unsigned long long) lay.bytes,
+                    bytes_ok ? "ok" : "MISMATCH", off_ok ? "" : "  OFFSETS NOT THE CONCATENATION");
+        if (!rows_ok || !bytes_ok || !off_ok) {
+            ++failures;
+            std::printf("           ^ for the (19,18) pair a zero gu_row is CORRECT and expected: type 19 has no kernel,\n");
+            std::printf("             so its row size is 0 and the blob's bytes collapse to the down projection alone.\n");
+        }
+    }
+
     std::printf("\n  %d of %zu case(s) disagree%s\n", failures, cases.size(), bad ? " (expected: all of them)" : "");
 
     // the known inconsistency, stated rather than buried

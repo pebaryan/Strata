@@ -6741,3 +6741,26 @@ policy:
 
 Note what the cache is still for, despite all of the above: it is what turns "upload the eight experts this token selected"
 into "upload the ones that are not already there", which is the difference between a wash and a gain.
+
+THE LAYOUT HELPER IS VALIDATED AGAINST THE PACK - AND MY FIRST CHECK OF IT USED THE WRONG UNITS
+
+    native_expert_layout(16, 18, 4096, 2048):
+      gu_row   1056        BYTES PER ROW  (4096/256 * 66)
+      d_row     784        BYTES PER ROW  (2048/256 * 98)
+      up_off   2162688     = 2048 rows of the gate, i.e. where the up projection begins inside the blob
+      down_off 4325376     = twice that, i.e. where the down projection begins
+      bytes    7536640     == the pack's blob_bytes EXACTLY
+
+    so the blob is the three projections concatenated, the in-blob offsets are the concatenation, and the helper's total
+    reproduces the pack's own per-expert size to the byte.  For (19, 18) the helper returns gu_row 0 and bytes 3211264 -
+    the down projection alone - which is CORRECT and expected: type 19 has no kernel, so its row size is zero.
+
+AND MY FIRST CHECK REPORTED THIS AS A MISMATCH, because I compared a per-row figure (1,056) against a whole-projection
+figure (2,162,688).  The helper was right and the check was unit-confused - the twelfth instrument-side error of this
+session, and the same shape as the others: the port's failures have overwhelmingly been in what was measuring, not in
+what was measured.  The corrected expectations are written into the gate with the distinction spelled out, so the next
+reader does not have to relearn it.
+
+WHAT THIS CLOSES: the question the pack's offsets could not answer (0 of 43 layers under the stride model) is answered by
+a function whose answer agrees with the pack's byte sizes for the whole blob, and that agreement is what lets the stage
+address an expert's gate, up and down inside a resident row without re-deriving anything.
