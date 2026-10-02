@@ -6190,3 +6190,39 @@ WHAT SURVIVES UNAFFECTED: the three ports.  Their deltas were 2-12x on the stage
 the token gate as well as by the clock, so no amount of cache drift accounts for them.  What does NOT survive is any
 conclusion drawn from comparing two different batches - which includes the 18.1% attributed to l_out and the 10% to the
 MLA stage, since those shares were read off a fast batch and the run they describe is the one where ffn_norm was 55.6%.
+
+THE INTERLEAVED HARNESS, AND IT RETIRES THE PAGE-CACHE QUESTION
+
+    tools/ab_bench.py --pairs 3 --a STRATA_EXPERT_KEEP=1 --b "STRATA_EXPERT_KEEP=" -- <runner>
+      pair 1: A 1554.2 ms  B 1552.7 ms   A-B   +1.5 ms
+      pair 2: A 1735.8 ms  B 1555.3 ms   A-B +180.5 ms
+      pair 3: A 1558.6 ms  B 1550.2 ms   A-B   +8.4 ms
+      arm A (keep pages)  1616.2 ms/token  spread 11.2%
+      arm B (release)     1552.7 ms/token  spread  0.3%
+      paired mean difference +63.5 ms (4.0% of the mean), largest within-arm spread 11.2%
+      VERDICT: NOT DISTINGUISHABLE
+
+WHY THE HARNESS EXISTS: the engine is precise inside a batch (per-stage spreads of 0.3-1.3%) but the whole level moves by
+up to 1.8x between batches, and the per-stage shares move with it, so any comparison of two runs taken at different times
+is worthless.  Alternating A, B, A, B inside one session makes both arms see the same cache state, and reporting the
+PAIRED differences alongside the arm means is what exposes a single slow run for what it is - pair 2's +180.5 ms is one
+outlier inside arm A's own 11.2% spread, not an effect.  The harness also refuses to over-claim: if the paired difference
+is no larger than the within-arm spread it prints NOT DISTINGUISHABLE and says so, which is a result rather than a failure.
+
+AND THE ANSWER IS THAT THE PAGE-CACHE RELEASE DOES NOT MATTER.  Keeping the expert pages is not measurably faster or
+slower than releasing them at 4% resolution, so the 1.8x I measured earlier was the between-batch swing and nothing else.
+The residency question is retired at this resolution, and with it the temptation to build a residency plan: the expert
+stage's I/O is either not large enough to move the wall time or is already being served as well as it will be by the
+existing read path.  The default therefore stays release-on-use, now as a measured no-op rather than a status quo, and
+STRATA_EXPERT_KEEP stays in the source as an experiment that has been run.
+
+NOTE THE INSTRUMENT'S OWN EFFECT, because it is evidence for the diagnosis: with the arms interleaved the fast arm's
+spread is 0.3% and the level is the fast batch's 1,552.7 ms/token, whereas three consecutive runs of the SAME arm
+earlier gave 2,728-2,780.  The difference between those two batches was not the code - it was what the cache had been
+made to hold by the experiment that ran before them.  That is the mechanism behind the between-batch swing, observed
+directly.
+
+WHAT TO USE IT FOR NEXT: every remaining stage change is worth less than the 1.8x the machine can drift on its own, so
+nothing below that should be claimed from single runs.  The expert dequantisation share is the next thing to measure with
+it, and the way to do that is to compare the current CPU expert path against a device MMVQ path for the same stage rather
+than to compare two builds measured at different times.
