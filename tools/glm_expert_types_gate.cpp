@@ -29,19 +29,22 @@ int main(int argc, char** argv) {
     const bool bad = (argc > 1 && std::strcmp(argv[1], "--bad") == 0);
     const bool inv = bad;      // --bad inverts every expectation
 
-    std::printf("  THE THREE TYPE PAIRS THE MODEL ACTUALLY USES, against the GROUPED kernel's dispatch:\n");
-    // gate/up 16 with down 23: 3 layers.  Both halves have grouped cases, so this pair IS servable.
+    std::printf("  THE TYPE PAIRS THE MODEL ACTUALLY USES, against iq_mmvq's dispatch (the PER-EXPERT path):\n");
+    // gate/up 16 with down 23: 3 layers.  Both halves covered.
     expect(glm_expert_layer_supported(16, 23), !inv, "gu 16 / down 23 (3 layers)  servable");
-    // gate/up 16 or 19 with down 18: 39 layers, and there is NO grouped down case for 18.
-    expect(glm_expert_layer_supported(16, 18), inv, "gu 16 / down 18 (11 layers) NOT servable: no down case for 18");
-    expect(glm_expert_layer_supported(19, 18), inv, "gu 19 / down 18 (28 layers) NOT servable: neither half");
+    // gate/up 16 with down 18: 11 layers.  THIS IS THE PAIR THE FIRST VERSION OF THIS HEADER GOT WRONG - it was generated
+    // from the GROUPED switch, which has no case for 18, and refused a pair iq_mmvq handles.  The parity gate caught it.
+    expect(glm_expert_layer_supported(16, 18), !inv, "gu 16 / down 18 (11 layers) servable on the PER-EXPERT path");
+    // gate/up 19 with down 18: 28 layers, and IQ1_S has no kernel in any switch.
+    expect(glm_expert_layer_supported(19, 18), inv, "gu 19 / down 18 (28 layers) NOT servable: no IQ1_S kernel");
     // gate/up 10 with down 11: 1 layer, neither half.
     expect(glm_expert_layer_supported(10, 11), inv, "gu 10 / down 11 (1 layer)  NOT servable: neither half");
 
-    std::printf("\n  THE INDIVIDUAL LISTS, so a reader can see the asymmetry rather than infer it:\n");
-    expect(glm_expert_gu_supported(16) && glm_expert_gu_supported(19) == false, !inv, "gu: 16 yes, 19 no");
-    expect(glm_expert_down_supported(18), inv, "down: 18 (39 of 43 layers) IS supported by the grouped kernel");
-    expect(glm_expert_down_supported(23), !inv, "down: 23 yes");
+    std::printf("\n  AND THE ASYMMETRY THAT DECIDED THE STAGE'S DESIGN - the GROUPED path's down switch:\n");
+    expect(glm_expert_down_supported(18), !inv, "down 18 IS in iq_mmvq's dispatch (so per-expert works)");
+    expect(strata::core::glm_grouped_down_supported(18), inv, "down 18 is NOT in the GROUPED down switch (20, 23, 42)");
+    expect(strata::core::glm_grouped_down_supported(23), !inv, "down 23 IS in the grouped switch");
+    expect(glm_expert_gu_supported(16) && !glm_expert_gu_supported(19), !inv, "gu: 16 yes, 19 no");
     expect(glm_expert_down_supported(11), inv, "down: 11 no");
 
     std::printf("\n  %d expectation(s) failed%s\n", failures, bad ? " (expected: all of them)" : "");

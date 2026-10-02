@@ -192,10 +192,11 @@ target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::c
 # additionally references RemoteExperts.  So the fix is to add those two - and remote_experts.cpp if the linker still asks -
 # to the add_executable below.  Until that is done and verified, the target stays COMMENTED OUT: a permanently red target
 # in a tree whose rule is that every commit builds would train the next reader to ignore a red build.
-# add_executable(expert_parity_gate tools/expert_parity_gate.cpp src/core/expert_source.cpp src/core/expert_cache.cpp)
-# target_include_directories(expert_parity_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
-# target_compile_options(expert_parity_gate PRIVATE -O2)
-# target_link_libraries(expert_parity_gate PRIVATE strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
+add_executable(expert_parity_gate tools/expert_parity_gate.cpp src/core/expert_source.cpp src/core/expert_cache.cpp
+               src/core/remote_experts.cpp)
+target_include_directories(expert_parity_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(expert_parity_gate PRIVATE -O2)
+target_link_libraries(expert_parity_gate PRIVATE strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
 
 # Device expert type guard (branch glm5next-port): which types the GROUPED kernel's switches actually cover, which is
 # not what iq_supported says and not what iq_mmvq's dispatch implies - the grouped down switch covers 20, 23 and 42 while

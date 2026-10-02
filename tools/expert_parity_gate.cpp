@@ -20,6 +20,7 @@
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/glm_expert_types.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -43,9 +44,23 @@ int main(int argc, char** argv) {
         return 2;
     }
 
-    C::FileExpertSource src;
     std::string err;
-    if (!src.open(pack, 48, 288, err)) { std::fprintf(stderr, "  open: %s\n", err.c_str()); return 1; }
+    // THE LAYOUT MUST BE LOADED BEFORE THE SOURCE IS OPENED, and this is the step the first version of this gate skipped -
+    // which produced "the requested geometry does not match the loaded expert layout" with a correct-looking (46, 288).
+    // open() validates the caller's numbers against the LOADED layout, and nothing had loaded one.  The runner does this
+    // at line 505 -> 517 and tools/block3_gate.cpp:255 shows the exact signature: (pack, 46, N_EXPERT, err, N_EMBD, FF).
+    {
+        K::cpu::ExpertLayout layout;
+        if (!K::cpu::expert_layout_load(pack, 46, 288, err, 4096, 2048)) {
+            std::fprintf(stderr, "  expert_layout_load: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("  layout: n_layers %lld n_expert %lld native %d first_layer %lld\n", (long long) layout.n_layers,
+                    (long long) layout.n_expert, layout.native ? 1 : 0, (long long) layout.first_layer);
+    }
+
+    C::FileExpertSource src;
+    if (!src.open(pack, 46, 288, err)) { std::fprintf(stderr, "  open: %s\n", err.c_str()); return 1; }
     const uint8_t* blob = src.blob(layer, expert);
     if (blob == nullptr) { std::fprintf(stderr, "  blob(%d, %d) is null\n", layer, expert); return 1; }
 

@@ -37,13 +37,36 @@ inline bool glm_expert_gu_supported(int ggml_type) {
     }
 }
 
-/// Does a native_expert_grouped down dispatch case exist for this type?
+/// iq_mmvq's dispatch - the PER-EXPERT path, and the set a per-expert stage must guard on.
+///
+/// CORRECTION: the first version of this function was generated from native_expert_grouped's DOWN switch, which covers
+/// only 20, 23 and 42, and it therefore refused (16, 18) - the pair that 39 of this model's 43 layers use and that iq_mmvq
+/// handles perfectly well.  tools/expert_parity_gate.cpp caught it by refusing to run, before any stage code depended on
+/// it.  Both switches are now recorded, separately and honestly: this one is iq_mmvq's.
 inline bool glm_expert_down_supported(int ggml_type) {
+    switch (ggml_type) {
+        case 16:
+        case 17:
+        case 18:
+        case 20:
+        case 21:
+        case 22:
+        case 23:
+        case 29:
+        case 42:
+            return true;
+        default:
+            return false;
+    }
+}
+
+/// native_expert_grouped's DOWN dispatch is only 20, 23 and 42 - so the GROUPED path serves three of this model's 43
+/// layers.  Kept beside the per-expert list because the difference between them is what decided the stage's design.
+inline bool glm_grouped_down_supported(int ggml_type) {
     switch (ggml_type) {
         case 20:
         case 23:
         case 42:
-
             return true;
         default:
             return false;

@@ -6990,3 +6990,30 @@ THE PARITY GATE'S LINK LINE, WRITTEN DOWN SO IT IS A COPY RATHER THAN A SEARCH
     target enabled and red would break the rule this port has held all day - every commit builds and passes its gate - and
     a build that is red for a known-benign reason is how a team learns to stop reading red builds.  The gate's own
     contents are committed and reviewed; only its activation is deferred, with the line above as the answer.
+
+THE GUARD WAS WRONG AND THE PARITY GATE CAUGHT IT BEFORE ANY STAGE CODE DEPENDED ON IT
+
+    The first version of include/strata/core/glm_expert_types.hpp was GENERATED from native_expert_grouped's switches and
+    then used to guard a PER-EXPERT iq_mmvq path.  So glm_expert_down_supported(18) was false - and 18 is the down
+    projection of 39 of the model's 43 layers, which iq_mmvq handles perfectly.  tools/expert_parity_gate.cpp refused to
+    run because of it, which is exactly what the guard was for, except that the thing it was guarding against was itself.
+    This is the thirteenth instrument-side error of the session and the first one found by a gate written the same day.
+
+    THE CORRECTED HEADER now records BOTH switches separately and says which is which:
+      iq_mmvq (per-expert, the path the stage will use) : 16, 17, 18, 20, 21, 22, 23, 29, 42
+      native_expert_grouped's down (grouped)            : 20, 23, 42   -> three of 43 layers
+    and glm_expert_types_gate passes 10/10, asserting both the model's real pairs against the per-expert list and the
+    asymmetry that decided the design - down 18 IS in iq_mmvq's dispatch, and is NOT in the grouped switch.
+
+    THE PARITY GATE NOW RUNS END TO END AND STOPS AT THE FIRST DEVICE CALL:
+      layout: n_layers 0 n_expert 512 native 0 first_layer 0     <- the local ExpertLayout is NOT filled by the loader
+      layer 3 expert 0: gu_type 16 d_type 18
+      layout: gu_row 1056 d_row 784 up_off 2162688 down_off 4325376 bytes 7536640   <- and these are right
+      quantize_q8_1_rows: an illegal memory access was encountered
+    so the prologue is sound - the pack opens (46, 288 with expert_layout_load called first, which is what the first
+    version omitted), the blob is found, the type pair passes the guard, and the layout matches the pack to the byte.  The
+    fault is in the first device call, and the next step is to compare this call against the runner's own - the wrapper
+    reports the name itself, so the convention it expects (stream and destination) is what to check, not the arithmetic.
+    NOTE the other rendering bug this exposed: printing the LOCAL ExpertLayout shows the loader's defaults, because the
+    loader fills its own state rather than the caller's struct - a cosmetic misleading print worth fixing by reading the
+    accessor instead.
