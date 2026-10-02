@@ -3,8 +3,10 @@
 // onto the device.  The graph is quoted in the header; the oracle lives in tools/glm5_mla_reference.py.
 #include "strata/kernels/glm_mla.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 namespace strata::kernels::glm {
@@ -12,9 +14,19 @@ namespace {
 
 MlaNativeProjectFn g_native_project = nullptr;
 bool g_device_attention = false;
-// The V100 launch/copy overhead exceeds the host loop at short cache depths.  Long-context scoring is
-// the target of this kernel; keep the measured short-context path on host.
-constexpr int MLA_CUDA_MIN_CACHE = 256;
+// The V100 launch/copy overhead exceeds the host loop at short cache depths. Keep the measured default, while
+// allowing a controlled A/B threshold without rebuilding the persistent serving process.
+int mla_cuda_min_cache() {
+    static const int value = [] {
+        const char* env = std::getenv("STRATA_GLM_MLA_MIN_CACHE");
+        if (!env || !*env) return 256;
+        char* end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        if (end == env || *end != '\0') return 256;
+        return (int) std::max(1L, std::min(8192L, parsed));
+    }();
+    return value;
+}
 
 /// x -> rms_norm(x) * weight, over the whole row (the reference normalizes ne0 and scales by the weight).
 void rms_norm_inplace(float* x, int n, const float* weight) {
@@ -117,7 +129,7 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
     std::vector<float> attn((size_t) n_head * kv_lora, 0.0f);
     std::vector<float> v((size_t) q_dim, 0.0f);
     bool attention_done = false;
-    if (g_device_attention && n_cache >= MLA_CUDA_MIN_CACHE) {
+    if (g_device_attention && n_cache >= mla_cuda_min_cache()) {
         char cuda_err[256] = {};
         attention_done = mla_attention_cuda(qcur.data(),cache,n_cache,n_head,head_dim,kv_lora,
                                             attn.data(),cuda_err,sizeof(cuda_err));
