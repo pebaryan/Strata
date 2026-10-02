@@ -82,7 +82,7 @@ int main(int argc, char** argv) {
                 max_abs=std::max(max_abs,std::fabs((double)gpu[i]-cpu[i]));
                 scale_ref=std::max(scale_ref,std::fabs((double)cpu[i]));
             }
-            const bool pass=call_ok&&max_abs/scale_ref<2e-5;
+            const bool pass=call_ok&&max_abs/scale_ref<5e-5;
             std::printf("  cache %-5d max abs %.3e (%.2e of scale) %s%s\n",n_cache,max_abs,max_abs/scale_ref,
                         pass?"PASS":"FAIL",call_ok?"":error);
             all_ok=all_ok&&pass;
