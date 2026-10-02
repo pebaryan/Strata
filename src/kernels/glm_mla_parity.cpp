@@ -87,6 +87,27 @@ int main(int argc, char** argv) {
                         pass?"PASS":"FAIL",call_ok?"":error);
             all_ok=all_ok&&pass;
         }
+        {
+            glm::MlaGeometry g; g.n_embd=32;g.n_head=2;g.head_dim=8;g.kv_lora=16;g.q_lora=12;
+            const int ncache=257,qdim=g.n_head*g.head_dim;
+            auto fill=[](std::vector<float>& v){for(size_t i=0;i<v.size();++i)v[i]=(float)((int)((i*31+11)%97)-48)*0.002f;};
+            std::vector<float> wqa((size_t)g.q_lora*g.n_embd),qan((size_t)g.q_lora),wqb((size_t)qdim*g.q_lora);
+            std::vector<float> wkb((size_t)g.n_head*g.kv_lora*g.head_dim),kva((size_t)g.kv_lora*g.n_embd);
+            std::vector<float> kvan((size_t)g.kv_lora),wvb((size_t)g.n_head*g.head_dim*g.kv_lora);
+            std::vector<float> wo((size_t)g.n_embd*qdim),x((size_t)g.n_embd),cache((size_t)ncache*g.kv_lora);
+            for(auto* v:{&wqa,&qan,&wqb,&wkb,&kva,&kvan,&wvb,&wo,&x,&cache})fill(*v);
+            glm::MlaWeights w;w.wq_a=wqa.data();w.q_a_norm=qan.data();w.wq_b=wqb.data();w.wk_b=wkb.data();
+            w.kv_a=kva.data();w.kv_a_norm=kvan.data();w.wv_b=wvb.data();w.wo=wo.data();
+            std::vector<float> cpu_out((size_t)g.n_embd),gpu_out((size_t)g.n_embd);
+            std::vector<float> cpu_attn((size_t)g.n_head*g.kv_lora),gpu_attn(cpu_attn.size());
+            std::vector<float> cpu_qr((size_t)g.q_lora),gpu_qr(cpu_qr.size());
+            glm::MlaIntermediates cm,gm;cm.attn=cpu_attn.data();cm.qr=cpu_qr.data();gm.attn=gpu_attn.data();gm.qr=gpu_qr.data();
+            glm::mla_set_device_attention(false);glm::mla_forward(w,g,x.data(),ncache,cache.data(),cpu_out.data(),cm);
+            glm::mla_set_device_attention(true);glm::mla_forward(w,g,x.data(),ncache,cache.data(),gpu_out.data(),gm);
+            compare("long attn",gpu_attn,cpu_attn.data(),cpu_attn.size(),all_ok);
+            compare("long out",gpu_out,cpu_out.data(),cpu_out.size(),all_ok);
+            glm::mla_set_device_attention(false);
+        }
         std::printf("MLA CUDA attention selftest: %s\n",all_ok?"PASS":"FAIL");
         return all_ok?0:1;
     }
