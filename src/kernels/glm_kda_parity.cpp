@@ -151,6 +151,19 @@ int main(int argc, char** argv) {
     compare("gated", got_o, e_o, ok);
     compare("result", got_result, e_result, ok);
 
+    std::vector<float> device_attn((size_t)tokens*di), device_state((size_t)nh*hd*hd,0.0f);
+    char device_error[256] = {};
+    const bool device_ok = glm::kda_recurrence_cuda(got_q.data(),got_k.data(),got_v.data(),got_g.data(),got_beta.data(),
+                                                     tokens,nh,hd,device_state.data(),device_attn.data(),
+                                                     device_error,sizeof(device_error));
+    if (device_ok) {
+        compare("CUDA attn",device_attn,e_attn,ok,3e-4,2e-3);
+        compare("CUDA/CPU S",device_state,state,ok,3e-4,2e-3);
+    } else {
+        std::printf("  CUDA recurrence unavailable: %s\n",device_error);
+        ok=false;
+    }
+
     // structural invariants that do not depend on the weights agreeing with the oracle
     {
         double gmin = 1e30, gmax = -1e30, qn_mean = 0.0;
