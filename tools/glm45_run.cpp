@@ -75,12 +75,22 @@ struct StageCount {
 /// per-layer profile with no profiler attached - which is what decides where the CUDA port should start.
 struct StageProfile {
     int last_layer = -1;
+    const char* last_name = "";
     std::chrono::steady_clock::time_point last_time;
     std::map<int, double> ms;
-    void note(int layer) {
+    std::map<std::string, double> by_stage;   ///< keyed by the stage that was LIVE during the interval
+    /// The interval between two consecutive callbacks is the cost of whatever ran between them, and the stage that ran
+    /// in the gap is identified by the callback that CLOSED it - so the delta is charged to the name of the callback
+    /// BEFORE it, which is what the trunk reports at the end of the work it just did.
+    void note(int layer, const char* name) {
         const std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now();
-        if (last_layer >= 0) ms[last_layer] += std::chrono::duration<double, std::milli>(now - last_time).count();
+        const double d = (last_layer >= 0) ? std::chrono::duration<double, std::milli>(now - last_time).count() : 0.0;
+        if (last_layer >= 0) {
+            ms[last_layer] += d;
+            by_stage[last_name] += d;
+        }
         last_layer = layer;
+        last_name = name;
         last_time = now;
     }
 };
@@ -101,7 +111,7 @@ static void stage_cb(void* ctx, int layer, const char* name, const float* data, 
     // consecutive callbacks is the cost of what ran between them, and attributing that to the layer that was live gives
     // a per-layer profile with no profiler attached.  This is what decides which stage the CUDA port should take first,
     // and it is measured rather than guessed, like everything else in this port.
-    g_prof.note(layer);
+    g_prof.note(layer, name);
     // ---- AND REPORT THE MAGNITUDE, because counting stages proves the loop ran and says nothing about what it produced.
     // The oracle's own per-layer dumps for these same four families are on disk, and the runner's input IS the oracle's
     // hc_init - so the two runs are comparable stage by stage from block 0, which is the bisection that found block 0's
@@ -820,11 +830,21 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "  staging: %.2f GB materialised over %d tokens = %.2f GB/token (dequant + D2H, the cost a device MMVQ removes)\n",
                          (double) g_staged_bytes / 1073741824.0, TOKENS,
                          (double) g_staged_bytes / 1073741824.0 / TOKENS);
-            std::fprintf(stderr, "  per layer ms:");
+                    {
+            std::vector<std::pair<std::string, double> > v(g_prof.by_stage.begin(), g_prof.by_stage.end());
+            std::sort(v.begin(), v.end(), [](const std::pair<std::string, double>& a,
+                                             const std::pair<std::string, double>& b) { return a.second > b.second; });
+            std::fprintf(stderr, "  by stage (interval closed by the named callback):\n");
+            for (size_t i = 0; i < v.size() && i < 10; ++i)
+                std::fprintf(stderr, "    %-16s %8.1f ms %5.1f%%\n", v[i].first.c_str(), v[i].second,
+                             100.0 * v[i].second / total);
+        }
+        std::fprintf(stderr, "  per layer ms:");
             for (const std::pair<const int, double>& kv : g_prof.ms) std::fprintf(stderr, " %d:%.1f", kv.first, kv.second);
             std::fprintf(stderr, "\n");
         }
     }
+    K::kda_print_profile();
     std::printf("\nargmax = %d   (logit %.6f)   expected 12089\n", best, best_logit);
     std::printf("ENGINE TOKEN: %s\n", best == 12089 ? "PASS" : "MISMATCH");
     return best == 12089 ? 0 : 1;

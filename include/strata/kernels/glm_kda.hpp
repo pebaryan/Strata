@@ -61,6 +61,9 @@ using KdaNativeProjectFn = bool (*)(int count, const void* const* weights, const
                                     const float* x, int n_in, int n_out, float* const* out);
 void kda_set_native_project(KdaNativeProjectFn fn);
 
+/// Print the KDA stage's host-time breakdown, phase by phase.  Diagnostics only.
+void kda_print_profile();
+
 /// The model's constants, named by the metadata key each comes from so the two eps cannot be swapped.
 inline constexpr float KDA_RMS_EPS = 1e-5f;   ///< attention.layer_norm_rms_epsilon
 inline constexpr float KDA_L2_EPS = 1e-6f;    ///< hard-coded in the reference

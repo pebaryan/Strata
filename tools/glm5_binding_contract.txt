@@ -6040,3 +6040,49 @@ ALREADY NATIVE - so what is left in them is the non-GEMM work: the conv, the gat
 recurrence over 64 heads of 128x128 state, all still on the host, plus the small ssm_*/hc_* staging that survives in the
 1.42 GB per token.  That is the first stage in this port that needs a kernel WRITTEN rather than wired, and gdn.cu beside
 it is the closest existing thing - the same delta-rule family, already on the device for the other model.
+
+THE STAGE-LEVEL PROFILE, AND IT MOVES THE TARGET: THE ROUTED EXPERTS ARE 55.6%, NOT THE KDA
+
+    PROFILE 7884.8 ms for 5 tokens = 1577.0 ms/token (0.63 tok/s)
+      by stage (interval closed by the named callback):
+        ffn_norm           4308.7 ms  55.6%
+        l_out              1401.6 ms  18.1%
+        attn_input         1168.9 ms  15.1%
+        attn_norm           778.0 ms  10.0%
+        hc_attn_post         90.0 ms   1.2%
+        attn_output           3.5 ms   0.0%
+        ffn_out               2.9 ms   0.0%
+        hc_attn_pre           0.9 ms   0.0%
+        hc_ffn_pre            0.8 ms   0.0%
+        moe_ids               0.3 ms   0.0%
+
+    KDA PROFILE over 170 layer calls, 1168.0 ms in these phases
+      attn_norm              0.8 ms    0.1%
+      proj+conv+silu        79.3 ms    6.8%
+      gates                240.3 ms   20.6%
+      recurrence           833.8 ms   71.4%
+      out_norm+wo            9.7 ms    0.8%
+
+TWO MEASUREMENTS AGREE, WHICH IS WHY THE TABLE CAN BE TRUSTED: the trunk's callback interval for attn_input is 1168.9 ms
+and the KDA stage's own phase timers total 1168.0 ms, arrived at independently - one from outside the kernel, one from
+inside it.  That agreement is the reason to believe the rest of the table rather than to read it as another plausible
+number.
+
+AND IT CORRECTS MY OWN ATTRIBUTION.  I had been saying "the KDA blocks are 69.9%", which is true of the LAYER attribution
+but misleading about the work: a KDA block is a KDA stage plus its MoE, and the MoE is what costs.  Of the 5,511 ms
+attributed to KDA blocks, only 1,169 ms is the KDA stage itself - the other 4,300 ms is the FFN/MoE path in the same
+blocks, which the stage-level table shows directly as ffn_norm at 55.6% of the whole run.
+
+SO THE NEXT KERNEL IS NOT THE RECURRENCE.  In order:
+
+  1. THE ROUTED EXPERTS, ffn_norm, 4308.7 ms, 55.6%.  Eight of 288 experts per layer per token, read from the pack's
+     quantized blobs through the ggml-backed CPU expert path, and this is exactly the shape iq_mmvq exists for - with the
+     type gap already sized: 16 and 18 are covered, and 19 (IQ1_S, 28 gu rows, the largest block of expert bytes), 10
+     (Q2_K) and 11 (Q3_K) are not.
+  2. THE KDA RECURRENCE, 833.8 ms inside a 1,168 ms stage, 10.6% of the run - a kernel to write, with gdn.cu as the
+     nearest existing thing.
+  3. THE MLA STAGE, attn_norm, 778.0 ms, 10.0% - its four GEMMs are already native, so this is its attention and cache
+     work.
+  4. l_out, 1401.6 ms, 18.1% - the interval closed by the trunk's final callback, i.e. the per-token work outside the
+     blocks: the head (now on the device) and the token loop itself.  Worth a look before anything else in this list,
+     because 18.1% for that is more than it should be now that the head is a device MMVQ.

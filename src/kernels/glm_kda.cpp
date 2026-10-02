@@ -16,6 +16,14 @@ namespace {
 
 KdaNativeProjectFn g_native_project = nullptr;
 
+/// WHERE THE KDA STAGE'S HOST TIME GOES, phase by phase.  The blocks are 69.9% of the wall time and their projections are
+/// already native, so the remainder is the non-GEMM work - and there are four distinct candidates in here (the input
+/// norm, the conv, the gates, the delta-rule recurrence with its fp64 state copies).  Timing them costs a handful of
+/// chrono calls and says which one to write a kernel for, which is cheaper than reasoning about it and has been right
+/// far more often in this port.
+double g_kda_ms[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
+long g_kda_layers = 0;
+
 inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
 /// A matrix-times-vector with the weight's rows contiguous, which is how every projection in the block
@@ -75,6 +83,19 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     const float scale = 1.0f / std::sqrt((float) hd);
 
     std::vector<float> xn((size_t) tokens * ne);
+    {
+        auto tick = [] { return std::chrono::steady_clock::now(); };
+        auto since = [](const std::chrono::steady_clock::time_point& a) {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+        };
+        (void) tick; (void) since;
+    }
+    ++g_kda_layers;
+    const auto kd_t = [] { return std::chrono::steady_clock::now(); };
+    const auto kd_since = [](const std::chrono::steady_clock::time_point& a) {
+        return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+    };
+    auto kd_t0 = kd_t();
     for (int t = 0; t < tokens; ++t) {
         const float* xt = x + (size_t) t * ne;
         double ss = 0.0;
@@ -85,6 +106,8 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     if (mid && mid->xn) std::memcpy(mid->xn, xn.data(), xn.size() * sizeof(float));
     const double tm_norm = lap();
 
+    g_kda_ms[0] += kd_since(kd_t0);            // the input norm
+    auto kd_t1 = kd_t();
     // q, k, v: project, then a separate causal conv each, then SiLU.  The conv reads earlier rows, so the
     // raw projection and the convolved output must be different buffers (run this in place and iteration
     // t+1 would read rows that iteration t already overwrote).
@@ -116,6 +139,8 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     if (mid && mid->vc) std::memcpy(mid->vc, vc.data(), vc.size() * sizeof(float));
     const double tm_qkv = lap();
 
+    g_kda_ms[1] += kd_since(kd_t1);            // projections, three convs, three SiLUs
+    auto kd_t2 = kd_t();
     // the forget gate: per (head, channel), in [KDA_GATE_LOWER, 0].  ssm_a holds -exp(A_log), so the
     // reference's `sigmoid(-(ssm_a * (...)))` is sigmoid(exp(A_log) * (...)), and the magnitude of the
     // exponent then multiplies the gate's lower bound.
@@ -140,6 +165,8 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     if (mid && mid->beta) std::memcpy(mid->beta, beta.data(), beta.size() * sizeof(float));
     const double tm_gates = lap();
 
+    g_kda_ms[2] += kd_since(kd_t2);            // the gates (beta, f, g)
+    auto kd_t3 = kd_t();
     // the recurrence, per head.  Decay first (S[i][:] *= exp(g[i]) - the gate index is S's FIRST index),
     // then the delta-rule correction, then the read, which happens AFTER the update.
     std::vector<double> S((size_t) nh * hd * hd, 0.0);
@@ -227,6 +254,8 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     if (mid && mid->o) std::memcpy(mid->o, o.data(), o.size() * sizeof(float));
     const double tm_gateout = lap();
 
+    g_kda_ms[3] += kd_since(kd_t3);            // the delta-rule recurrence and its state traffic
+    auto kd_t4 = kd_t();
     if (tokens == 1 && g_native_project && w.wo_type) {
         const void* native_w[1] = {w.wo};
         const int native_type[1] = {w.wo_type};
@@ -243,6 +272,16 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     if (std::getenv("STRATA_GLM_TIMING"))
         std::fprintf(stderr, "KDA_TIMING norm=%.3f qkv=%.3f gates=%.3f rec=%.3f outgate=%.3f wo=%.3f\n",
                      tm_norm, tm_qkv, tm_gates, tm_rec, tm_gateout, tm_wo);
+    g_kda_ms[4] += kd_since(kd_t4);            // the output norm and wo
+}
+
+void kda_print_profile() {
+    const double total = g_kda_ms[0] + g_kda_ms[1] + g_kda_ms[2] + g_kda_ms[3] + g_kda_ms[4];
+    if (total <= 0.0) return;
+    const char* nm[5] = {"attn_norm", "proj+conv+silu", "gates", "recurrence", "out_norm+wo"};
+    std::fprintf(stderr, "KDA PROFILE over %ld layer calls, %.1f ms in these phases\n", g_kda_layers, total);
+    for (int i = 0; i < 5; ++i)
+        std::fprintf(stderr, "  %-16s %9.1f ms  %5.1f%%\n", nm[i], g_kda_ms[i], 100.0 * g_kda_ms[i] / total);
 }
 
 }  // namespace strata::kernels::glm
