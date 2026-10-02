@@ -25,7 +25,7 @@ __global__ void mla_latent_attention(const float* q,const float* cache,int n_cac
     const int h=(int)blockIdx.x,tid=(int)threadIdx.x;
     __shared__ float reduce[256];
     const float* qh=q+(size_t)h*kv_lora;
-    float local_max=-CUDART_INF_F;
+    float local_max=-1.0e30f;
     for(int t=tid;t<n_cache;t+=blockDim.x){
         const float* kt=cache+(size_t)t*kv_lora;float dot=0.0f;
         for(int i=0;i<kv_lora;++i)dot=fmaf(qh[i],kt[i],dot);
