@@ -6693,3 +6693,51 @@ stage's shape is now:
         mmvq(row_from_cache_or_src, x_q8_1, y, ...)          // guarding on the DISPATCH LIST, not iq_supported
 
 and the fallback for cannot_fit is what makes a small budget a performance question rather than a correctness one.
+
+THE DEVICE EXPERT PATH IS ALREADY IMPLEMENTED - GROUPED KERNEL, LAYOUT HELPER, SCRATCH SIZING, ALL PUBLIC
+
+    include/strata/kernels/iq_kernels.hpp, the GPU kernels' own public surface:
+
+      struct NativeExpertLayout {
+          int gu_type, d_type;  int64_t n_embd, n_ff;
+          size_t gu_row, d_row;          // bytes per row
+          size_t up_off, down_off;       // BYTE OFFSETS INSIDE THE BLOB
+          size_t bytes;                  // the whole blob
+      };
+      NativeExpertLayout native_expert_layout(int gu_type, int d_type, int64_t n_embd, int64_t n_ff);
+      size_t native_expert_scratch_bytes(int64_t cap_entries, int64_t n_ff);
+      void   native_expert_grouped(const NativeExpertLayout& L, const unsigned long long* grp_ptr,
+                                   const int32_t* grp_start, const int32_t* n_groups, const int32_t* ent_dst,
+                                   const int32_t* ent_tok, int64_t cap_groups, int64_t cap_entries,
+                                   const void* x_q8_1, void* scratch, float* out, void* stream);
+
+    plus iq_dequant_gu_f16(gu_type, gate, up, n_ff, n_embd, dst, stream) and iq_dequant_f32(type, src, n, dst, stream).
+
+FOUR THINGS THIS SETTLES AT ONCE, and it is the fifth instance today of the same pattern:
+
+  1. THE LAYOUT QUESTION IS ANSWERED BY A FUNCTION.  up_off and down_off ARE "byte offsets inside the blob" in this
+     struct - the exact quantity my inference from the pack table could not produce (0 of 43), sitting in a helper that
+     the Qwen path presumably already calls.  The stage asks native_expert_layout for it and stops guessing.
+  2. THE DISPATCH IS GROUPED, NOT PER-EXPERT.  native_expert_grouped takes group pointers, group starts, per-group counts
+     and per-entry expert and token indices - i.e. it is built for exactly the shape a MoE layer has (8 experts, one
+     token, one output), which is the batched form the GLM MoE needs.  Writing a per-expert loop of iq_mmvq calls would
+     be reinventing a slower version of a kernel that exists.
+  3. THE SCRATCH IS SIZED BY A FUNCTION TOO, so the "how much device memory does this need" question is also answered
+     rather than estimated.
+  4. AND THE WHOLE THING IS PUBLIC API, not an internal of another model's path - so the GLM stage can call it without
+     touching another model's code, which is the same position the KDA hook, the MLA types and the dense FFN's ffn_types
+     were each in.
+
+SO THE STAGE IS NOW A WIRING JOB WITH A KNOWN SHAPE, and what it needs from the pieces built today is only the residency
+policy:
+
+    L = native_expert_layout(gu_type, d_type, 4096, 2048)        // up_off, down_off, gu_row, d_row, bytes
+    for each selected expert e:
+        src   = source->blob(layer, e)                            // where the bytes are; not an inference
+        row   = cache.lookup({layer, e}, L.bytes) ? <upload src into the cache> : ...
+        build grp_ptr / grp_start / n_groups / ent_dst / ent_tok over the cached rows
+    native_expert_grouped(L, ..., x_q8_1, scratch, out, stream)
+    and guard on the DISPATCH LIST, never on iq_supported (type 11: claimed true, no case, std::exit(1))
+
+Note what the cache is still for, despite all of the above: it is what turns "upload the eight experts this token selected"
+into "upload the ones that are not already there", which is the difference between a wash and a gain.
