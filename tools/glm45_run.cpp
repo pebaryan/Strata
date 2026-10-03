@@ -623,6 +623,8 @@ static bool run_cached_device_moe_upload(void* raw, int layer, int n_experts, co
 // ever used again; the CPU needs ~1.3 ms of core time for the same expert and no bus traffic, and eight cores run eight
 // misses side by side.  A row is promoted into the GPU cache only once it has missed `g_promote_after` times (or while
 // the cache still has free room), so the cache converges on the experts the conversation actually reuses.
+static thread_local int t_in_job = 0;   // >0 while this thread is executing a CpuPool job (nested run() calls go serial)
+
 class CpuPool {
 public:
     explicit CpuPool(int workers) {
@@ -637,7 +639,10 @@ public:
     /// Runs fn(0..n-1) over the workers and the calling thread; returns when every index is done.
     void run(int n, const std::function<void(int)>& fn) {
         if (n <= 0) return;
-        if (threads_.empty() || n == 1) { for (int i = 0; i < n; ++i) fn(i); return; }
+        // A call made from inside one of this pool's own jobs (a stage that parallelises itself, run per token from a
+        // parallel prompt loop) runs serially on that thread: the pool is not reentrant and the outer loop already
+        // occupies every worker.
+        if (threads_.empty() || n == 1 || t_in_job > 0) { for (int i = 0; i < n; ++i) fn(i); return; }
         // Every run owns its job.  A worker still finishing the previous run holds the previous job (by shared_ptr), so
         // it can never take an index of, or be counted into, the next one - sharing next/done/n across runs let a
         // straggler run a task twice and overshoot the completion count, which hung the caller.
@@ -668,7 +673,9 @@ private:
         for (;;) {
             const int i = job.next.fetch_add(1);
             if (i >= job.n) break;
+            ++t_in_job;
             (*job.fn)(i);
+            --t_in_job;
             std::lock_guard<std::mutex> l(job.m);
             if (++job.done == job.n) job.done_cv.notify_all();
         }
@@ -819,9 +826,25 @@ static std::atomic<long> g_fill_ns{0};                // summed over threads: ti
 
 static double g_upload_frac = 0.5;      // STRATA_GLM_HYBRID_UPLOAD_FRAC: share of a full cache's misses that are uploaded
 
+// STRATA_GLM_TRACE=<file>: append every decode-time expert selection as "layer e e e ..." (a "T" line before each token's
+// first MoE layer), for replaying cache policies offline.
+static void trace_decode_selection(int layer, int n_experts, const int32_t* experts) {
+    static FILE* f = [] {
+        const char* p = std::getenv("STRATA_GLM_TRACE");
+        return p ? std::fopen(p, "a") : (FILE*) nullptr;
+    }();
+    if (!f) return;
+    if (layer == 3) std::fputs("T\n", f);
+    std::fprintf(f, "%d", layer);
+    for (int i = 0; i < n_experts; ++i) std::fprintf(f, " %d", (int) experts[i]);
+    std::fputc('\n', f);
+    std::fflush(f);
+}
+
 static bool run_cached_device_moe(void* raw, int layer, int n_experts, const int32_t* experts,
                                   const uint8_t* const* blobs, const float* weights,
                                   const KCPU::NativeFmt& fmt, const float* x, float* out, std::string& err) {
+    trace_decode_selection(layer, n_experts, experts);
     if (!g_cpu_miss) return run_cached_device_moe_upload(raw, layer, n_experts, experts, blobs, weights, fmt, x, out, err);
     GlmExpertDeviceRuntime& runtime = *(GlmExpertDeviceRuntime*) raw;
     const KN::NativeExpertLayout layout =
@@ -1075,6 +1098,8 @@ static bool run_cached_device_moe_batch(void* raw, int layer, int n_unique, cons
                                                              n_used, layout, fmt.gu_type, fmt.d_type,
                                                              fmt.n_embd, fmt.n_ff, x, out, runtime.scratch, err);
     if (!ok) { release_pending(); if (err.empty()) err = "batched expert device FFN failed"; return false; }
+    // (A per-layer, popularity-ranked admission policy was tried here and measured no better: decode hit rate is capacity-
+    // limited, ~61% for plain LRU against 62% for the best online policy in an offline replay of a real decode trace.)
     for (const PendingRow& p : pending) {
         if (!p.cacheable) { row_release(p.dev, layout.bytes); continue; }
         runtime.cache.insert(p.key, C::ExpertRowEntry{p.dev, layout.bytes});
@@ -1478,6 +1503,12 @@ int main(int argc, char** argv) {
     // The prompt path's per-token hyper-connection stages are independent across tokens: spread them over the pool
     // (STRATA_GLM_CPU_THREADS sets its size; 0 workers = serial).
     C::glm::glm_set_parallel_for([](int n, const std::function<void(int)>& job) { cpu_pool().run(n, job); });
+    // Single-token host stages that were serial reductions: the 24 hyper-connection mix rows and the 288 router rows.
+    // (STRATA_GLM_POOL_ROWS=0 keeps them serial.)  Bit-identical either way.
+    if (const char* pr = std::getenv("STRATA_GLM_POOL_ROWS"); !pr || std::strcmp(pr, "0") != 0) {
+        K::hc_set_parallel_for([](int n, const std::function<void(int)>& job) { cpu_pool().run(n, job); });
+        K::moe_set_parallel_for([](int n, const std::function<void(int)>& job) { cpu_pool().run(n, job); });
+    }
     K::kda_set_parallel_for([](int n, const std::function<void(int)>& job) { cpu_pool().run(n, job); });
     K::mla_set_parallel_for([](int n, const std::function<void(int)>& job) { cpu_pool().run(n, job); });
     // Batched MLA for prompt chunks (STRATA_GLM_MLA_BATCH=0 keeps the per-token path): see mla_forward_batch.
@@ -1921,6 +1952,8 @@ int main(int argc, char** argv) {
                 if (begin + (size_t) count == ids.size() &&
                     !run_head(prompt_outputs.data() + (size_t) (count - 1) * trunk_row, best, logit)) ok = false;
             }
+            if (std::getenv("STRATA_GLM_TIMING"))
+                std::fprintf(stderr, "CACHE@prefill-end: %s\n", expert_device_runtime.cache.report().c_str());
             long produced = 0;
             while (ok && produced < max_new) {
                 if (std::getenv("STRATA_GLM_LOGITS")) std::fprintf(stderr, "LOGIT %d %.6f\n", best, logit);
@@ -1928,6 +1961,8 @@ int main(int argc, char** argv) {
                 if (best == 154820 || best == 154827 || produced == max_new) break;
                 if (!embed(best) || !run_x(x.data(), pos++, false, true, best, logit)) ok = false;
             }
+            if (std::getenv("STRATA_GLM_TIMING"))
+                std::fprintf(stderr, "CACHE@request-end: %s\n", expert_device_runtime.cache.report().c_str());
             if (std::getenv("STRATA_GLM_TIMING"))
                 std::fprintf(stderr, "CPU tier ms (cumulative): populate %.0f  gate/up %.0f  quant %.0f  down %.0f  gpu-wait %.0f  promote %.0f  lookup %.0f  fill-thread-sum %.0f | cpu evals %ld gpu evals %ld promoted %ld | host hits %ld fills %ld\n",
                              g_cpu_ms[0], g_cpu_ms[1], g_cpu_ms[2], g_cpu_ms[3], g_cpu_ms[4], g_cpu_ms[5], g_cpu_ms[6],

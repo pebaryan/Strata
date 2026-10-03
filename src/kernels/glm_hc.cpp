@@ -13,6 +13,8 @@ namespace {
 
 inline float sigmoid(float v) { return 1.0f / (1.0f + std::exp(-v)); }
 
+HcParallelFor g_parallel_for = nullptr;
+
 /// Sinkhorn, exactly as the reference does it: softmax over dst, +eps, one column normalization, then
 /// (iters-1) x (row, column) - every divisor has eps added.  comb is comb[dst][src], which is the ggml
 /// layout of a [hc, hc] tensor with ne0 = dst, so "sum_rows" in the reference sums over dst.
@@ -55,9 +57,11 @@ void sinkhorn(float (*comb)[HC]) {
 
 }  // namespace
 
+void hc_set_parallel_for(HcParallelFor fn) { g_parallel_for = fn; }
+
 void hc_pre(const float* x, const float* fn, const float* base, const float* scale, int n_embd,
             float* layer_in, HcMix* mix, int n_threads) {
-    (void) n_threads;   // the reduction is one row of 16384; a thread pool would cost more than it saves
+    (void) n_threads;   // pool use is via hc_set_parallel_for
     const int dim = HC * n_embd;
 
     // rms_norm over the flattened streams (the reference normalizes the whole hc*n_embd block at once)
@@ -65,14 +69,20 @@ void hc_pre(const float* x, const float* fn, const float* base, const float* sca
     for (int i = 0; i < dim; ++i) ss += (double) x[i] * (double) x[i];
     const float rms = 1.0f / std::sqrt((float) (ss / dim) + HC_RMS_EPS);
 
-    // mixes[m] = sum_i fn[m][i] * flat_norm[i]  (ggml_mul_mat reduces over the weight's ne0)
+    // mixes[m] = sum_i fn[m][i] * flat_norm[i]  (ggml_mul_mat reduces over the weight's ne0).  The normalised input is
+    // formed once (the same x[i] * rms the rows used to recompute 24 times) and the rows - independent, each a single
+    // serial reduction in the same order as before - run on the pool when one is installed.
+    std::vector<float> flat_norm((size_t) dim);
+    for (int i = 0; i < dim; ++i) flat_norm[(size_t) i] = x[i] * rms;
     std::vector<float> mixes((size_t) HC_MIX_DIM, 0.0f);
-    for (int m = 0; m < HC_MIX_DIM; ++m) {
+    const std::function<void(int)> mix_row = [&](int m) {
         const float* row = fn + (size_t) m * (size_t) dim;
         float acc = 0.0f;
-        for (int i = 0; i < dim; ++i) acc += row[i] * (x[i] * rms);
+        for (int i = 0; i < dim; ++i) acc += row[i] * flat_norm[(size_t) i];
         mixes[(size_t) m] = acc;
-    }
+    };
+    if (g_parallel_for != nullptr) g_parallel_for(HC_MIX_DIM, mix_row);
+    else for (int m = 0; m < HC_MIX_DIM; ++m) mix_row(m);
 
     for (int h = 0; h < HC; ++h) {
         mix->pre[h] = sigmoid(mixes[(size_t) h] * scale[0] + base[h]) + HC_EPS;

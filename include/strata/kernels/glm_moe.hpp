@@ -18,8 +18,15 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 namespace strata::kernels::glm {
+
+/// Optional worker pool for the router's 288 row dot products (each a serial reduction over n_embd, ~1.6 ms in all, ~65 ms
+/// per decoded token over 42 layers).  `fn(n, job)` runs job(0..n-1) and returns when done, and must run a call made from
+/// inside one of its own jobs serially.  Results are bit-identical with or without it.
+using MoeParallelFor = void (*)(int n, const std::function<void(int)>& job);
+void moe_set_parallel_for(MoeParallelFor fn);
 
 struct MoeGeometry {
     int n_embd = 4096;

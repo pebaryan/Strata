@@ -16,6 +16,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 
 namespace strata::kernels::glm {
 
@@ -39,6 +40,12 @@ struct HcMix {
     float post[HC] = {0, 0, 0, 0};
     float comb[HC][HC] = {{0}};    ///< [dst][src]
 };
+
+/// Optional worker pool for the mix rows of hc_pre (24 independent dot products of 16384 elements, ~0.4 ms serially, which
+/// is ~35 ms per decoded token over 90 calls).  `fn(n, job)` runs job(0..n-1) and returns when done; it must run a call
+/// made from inside one of its own jobs serially.  Results are bit-identical with or without it.
+using HcParallelFor = void (*)(int n, const std::function<void(int)>& job);
+void hc_set_parallel_for(HcParallelFor fn);
 
 /// One token's streams (`x` is [HC][n_embd], row-major) -> the layer input [n_embd] and the mix.
 /// `fn` is [(2+hc)*hc][hc*n_embd] as the engine reads a weight of ggml shape [hc*n_embd, (2+hc)*hc].

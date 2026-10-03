@@ -14,19 +14,33 @@ namespace {
 
 inline float sigmoidf(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
+MoeParallelFor g_parallel_for = nullptr;
+
 }  // namespace
+
+void moe_set_parallel_for(MoeParallelFor fn) { g_parallel_for = fn; }
 
 void moe_route(const float* router, const float* probs_b, const MoeGeometry& g, const float* x,
                int32_t* ids_out, float* weights_out, float* probs_out) {
     const int E = g.n_expert, ne = g.n_embd;
     std::vector<float> probs((size_t) E);
-    for (int e = 0; e < E; ++e) {
-        const float* row = router + (size_t) e * ne;
-        float acc = 0.0f;
-        for (int i = 0; i < ne; ++i) acc += row[i] * x[i];
-        probs[(size_t) e] = sigmoidf(acc);
-        if (probs_out) probs_out[e] = probs[(size_t) e];
-    }
+    // The expert rows are independent dot products (each reduced serially in the same order as ever), so blocks of them
+    // run on the pool when one is installed - a single token's routing is ~1.6 ms of dependent float adds otherwise.
+    constexpr int kBlock = 16;
+    const std::function<void(int)> rows = [&](int b) {
+        const int e_end = std::min(E, (b + 1) * kBlock);
+        for (int e = b * kBlock; e < e_end; ++e) {
+            const float* row = router + (size_t) e * ne;
+            float acc = 0.0f;
+            for (int i = 0; i < ne; ++i) acc += row[i] * x[i];
+            probs[(size_t) e] = sigmoidf(acc);
+        }
+    };
+    const int n_blocks = (E + kBlock - 1) / kBlock;
+    if (g_parallel_for != nullptr) g_parallel_for(n_blocks, rows);
+    else for (int b = 0; b < n_blocks; ++b) rows(b);
+    if (probs_out)
+        for (int e = 0; e < E; ++e) probs_out[e] = probs[(size_t) e];
 
     // selection is on the biased probs, weights come from the unbiased ones
     std::vector<int> order((size_t) E);
