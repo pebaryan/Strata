@@ -194,8 +194,8 @@ bool glm_expert_moe_device_batch_resident(const uint8_t* const* rows_device, int
                                           int64_t n_embd, int64_t n_ff, const float* x_host, float* out_host,
                                           GlmExpertDeviceScratch& s, std::string& err) {
     if (!rows_device || !route_slot || !weights || !x_host || !out_host || n_unique <= 0 || n_used <= 0 ||
-        tokens <= 0 || tokens > 2048 || n_unique > tokens * n_used) {
-        err = "batched device MoE requires valid rows/routes and 1..2048 tokens";
+        tokens <= 0 || tokens > 4096 || n_unique > tokens * n_used) {
+        err = "batched device MoE requires valid rows/routes and 1..4096 tokens";
         return false;
     }
     if (!glm_expert_layer_supported(gu_type, d_type)) {

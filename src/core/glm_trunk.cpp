@@ -51,6 +51,12 @@ bool for_tokens(int n, std::string& err, F&& f) {
 
 void glm_set_parallel_for(GlmParallelForFn fn) { g_parallel_for = fn; }
 
+namespace {
+GlmPrefetchFn g_layer_prefetch = nullptr;
+void* g_layer_prefetch_ctx = nullptr;
+}  // namespace
+void glm_set_layer_prefetch(GlmPrefetchFn fn, void* ctx) { g_layer_prefetch = fn; g_layer_prefetch_ctx = ctx; }
+
 bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, void* provider_ctx,
                        const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
                        float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
@@ -237,8 +243,8 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
                              float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
                              int first_layer) {
     if (!x || !provider || !l_out) { err = "glm_trunk_forward_batch: null argument"; return false; }
-    if (tokens <= 0 || tokens > 2048 || layers <= 0 || layers > GLM_TRUNK_BLOCKS) {
-        err = "glm_trunk_forward_batch: tokens must be 1..2048 and layers within the trunk";
+    if (tokens <= 0 || tokens > 4096 || layers <= 0 || layers > GLM_TRUNK_BLOCKS) {
+        err = "glm_trunk_forward_batch: tokens must be 1..4096 and layers within the trunk";
         return false;
     }
     const int ne = kda_g.n_embd;
@@ -280,6 +286,9 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
             err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + ": required weights are missing";
             return false;
         }
+        // Tell the expert source which layer is starting (every layer before it is finished), so it can keep reading the
+        // layers ahead while this one computes.
+        if (g_layer_prefetch != nullptr) g_layer_prefetch(g_layer_prefetch_ctx, layer);
 
         lap();
         if (!for_tokens(tokens, err, [&](int t, std::string& e) {

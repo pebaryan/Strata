@@ -111,6 +111,12 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
 using GlmParallelForFn = void (*)(int n, const std::function<void(int)>& job);
 void glm_set_parallel_for(GlmParallelForFn fn);
 
+/// Optional notification from the prompt path: called at the top of every layer with that layer's index, so every earlier
+/// layer is finished and the layers after it will be wanted next.  A streaming expert source uses it to keep reading ahead
+/// while this layer computes (a long chunk uses nearly every expert of every layer, so whole layers are worth fetching).
+using GlmPrefetchFn = void (*)(void* ctx, int layer);
+void glm_set_layer_prefetch(GlmPrefetchFn fn, void* ctx);
+
 /// Layer-major prompt path for a causal token chunk. Input/output rows are [tokens][HC][n_embd].
 /// KDA recurrence and MLA cache updates advance in token order within each layer; only independent
 /// projections are batched. State is left at the chunk's final position for the next chunk/decode call.

@@ -239,7 +239,160 @@ static float* dequant_to_host(const C::GlmBoundBlock::Tensor& t, std::string& er
     return host;
 }
 
+// LAYER STREAMER for the prompt path.  A long chunk routes to nearly every expert of every layer, and one layer's experts
+// are contiguous in experts.bin, so the whole layer is read sequentially with large O_DIRECT reads into one of two
+// anonymous staging buffers by a reader thread that runs up to two layers ahead of the compute.  That does two things the
+// mmap path could not: the SSD stays busy through every layer's attention / hyper-connection / GPU work (it idled for
+// ~4.8 s of each ~10 s layer), and the reads bypass the page cache, whose constant reclaim on a 31 GB box held buffered
+// reads to ~205 MB/s against ~340 MB/s for the link.  The MoE stage takes its rows from the staging buffer
+// (LayerStreamer::blob), blocking only until the bytes it needs have landed; anything not staged falls back to the mmap.
+class LayerStreamer {
+public:
+    ~LayerStreamer() {
+        { std::lock_guard<std::mutex> l(m_); stop_ = true; }
+        cv_.notify_all();
+        if (thread_.joinable()) thread_.join();
+        for (int s = 0; s < 2; ++s) if (buf_[s]) munmap(buf_[s], buf_cap_);
+        if (fd_ >= 0) ::close(fd_);
+    }
+    bool enabled() const { return enabled_; }
+
+    /// `fd` is experts.bin opened O_DIRECT; the geometry comes from the expert source's own blob addresses.
+    bool init(int fd, C::ExpertSource* src, uintptr_t map_start, uintptr_t map_end, off_t map_off, int first_layer, int n_layers) {
+        fd_ = fd; first_ = first_layer; n_layers_ = n_layers;
+        off_.assign((size_t) n_layers, 0); bytes_.assign((size_t) n_layers, 0); row_.assign((size_t) n_layers, 0);
+        for (int l = first_layer; l < n_layers; ++l) {
+            const uint8_t* b0 = src->blob(l, 0);
+            const uint8_t* b1 = src->blob(l, 1);
+            if (!b0 || !b1 || b1 <= b0) return false;
+            const size_t row = (size_t) (b1 - b0), bytes = row * N_EXPERT;
+            if ((uintptr_t) b0 < map_start || (uintptr_t) b0 + bytes > map_end) return false;
+            const off_t off = map_off + (off_t) ((uintptr_t) b0 - map_start);
+            if ((off % 4096) != 0 || (bytes % 4096) != 0) return false;     // O_DIRECT needs aligned offsets and lengths
+            off_[(size_t) l] = off; bytes_[(size_t) l] = bytes; row_[(size_t) l] = row;
+            buf_cap_ = std::max(buf_cap_, bytes);
+        }
+        for (int s = 0; s < 2; ++s) {
+            void* p = mmap(nullptr, buf_cap_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+            if (p == MAP_FAILED) return false;
+            buf_[s] = (uint8_t*) p;
+        }
+        enabled_ = true;
+        thread_ = std::thread([this] { run(); });
+        return true;
+    }
+
+    /// A chunk is starting: read layers first_layer.. in order, two ahead of the consumer.
+    void begin(int first_layer) {
+        std::unique_lock<std::mutex> l(m_);
+        active_ = false;                                      // so the reader cannot start another stale layer meanwhile
+        ++gen_;
+        cv_.notify_all();
+        cv_ready_.wait(l, [&] { return !reading_; });        // the reader abandons an old pass within one 8 MB read
+        for (Slot& s : slot_) { s.layer = -1; s.filled = 0; s.failed = false; }
+        next_ = std::max(first_layer, first_);
+        consumed_ = next_;
+        active_ = true;
+        cv_.notify_all();
+    }
+    /// Every layer before `layer` is finished (its buffer may be reused).
+    void layer_started(int layer) {
+        std::lock_guard<std::mutex> l(m_);
+        consumed_ = std::max(consumed_, layer);
+        cv_.notify_all();
+    }
+    void end() {
+        std::lock_guard<std::mutex> l(m_);
+        active_ = false;
+        ++gen_;
+        cv_.notify_all();
+    }
+    bool active() const { return enabled_ && active_; }
+
+    /// The staged row for (layer, expert), waiting for its bytes to arrive; nullptr when this layer is not being streamed.
+    const uint8_t* blob(int layer, int expert) {
+        if (!active() || layer < first_ || layer >= n_layers_ || expert < 0 || expert >= N_EXPERT) return nullptr;
+        std::unique_lock<std::mutex> l(m_);
+        const size_t need = ((size_t) expert + 1) * row_[(size_t) layer];
+        int s = -1;
+        cv_ready_.wait(l, [&] {
+            if (!active_) return true;
+            for (int i = 0; i < 2; ++i) if (slot_[i].layer == layer) { s = i; return true; }
+            return layer < next_ ? true : false;           // a layer already passed over (consumed) will never be staged
+        });
+        if (s < 0 || !active_) return nullptr;
+        cv_ready_.wait(l, [&] { return !active_ || slot_[s].filled >= need || slot_[s].failed || slot_[s].layer != layer; });
+        if (!active_ || slot_[s].failed || slot_[s].layer != layer || slot_[s].filled < need) return nullptr;
+        return buf_[s] + (size_t) expert * row_[(size_t) layer];
+    }
+    double read_seconds() const { return read_ns_.load() / 1e9; }
+    double wait_seconds() const { return wait_ns_.load() / 1e9; }
+
+private:
+    struct Slot { int layer = -1; size_t filled = 0; bool failed = false; };
+    int free_slot() const {   // a slot is free once its layer is consumed
+        for (int s = 0; s < 2; ++s) if (slot_[s].layer < 0 || slot_[s].layer < consumed_) return s;
+        return -1;
+    }
+    void run() {
+        const size_t kChunk = 8u << 20;
+        for (;;) {
+            int s, layer; uint64_t gen;
+            {
+                std::unique_lock<std::mutex> l(m_);
+                cv_.wait(l, [&] { return stop_ || (active_ && next_ < n_layers_ && free_slot() >= 0); });
+                if (stop_) return;
+                s = free_slot(); layer = next_++; gen = gen_;
+                slot_[s].layer = layer; slot_[s].filled = 0; slot_[s].failed = false;
+                reading_ = true;
+            }
+            cv_ready_.notify_all();
+            const size_t bytes = bytes_[(size_t) layer]; const off_t off = off_[(size_t) layer];
+            size_t done = 0; bool fail = false;
+            const auto t0 = std::chrono::steady_clock::now();
+            while (done < bytes) {
+                if (gen_snapshot() != gen) break;                       // a new pass began (or the chunk ended)
+                const size_t n = std::min(kChunk, bytes - done);
+                const ssize_t r = ::pread(fd_, buf_[s] + done, n, off + (off_t) done);
+                if (r <= 0) { fail = true; break; }
+                done += (size_t) r;
+                { std::lock_guard<std::mutex> l(m_); slot_[s].filled = done; }
+                cv_ready_.notify_all();
+            }
+            read_ns_ += (long) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            {
+                std::lock_guard<std::mutex> l(m_);
+                if (fail) slot_[s].failed = true;
+                if (gen_ != gen) slot_[s].layer = -1;
+                reading_ = false;
+            }
+            cv_ready_.notify_all();
+        }
+    }
+    uint64_t gen_snapshot() { std::lock_guard<std::mutex> l(m_); return gen_; }
+
+    int fd_ = -1;
+    bool enabled_ = false;
+    int first_ = 3, n_layers_ = 0;
+    std::vector<off_t> off_;
+    std::vector<size_t> bytes_, row_;
+    size_t buf_cap_ = 0;
+    uint8_t* buf_[2] = {nullptr, nullptr};
+    std::thread thread_;
+    std::mutex m_;
+    std::condition_variable cv_, cv_ready_;
+    Slot slot_[2];
+    int next_ = 0, consumed_ = 0;
+    uint64_t gen_ = 0;
+    std::atomic<bool> active_{false};
+    bool stop_ = false, reading_ = false;
+    std::atomic<long> read_ns_{0}, wait_ns_{0};
+};
+static LayerStreamer g_stream;
+
 static const uint8_t* blob_adapter(void* ctx, int layer, int expert) {
+    if (g_stream.active())
+        if (const uint8_t* staged = g_stream.blob(layer, expert)) return staged;
     return ((C::ExpertSource*) ctx)->blob(layer, expert);
 }
 
@@ -866,7 +1019,7 @@ static bool run_cached_device_moe_batch(void* raw, int layer, int n_unique, cons
     GlmExpertDeviceRuntime& runtime = *(GlmExpertDeviceRuntime*) raw;
     const KN::NativeExpertLayout layout =
         KN::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
-    if (!experts || !blobs || !route_slot || !weights || n_unique <= 0 || tokens <= 0 || tokens > 2048 ||
+    if (!experts || !blobs || !route_slot || !weights || n_unique <= 0 || tokens <= 0 || tokens > 4096 ||
         layout.bytes == 0 || layout.bytes != fmt.bytes) {
         err = "batched device MoE layout/count disagrees with NativeFmt";
         return false;
@@ -1296,6 +1449,33 @@ int main(int argc, char** argv) {
     // The prompt path's per-token hyper-connection stages are independent across tokens: spread them over the pool
     // (STRATA_GLM_CPU_THREADS sets its size; 0 workers = serial).
     C::glm::glm_set_parallel_for([](int n, const std::function<void(int)>& job) { cpu_pool().run(n, job); });
+    // Prompt-path layer streamer (STRATA_GLM_STREAM_LAYERS=0 disables): see LayerStreamer.
+    {
+        const char* pn = std::getenv("STRATA_GLM_STREAM_LAYERS");
+        if (!pn || std::strcmp(pn, "0") != 0) {
+            uintptr_t ms = 0, me = 0;
+            off_t mo = 0;
+            if (FILE* mp = std::fopen("/proc/self/maps", "r")) {
+                char line[1024];
+                while (std::fgets(line, sizeof line, mp)) {
+                    unsigned long s0, e0, off0;
+                    if (std::strstr(line, "experts.bin") && std::sscanf(line, "%lx-%lx %*s %lx", &s0, &e0, &off0) == 3 &&
+                        e0 - s0 > me - ms) { ms = s0; me = e0; mo = (off_t) off0; }
+                }
+                std::fclose(mp);
+            }
+            const int pfd = ::open((pack + "/experts.bin").c_str(), O_RDONLY | O_DIRECT);
+            if (pfd >= 0 && me > ms && g_stream.init(pfd, &src, ms, me, mo, 3, 46)) {
+                C::glm::glm_set_layer_prefetch(
+                    [](void*, int layer) { if (layer == 0) g_stream.begin(3); g_stream.layer_started(layer); }, nullptr);
+                std::printf("Layer streamer: O_DIRECT reads of whole layers, two ahead of the prompt path\n");
+            } else {
+                if (pfd >= 0) ::close(pfd);
+                std::printf("Layer streamer: unavailable (open O_DIRECT / alignment); prompt path reads through the mmap\n");
+            }
+            std::fflush(stdout);
+        }
+    }
     // Host RAM tier (see HostRowCache).  Default: what the machine can spare beyond 9 GB of headroom.
     if (g_cpu_miss) {
         const char* hc = std::getenv("STRATA_GLM_HOST_CACHE_GB");
@@ -1582,7 +1762,7 @@ int main(int argc, char** argv) {
     // Prompt embeddings do not depend on trunk state. Gather them in small batches so a prompt
     // pays one launch/sync/copy per 128 tokens instead of one per token. The trunk itself remains
     // sequential because KDA recurrence and MLA cache updates are causal.
-    constexpr int EMBED_BATCH = 2048;
+    constexpr int EMBED_BATCH = 4096;
     const size_t trunk_row = (size_t) HC * N_EMBD;
     int32_t* d_prompt_tokens = nullptr;
     float* d_prompt_embeds = nullptr;
@@ -1692,10 +1872,11 @@ int main(int argc, char** argv) {
                 }
                 if (!ok) break;
                 ensure_prefill_headroom(count);
-                if (!C::glm::glm_trunk_forward_batch(prompt_inputs.data(), count, N_LAYERS, provider, &P, P.kda_g,
-                                                     P.mla_g, EPS, st, prompt_outputs.data(), nullptr, err)) {
-                    ok = false; break;
-                }
+                const bool chunk_ok = C::glm::glm_trunk_forward_batch(prompt_inputs.data(), count, N_LAYERS, provider, &P,
+                                                                      P.kda_g, P.mla_g, EPS, st, prompt_outputs.data(),
+                                                                      nullptr, err);
+                g_stream.end();                    // stop reading ahead; decode goes back to the mmap
+                if (!chunk_ok) { ok = false; break; }
                 pos += count;
                 if (begin + (size_t) count == ids.size() &&
                     !run_head(prompt_outputs.data() + (size_t) (count - 1) * trunk_row, best, logit)) ok = false;
