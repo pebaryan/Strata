@@ -251,9 +251,12 @@ int main(int argc, char** argv) {
             sg.clamp_exp = g.clamp_exp; sg.clamp_shexp = g.clamp_shexp;
             std::vector<float> nat_out((size_t) ne, 0.0f);
             std::vector<int> nat_ids((size_t) k, -1);
+            // v0.1.38 / WIP: glm_stage_moe_native gained `shared_types` (the three shared matrices' quant
+            // types).  This fixture's shared expert is plain float, so there are no types to report and the
+            // stage takes its generic path (the caller's own guard skips the typed fast path on nullptr).
             const bool nat_ok = strata::core::glm::glm_stage_moe_native(
                 x.data(), router.data(), probs_b.data(), g, (int) hdr[4], fmt, &moe_blob_adapter, &src, &sg, shared,
-                g.clamp_shexp, nat_out.data(), nerr, nat_ids.data());
+                nullptr, g.clamp_shexp, nat_out.data(), nerr, nat_ids.data());
             if (!nat_ok) {
                 std::printf("native path: the stage refused: %s\n", nerr.c_str());
             } else {

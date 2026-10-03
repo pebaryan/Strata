@@ -355,7 +355,13 @@ struct PeerPrefill {
     cudaEvent_t ev_done = nullptr;  // on the peer: its rows have landed in the primary's Dm
     // multi-GPU: the result rows go back group by group on a second stream while the next group computes
     cudaStream_t s_out = nullptr;
-    static constexpr int kGrpEv = NE / 16 + 2;
+    // merge v0.1.38: upstream writes this as NE / 16 + 2, folding its compile-time NE (512, see
+    // include/strata/kernels/cpu/expert.hpp).  This branch made NE a runtime value on purpose (pruned
+    // packs, see the note at the NE macro above), so the expression no longer folds and the array
+    // bound must be spelled out.  512/16+2 = 34 slots is the full-pack upper bound and covers the
+    // pruned packs too (256 experts -> 16 groups); the indexing below is modulo kGrpEv, so spare
+    // slots cost nothing.
+    static constexpr int kGrpEv = 512 / 16 + 2;
     cudaEvent_t ev_grp[kGrpEv] = {};
     bool out_pending = false;       // s_out may still read Dm (the next layer's products wait for it)
     bool out_pipe = true;

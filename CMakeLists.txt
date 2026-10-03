@@ -185,10 +185,11 @@ endif()
 # pull in, so take just the one translation unit.
 add_executable(glm5_bind_check tools/glm5_bind_check.cpp src/core/native_dense.cpp
                    src/core/glm_bind.cpp src/core/glm_layer.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp
-                   src/kernels/glm_hc.cpp)
+                   src/kernels/glm_hc.cpp
+               src/core/glm_moe_native.cpp)
 target_include_directories(glm5_bind_check PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm5_bind_check PRIVATE -O2)
-target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::cudart)
+target_link_libraries(glm5_bind_check PRIVATE strata_kernels_cpu strata_core strata_kernels CUDA::cudart)
 
 # Per-expert device expert parity (branch glm5next-port): the CPU native kernels versus per-expert iq_mmvq calls on the
 # SAME blob.  This is the gate for the design the grouped kernel cannot serve, since its down switch has no case for the
@@ -200,7 +201,8 @@ target_link_libraries(glm5_bind_check PRIVATE strata_core strata_kernels CUDA::c
 # to the add_executable below.  Until that is done and verified, the target stays COMMENTED OUT: a permanently red target
 # in a tree whose rule is that every commit builds would train the next reader to ignore a red build.
 add_executable(expert_parity_gate tools/expert_parity_gate.cpp src/core/glm_expert_device.cpp src/core/expert_source.cpp
-               src/core/expert_cache.cpp src/core/remote_experts.cpp)
+               src/core/expert_cache.cpp src/core/remote_experts.cpp
+               src/core/peer_experts.cpp)
 target_include_directories(expert_parity_gate PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(expert_parity_gate PRIVATE -O2)
 target_link_libraries(expert_parity_gate PRIVATE strata_core strata_kernels strata_kernels_cpu CUDA::cudart)
@@ -270,7 +272,8 @@ target_link_libraries(ffn_gate PRIVATE strata_core strata_kernels CUDA::cudart)
 # normalize-then-scale) and the expert/shared-expert FFNs, against tools/glm5_moe_reference.py.
 add_executable(glm_moe_parity src/kernels/glm_moe_parity.cpp src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp
                    src/core/glm_moe_native.cpp src/core/expert_source.cpp src/core/expert_cache.cpp
-                   src/core/remote_experts.cpp src/kernels/cuda/quantize_act.cu)
+                   src/core/remote_experts.cpp src/kernels/cuda/quantize_act.cu
+               src/core/peer_experts.cpp)
 target_link_libraries(glm_moe_parity PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
 target_include_directories(glm_moe_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm_moe_parity PRIVATE -O2)
@@ -544,7 +547,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # what composes them into a token.  No tokenizer - the prompt arrives as ids - because Gate C1 compares logits
   # against llama.cpp on the SAME ids and a tokenizer on one side of that comparison is a second variable.
   # plan v0.3 P5: batched prompt processing (tensor-core GEMMs through cuBLAS).
-  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp)
+  add_library(strata_prefill STATIC src/prefill/gemm.cu src/prefill/kernels.cu src/prefill/prefill.cpp
+               src/core/peer_experts.cpp)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${_strata_gpu_include_directories})
   target_link_libraries(strata_prefill PUBLIC strata_engine ${_strata_gpu_blas_target} ${_strata_gpu_runtime_target})
   if(STRATA_ENABLE_HIP AND STRATA_HIPBLASLT_AVAILABLE)
@@ -555,7 +559,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
   endif()
 
-  add_executable(strata src/program/generate.cpp)
+  add_executable(strata src/program/generate.cpp
+               src/core/peer_experts.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
@@ -1129,8 +1134,9 @@ endif()
 
 add_executable(block_gate tools/block_gate.cpp src/core/glm_layer.cpp src/core/glm_bind.cpp
                    src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp
-                   src/kernels/cuda/quantize_act.cu)
-target_link_libraries(block_gate PRIVATE strata_kernels CUDA::cudart)
+                   src/kernels/cuda/quantize_act.cu
+               src/core/glm_moe_native.cpp)
+target_link_libraries(block_gate PRIVATE strata_kernels_cpu strata_kernels CUDA::cudart)
 
 # layer_weights_gate (branch glm5next-port): does glm_fill_layer_weights put each tensor in the RIGHT field?
 # A mapping mistake there is invisible - every pointer is a valid float* to a plausibly-shaped array - so
@@ -1173,7 +1179,8 @@ add_executable(block3_gate tools/block3_gate.cpp src/core/glm_trunk.cpp src/core
                    src/core/native_dense.cpp src/core/expert_source.cpp src/core/expert_cache.cpp
                    src/core/remote_experts.cpp src/kernels/glm_kda.cpp
                    src/kernels/glm_moe.cpp src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp
-                   src/kernels/cuda/quantize_act.cu)
+                   src/kernels/cuda/quantize_act.cu
+               src/core/peer_experts.cpp)
 target_include_directories(block3_gate PRIVATE /include)
 target_link_libraries(block3_gate PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
 
@@ -1184,7 +1191,8 @@ add_executable(glm45_run tools/glm45_run.cpp src/core/glm_trunk.cpp src/core/glm
                src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_expert_device.cpp
                src/core/expert_row_cache.cpp src/core/glm_bind.cpp src/core/native_dense.cpp src/core/native_head.cpp
                src/core/expert_source.cpp src/core/expert_cache.cpp src/core/remote_experts.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
-               src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu)
+               src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu
+               src/core/peer_experts.cpp)
 target_include_directories(glm45_run PRIVATE /include)
 target_link_libraries(glm45_run PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
 
@@ -1195,6 +1203,7 @@ add_executable(strata-glm tools/glm45_run.cpp src/core/glm_trunk.cpp src/core/gl
                src/core/glm_layer_weights.cpp src/core/glm_moe_native.cpp src/core/glm_expert_device.cpp
                src/core/expert_row_cache.cpp src/core/glm_bind.cpp src/core/native_dense.cpp src/core/native_head.cpp
                src/core/expert_source.cpp src/core/expert_cache.cpp src/core/remote_experts.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
-               src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu)
+               src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu
+               src/core/peer_experts.cpp)
 target_include_directories(strata-glm PRIVATE /include)
 target_link_libraries(strata-glm PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
