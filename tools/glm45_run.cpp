@@ -389,6 +389,12 @@ private:
     std::atomic<long> read_ns_{0}, wait_ns_{0};
 };
 static LayerStreamer g_stream;
+// Streaming reads EVERY expert of every layer (sequentially, at the link's ~340 MB/s); the mmap path reads only the experts
+// a chunk selects (randomly, ~205 MB/s effective).  With 8 of 288 experts per token the fraction of a layer a t-token chunk
+// touches is 1 - (1 - 8/288)^t, so streaming wins from roughly 60% coverage, i.e. about 32 tokens (an 18-token prompt
+// touches ~40% and was 2.4x slower streamed).  STRATA_GLM_STREAM_MIN_TOKENS overrides.
+static int g_stream_min_tokens = 32;
+static bool g_stream_this_chunk = false;
 
 static const uint8_t* blob_adapter(void* ctx, int layer, int expert) {
     if (g_stream.active())
@@ -1467,7 +1473,12 @@ int main(int argc, char** argv) {
             const int pfd = ::open((pack + "/experts.bin").c_str(), O_RDONLY | O_DIRECT);
             if (pfd >= 0 && me > ms && g_stream.init(pfd, &src, ms, me, mo, 3, 46)) {
                 C::glm::glm_set_layer_prefetch(
-                    [](void*, int layer) { if (layer == 0) g_stream.begin(3); g_stream.layer_started(layer); }, nullptr);
+                    [](void*, int layer) {
+                        if (!g_stream_this_chunk) return;
+                        if (layer == 0) g_stream.begin(3);
+                        g_stream.layer_started(layer);
+                    }, nullptr);
+                if (const char* mt = std::getenv("STRATA_GLM_STREAM_MIN_TOKENS")) g_stream_min_tokens = std::max(1, std::atoi(mt));
                 std::printf("Layer streamer: O_DIRECT reads of whole layers, two ahead of the prompt path\n");
             } else {
                 if (pfd >= 0) ::close(pfd);
@@ -1872,7 +1883,8 @@ int main(int argc, char** argv) {
                 }
                 if (!ok) break;
                 ensure_prefill_headroom(count);
-                const bool chunk_ok = C::glm::glm_trunk_forward_batch(prompt_inputs.data(), count, N_LAYERS, provider, &P,
+                g_stream_this_chunk = g_stream.enabled() && count >= g_stream_min_tokens;
+                const bool chunk_ok =C::glm::glm_trunk_forward_batch(prompt_inputs.data(), count, N_LAYERS, provider, &P,
                                                                       P.kda_g, P.mla_g, EPS, st, prompt_outputs.data(),
                                                                       nullptr, err);
                 g_stream.end();                    // stop reading ahead; decode goes back to the mmap
