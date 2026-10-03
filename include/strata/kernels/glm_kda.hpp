@@ -88,6 +88,18 @@ void kda_set_parallel_for(KdaParallelFor fn);
 bool kda_rows_cuda(const float* weight, const float* x, int tokens, int rows, int cols, float* y,
                    char* error, size_t error_capacity);
 
+/// Serve-mode decode: run a single token through the whole KDA layer on the device (norm, q/k/v, conv, gates, recurrence,
+/// gated norm, wo) with one upload and one download, keeping the conv histories and recurrence state resident.  Needs lazy
+/// state and native projection types.  STRATA_GLM_KDA_BLOCK=0 turns it off in the runner.
+void kda_set_device_block(bool enabled);
+/// 1 = done; 0 = declined with nothing touched (the host path must run); -1 = failed after work began.
+int kda_block_decode_cuda(const KdaWeights& w, const KdaGeometry& g, const float* x, float* out, float* state,
+                          float* conv_state, char* error, size_t error_capacity);
+/// Coherence of the device-resident conv histories with the host copy: call sync before a host-side conv reads them, and
+/// modified after it rewrites them (which drops the stale device copy).
+void kda_conv_sync_host(float* conv_state, size_t count);
+void kda_conv_host_modified(const float* conv_state);
+
 /// Print the KDA stage's host-time breakdown, phase by phase.  Diagnostics only.
 void kda_print_profile();
 

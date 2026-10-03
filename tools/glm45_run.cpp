@@ -1625,6 +1625,11 @@ int main(int argc, char** argv) {
     // Serve mode only: the resident KDA state stays on the device between calls (reset_state invalidates it).
     const char* kda_lazy_env = std::getenv("STRATA_GLM_KDA_LAZY_STATE");
     K::kda_set_lazy_state(serve && kda_cuda && (!kda_lazy_env || std::strcmp(kda_lazy_env,"0") != 0));
+    // Device-resident single-token KDA block for decode (STRATA_GLM_KDA_BLOCK=0 keeps the host-orchestrated path).
+    {
+        const char* kb = std::getenv("STRATA_GLM_KDA_BLOCK");
+        K::kda_set_device_block(serve && (!kb || std::strcmp(kb, "0") != 0));
+    }
     std::printf("KDA gates: %s\n",kda_gates_cuda?"CUDA":"host");
     const char* mla_cuda_env = std::getenv("STRATA_GLM_MLA_CUDA");
     const bool mla_cuda = !mla_cuda_env || std::strcmp(mla_cuda_env,"0") != 0;

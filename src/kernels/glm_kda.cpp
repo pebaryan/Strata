@@ -19,6 +19,7 @@ namespace {
 KdaNativeProjectFn g_native_project = nullptr;
 bool g_device_recurrence = false;
 bool g_device_gates = false;
+bool g_device_block = false;
 
 /// WHERE THE KDA STAGE'S HOST TIME GOES, phase by phase.  The blocks are 69.9% of the wall time and their projections are
 /// already native, so the remainder is the non-GEMM work - and there are four distinct candidates in here (the input
@@ -104,6 +105,7 @@ void kda_set_native_project(KdaNativeProjectFn fn) { g_native_project = fn; }
 void kda_set_device_recurrence(bool enabled) { g_device_recurrence = enabled; }
 void kda_set_device_gates(bool enabled) { g_device_gates = enabled; }
 void kda_set_parallel_for(KdaParallelFor fn) { g_parallel_for = fn; }
+void kda_set_device_block(bool enabled) { g_device_block = enabled; }
 
 #if !defined(STRATA_ENABLE_CUDA)
 bool kda_recurrence_cuda(const float*, const float*, const float*, const float*, const float*, int, int, int,
@@ -113,6 +115,13 @@ bool kda_recurrence_cuda(const float*, const float*, const float*, const float*,
 }
 void kda_set_lazy_state(bool) {}
 void kda_invalidate_state() {}
+int kda_block_decode_cuda(const KdaWeights&, const KdaGeometry&, const float*, float*, float*, float*, char* error,
+                          size_t error_capacity) {
+    if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return 0;
+}
+void kda_conv_sync_host(float*, size_t) {}
+void kda_conv_host_modified(const float*) {}
 bool kda_rows_cuda(const float*, const float*, int, int, int, float*, char* error, size_t error_capacity) {
     if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
     return false;
@@ -131,6 +140,21 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     auto lap = [&]() { auto n = Clock::now(); double ms = std::chrono::duration<double, std::milli>(n-mark).count(); mark=n; return ms; };
     const int ne = g.n_embd, nh = g.nh, hd = g.hd, di = g.d_inner();
     const float scale = 1.0f / std::sqrt((float) hd);
+
+    // A decoded token on the device-resident block: one upload, one download, everything between on the GPU.  It declines
+    // (touching nothing) whenever its preconditions are not met, and the host path below runs instead.
+    if (tokens == 1 && g_device_block && !mid && state && conv_state && g_device_recurrence && g_device_gates) {
+        char block_err[256] = {};
+        const int r = kda_block_decode_cuda(w, g, x, out, state, conv_state, block_err, sizeof(block_err));
+        if (r == 1) return;
+        if (r < 0) {
+            std::fprintf(stderr, "GLM KDA device block failed: %s\n", block_err);
+            std::exit(1);
+        }
+    }
+    // The host conv below reads and rewrites the histories; if the device block was running, its copy is the live one.
+    const size_t conv_floats = (size_t) 3 * (g.d_conv - 1) * di;
+    if (conv_state) kda_conv_sync_host(conv_state, conv_floats);
 
     std::vector<float> xn((size_t) tokens * ne);
     {
@@ -186,6 +210,7 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
             histories[which] = conv_state ? conv_state + (size_t) which * (g.d_conv - 1) * di : nullptr;
         const float* raw_in[3] = {raw_dst[0], raw_dst[1], raw_dst[2]};
         conv1d_silu_multi(3, conv_w, raw_in, conv_dst, tokens, di, g.d_conv, conv_state ? histories : nullptr);
+        if (conv_state) kda_conv_host_modified(conv_state);   // any device copy of the histories is now stale
     }
     if (mid && mid->qc) std::memcpy(mid->qc, qc.data(), qc.size() * sizeof(float));
     if (mid && mid->kc) std::memcpy(mid->kc, kc.data(), kc.size() * sizeof(float));

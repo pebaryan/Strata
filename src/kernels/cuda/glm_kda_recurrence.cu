@@ -1,5 +1,8 @@
 #include <cuda_runtime.h>
+#include "strata/kernels/glm_kda.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -104,6 +107,119 @@ bool resident_weight(Scratch& s,const float* host,size_t n,float*& dev) {
     if (cudaMemcpy(d,host,n*sizeof(float),cudaMemcpyHostToDevice)!=cudaSuccess) { cudaFree(d); return false; }
     s.resident_weights.emplace(host,std::make_pair(n,d)); dev=d; return true;
 }
+// ---- the device-resident single-token KDA block (decode) -------------------------------------------------------------
+//
+// One upload of the layer input and one download of its output; everything between stays on the device.  The host path
+// (kda_forward) does ~8 synchronous host/GPU round trips per layer for the same work, which is what bounds decode.
+
+// Block reductions in double, exactly as the host does its sums of squares.
+__device__ __forceinline__ double block_sum_double(double v, double* red /*[32]*/) {
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    if (lane == 0) red[warp] = v;
+    __syncthreads();
+    double total = 0.0;
+    if (threadIdx.x == 0) { for (int w = 0; w < (int) (blockDim.x >> 5); ++w) total += red[w]; red[0] = total; }
+    __syncthreads();
+    total = red[0];
+    __syncthreads();
+    return total;
+}
+
+// y = rms_norm(x) * w   (plain multiply, the model's eps)
+__global__ void kda_rmsnorm1(const float* x, const float* w, float* y, int n, float eps) {
+    __shared__ double red[32];
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) acc += (double) x[i] * (double) x[i];
+    const double ss = block_sum_double(acc, red);
+    const float inv = 1.0f / sqrtf((float) (ss / n) + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) y[i] = x[i] * inv * w[i];
+}
+
+// Causal depthwise conv + SiLU for ONE token, for q, k and v at once, with the [3][d_conv-1][d_inner] history shifted in place.
+__global__ void kda_conv_step(const float* wq, const float* wk, const float* wv, const float* rq, const float* rk,
+                              const float* rv, float* hist, float* cq, float* ck, float* cv, int di, int dc) {
+    const int ch = (int) (blockIdx.x * blockDim.x + threadIdx.x), which = (int) blockIdx.y;
+    if (ch >= di) return;
+    const float* w = which == 0 ? wq : which == 1 ? wk : wv;
+    const float* raw = which == 0 ? rq : which == 1 ? rk : rv;
+    float* out = which == 0 ? cq : which == 1 ? ck : cv;
+    float* h = hist + (size_t) which * (dc - 1) * di;
+    float acc = 0.0f;
+    for (int k = 0; k < dc; ++k) {
+        const float v = (k < dc - 1) ? h[(size_t) k * di + ch] : raw[ch];
+        acc += w[(size_t) k * di + ch] * v;
+    }
+    out[ch] = acc / (1.0f + expf(-acc));
+    for (int j = 0; j < dc - 2; ++j) h[(size_t) j * di + ch] = h[(size_t) (j + 1) * di + ch];
+    h[(size_t) (dc - 2) * di + ch] = raw[ch];
+}
+
+// q,k per-head l2 normalisation (double accumulation like the host): grid (nh, 2)
+__global__ void kda_l2norm_qk(const float* cq, const float* ck, float* qn, float* kn, int hd, float eps) {
+    __shared__ double red[32];
+    const int h = (int) blockIdx.x;
+    const float* src = blockIdx.y == 0 ? cq : ck;
+    float* dst = blockIdx.y == 0 ? qn : kn;
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) acc += (double) src[(size_t) h * hd + i] * (double) src[(size_t) h * hd + i];
+    const double nrm = sqrt(block_sum_double(acc, red));
+    const double inv = 1.0 / fmax(nrm, (double) eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) dst[(size_t) h * hd + i] = (float) ((double) src[(size_t) h * hd + i] * inv);
+}
+
+// the gated norm: rms over head_dim per head, times o_norm, times sigmoid(gb): grid (nh)
+__global__ void kda_outgate(const float* attn, const float* gb, const float* o_norm, float* o, int hd, float eps) {
+    __shared__ double red[32];
+    const int h = (int) blockIdx.x;
+    double acc = 0.0;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) acc += (double) attn[(size_t) h * hd + i] * (double) attn[(size_t) h * hd + i];
+    const double ss = block_sum_double(acc, red);
+    const float inv = 1.0f / sqrtf((float) (ss / hd) + eps);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        const size_t c = (size_t) h * hd + i;
+        o[c] = attn[c] * inv * o_norm[i] * (1.0f / (1.0f + expf(-gb[c])));
+    }
+}
+
+struct BlockScratch {
+    int ne = 0, nh = 0, hd = 0;
+    float *x = nullptr, *xn = nullptr, *rq = nullptr, *rk = nullptr, *rv = nullptr, *cq = nullptr, *ck = nullptr, *cv = nullptr;
+    float *qn = nullptr, *kn = nullptr, *fa = nullptr, *fb = nullptr, *bp = nullptr, *gg = nullptr, *bb = nullptr;
+    float *attn = nullptr, *ga = nullptr, *gb = nullptr, *o = nullptr, *out = nullptr;
+    void *xq = nullptr, *oq = nullptr;
+    cudaStream_t stream = nullptr;
+    struct Conv { float* device = nullptr; size_t count = 0; bool ahead = false; };   // history, keyed by the host buffer
+    std::unordered_map<const float*, Conv> conv;
+    ~BlockScratch() {
+        release();
+        for (auto& kv : conv) cudaFree(kv.second.device);
+        if (stream) cudaStreamDestroy(stream);
+    }
+    void release() {
+        float** all[] = {&x, &xn, &rq, &rk, &rv, &cq, &ck, &cv, &qn, &kn, &fa, &fb, &bp, &gg, &bb, &attn, &ga, &gb, &o, &out};
+        for (float** p : all) { if (*p) cudaFree(*p); *p = nullptr; }
+        if (xq) cudaFree(xq);
+        if (oq) cudaFree(oq);
+        xq = oq = nullptr;
+        ne = nh = hd = 0;
+    }
+    bool alloc(int ne_, int nh_, int hd_) {
+        if (ne == ne_ && nh == nh_ && hd == hd_ && x) return true;
+        release();
+        const size_t di = (size_t) nh_ * hd_;
+        auto mk = [&](float*& p, size_t n) { return cudaMalloc(&p, n * sizeof(float)) == cudaSuccess; };
+        if (!mk(x, ne_) || !mk(xn, ne_) || !mk(rq, di) || !mk(rk, di) || !mk(rv, di) || !mk(cq, di) || !mk(ck, di) ||
+            !mk(cv, di) || !mk(qn, di) || !mk(kn, di) || !mk(fa, hd_) || !mk(fb, di) || !mk(bp, nh_) || !mk(gg, di) ||
+            !mk(bb, nh_) || !mk(attn, di) || !mk(ga, hd_) || !mk(gb, di) || !mk(o, di) || !mk(out, ne_)) { release(); return false; }
+        if (cudaMalloc(&xq, strata::kernels::native_q8_1_bytes(ne_, 1)) != cudaSuccess ||
+            cudaMalloc(&oq, strata::kernels::native_q8_1_bytes((int) di, 1)) != cudaSuccess) { release(); return false; }
+        if (!stream && cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) { release(); return false; }
+        ne = ne_; nh = nh_; hd = hd_;
+        return true;
+    }
+};
+BlockScratch& block_scratch() { static BlockScratch b; return b; }
 } // namespace
 
 bool kda_recurrence_cuda(const float* q, const float* k, const float* v, const float* g, const float* beta,
@@ -188,6 +304,110 @@ void kda_invalidate_state() {
     Scratch& s=scratch(); std::lock_guard<std::mutex> lock(s.mutex);
     for (auto& kv:s.resident_states) cudaFree(kv.second.device);
     s.resident_states.clear();
+    BlockScratch& b=block_scratch();
+    for (auto& kv:b.conv) cudaFree(kv.second.device);
+    b.conv.clear();
+}
+
+// The conv histories live on the device while the decode block runs (the host copy goes stale).  A host-side conv (prompt
+// chunks, any fallback) must first pull the device copy back, and afterwards the device copy is stale and is dropped.
+void kda_conv_sync_host(float* conv_state, size_t count) {
+    if (!conv_state) return;
+    BlockScratch& b=block_scratch();
+    std::lock_guard<std::mutex> lock(scratch().mutex);
+    auto it=b.conv.find(conv_state);
+    if (it==b.conv.end() || !it->second.ahead || it->second.count!=count) return;
+    cudaMemcpy(conv_state,it->second.device,count*sizeof(float),cudaMemcpyDeviceToHost);
+    it->second.ahead=false;
+}
+void kda_conv_host_modified(const float* conv_state) {
+    if (!conv_state) return;
+    BlockScratch& b=block_scratch();
+    std::lock_guard<std::mutex> lock(scratch().mutex);
+    auto it=b.conv.find(conv_state);
+    if (it==b.conv.end()) return;
+    cudaFree(it->second.device);
+    b.conv.erase(it);
+}
+
+// Returns 1 done, 0 declined (nothing touched: the caller runs the host path), -1 failed after work began.
+int kda_block_decode_cuda(const KdaWeights& w,const KdaGeometry& g,const float* x_host,float* out_host,float* state,
+                          float* conv_state,char* error,size_t error_capacity) {
+    auto decline=[&](const char* msg){ if(error&&error_capacity) std::snprintf(error,error_capacity,"%s",msg); return 0; };
+    auto fail=[&](const char* msg){ if(error&&error_capacity) std::snprintf(error,error_capacity,"%s",msg); return -1; };
+    if (!g_lazy_state) return decline("device block needs lazy resident state (serve mode)");
+    if (!x_host||!out_host||!state||!conv_state) return decline("null argument");
+    using namespace strata::kernels;
+    if (!w.wq_type||!w.wk_type||!w.wv_type||!w.wo_type||!native_mmvq_supported(w.wq_type)||!native_mmvq_supported(w.wk_type)||
+        !native_mmvq_supported(w.wv_type)||!native_mmvq_supported(w.wo_type)) return decline("projection types not native");
+    const int ne=g.n_embd,nh=g.nh,hd=g.hd,dc=g.d_conv,di=nh*hd;
+    if (dc<3||dc>8||hd>1024||ne%32||di%32||ne>16384||di>16384) return decline("unsupported geometry");
+    Scratch& s=scratch(); std::lock_guard<std::mutex> lock(s.mutex);
+    BlockScratch& b=block_scratch();
+    if (!b.alloc(ne,nh,hd)) return decline("block scratch allocation failed");
+    float *d_an=nullptr,*d_cqw=nullptr,*d_ckw=nullptr,*d_cvw=nullptr,*d_fa=nullptr,*d_fb=nullptr,*d_beta=nullptr,*d_a=nullptr,
+          *d_bias=nullptr,*d_ga=nullptr,*d_gb=nullptr,*d_on=nullptr;
+    if(!resident_weight(s,w.attn_norm,(size_t)ne,d_an)||!resident_weight(s,w.conv_q,(size_t)dc*di,d_cqw)||
+       !resident_weight(s,w.conv_k,(size_t)dc*di,d_ckw)||!resident_weight(s,w.conv_v,(size_t)dc*di,d_cvw)||
+       !resident_weight(s,w.ssm_f_a,(size_t)hd*ne,d_fa)||!resident_weight(s,w.ssm_f_b,(size_t)di*hd,d_fb)||
+       !resident_weight(s,w.ssm_beta,(size_t)nh*ne,d_beta)||!resident_weight(s,w.ssm_a,(size_t)nh,d_a)||
+       !resident_weight(s,w.dt_bias,(size_t)di,d_bias)||!resident_weight(s,w.ssm_g_a,(size_t)hd*ne,d_ga)||
+       !resident_weight(s,w.ssm_g_b,(size_t)di*hd,d_gb)||!resident_weight(s,w.o_norm,(size_t)hd,d_on))
+        return decline("weight upload failed");
+    // recurrence state: the same resident entry the prompt path's kernel uses
+    const size_t st=(size_t)nh*hd*hd;
+    float* state_dev=nullptr;
+    {
+        auto it=s.resident_states.find(state);
+        if (it==s.resident_states.end()||it->second.count!=st) {
+            if (it!=s.resident_states.end()) { cudaFree(it->second.device); s.resident_states.erase(it); }
+            Scratch::ResidentState entry; entry.count=st;
+            if (cudaMalloc(&entry.device,st*sizeof(float))!=cudaSuccess) return decline("state allocation failed");
+            if (cudaMemcpy(entry.device,state,st*sizeof(float),cudaMemcpyHostToDevice)!=cudaSuccess) { cudaFree(entry.device); return decline("state upload failed"); }
+            it=s.resident_states.emplace(state,std::move(entry)).first;
+        }
+        state_dev=it->second.device;
+    }
+    // conv history: upload from the host copy the first time (or after a host-side conv invalidated it)
+    const size_t conv_count=(size_t)3*(dc-1)*di;
+    auto cit=b.conv.find(conv_state);
+    if (cit==b.conv.end()||cit->second.count!=conv_count) {
+        if (cit!=b.conv.end()) { cudaFree(cit->second.device); b.conv.erase(cit); }
+        BlockScratch::Conv entry; entry.count=conv_count;
+        if (cudaMalloc(&entry.device,conv_count*sizeof(float))!=cudaSuccess) return decline("conv history allocation failed");
+        if (cudaMemcpy(entry.device,conv_state,conv_count*sizeof(float),cudaMemcpyHostToDevice)!=cudaSuccess) { cudaFree(entry.device); return decline("conv history upload failed"); }
+        cit=b.conv.emplace(conv_state,entry).first;
+    }
+    float* hist=cit->second.device;
+    cit->second.ahead=true;        // from here the device copy is the live one
+
+    cudaStream_t st_=b.stream; void* sv=(void*)st_;
+    cudaError_t e=cudaMemcpyAsync(b.x,x_host,(size_t)ne*sizeof(float),cudaMemcpyHostToDevice,st_);
+    if (e!=cudaSuccess) return fail(cudaGetErrorString(e));
+    kda_rmsnorm1<<<1,1024,0,st_>>>(b.x,d_an,b.xn,ne,KDA_RMS_EPS);
+    native_quantize_q8_1(b.xn,b.xq,ne,1,sv);
+    native_mmvq(w.wq_type,w.wq,b.xq,b.rq,ne,di,1,sv);
+    native_mmvq(w.wk_type,w.wk,b.xq,b.rk,ne,di,1,sv);
+    native_mmvq(w.wv_type,w.wv,b.xq,b.rv,ne,di,1,sv);
+    kda_conv_step<<<dim3((di+255)/256,3),256,0,st_>>>(d_cqw,d_ckw,d_cvw,b.rq,b.rk,b.rv,hist,b.cq,b.ck,b.cv,di,dc);
+    kda_l2norm_qk<<<dim3(nh,2),128,0,st_>>>(b.cq,b.ck,b.qn,b.kn,hd,KDA_L2_EPS);
+    // gates, from the normed input
+    kda_rows<<<(hd+7)/8,256,0,st_>>>(d_fa,b.xn,b.fa,1,hd,ne);
+    kda_rows<<<(di+7)/8,256,0,st_>>>(d_fb,b.fa,b.fb,1,di,hd);
+    kda_rows<<<(nh+7)/8,256,0,st_>>>(d_beta,b.xn,b.bp,1,nh,ne);
+    kda_apply_gates<<<(di+255)/256,256,0,st_>>>(b.fb,b.bp,d_a,d_bias,1,nh,hd,b.gg,b.bb);
+    kda_recur<<<nh,256,(size_t)2*hd*sizeof(float),st_>>>(b.qn,b.kn,b.cv,b.gg,b.bb,1,nh,hd,state_dev,b.attn);
+    // output gate, then wo
+    kda_rows<<<(hd+7)/8,256,0,st_>>>(d_ga,b.xn,b.ga,1,hd,ne);
+    kda_rows<<<(di+7)/8,256,0,st_>>>(d_gb,b.ga,b.gb,1,di,hd);
+    kda_outgate<<<nh,128,0,st_>>>(b.attn,b.gb,d_on,b.o,hd,KDA_RMS_EPS);
+    native_quantize_q8_1(b.o,b.oq,di,1,sv);
+    native_mmvq(w.wo_type,w.wo,b.oq,b.out,di,ne,1,sv);
+    e=cudaMemcpyAsync(out_host,b.out,(size_t)ne*sizeof(float),cudaMemcpyDeviceToHost,st_);
+    if (e==cudaSuccess) e=cudaStreamSynchronize(st_);
+    if (e==cudaSuccess) e=cudaGetLastError();
+    if (e!=cudaSuccess) return fail(cudaGetErrorString(e));
+    return 1;
 }
 
 bool kda_gates_cuda(const float* xn,const float* ssm_f_a,const float* ssm_f_b,const float* ssm_beta,
