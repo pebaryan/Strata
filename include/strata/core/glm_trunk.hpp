@@ -104,4 +104,12 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
                        float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
                        int first_layer = 0, GlmStageFn stage_fn = nullptr, void* stage_ctx = nullptr);
 
+/// Layer-major prompt path for a causal token chunk. Input/output rows are [tokens][HC][n_embd].
+/// KDA recurrence and MLA cache updates advance in token order within each layer; only independent
+/// projections are batched. State is left at the chunk's final position for the next chunk/decode call.
+bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkProvider provider, void* provider_ctx,
+                             const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
+                             float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
+                             int first_layer = 0);
+
 }  // namespace strata::core::glm

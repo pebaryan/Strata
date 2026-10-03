@@ -62,6 +62,20 @@ __global__ void scaled_add_kernel(float* __restrict__ dst, const float* __restri
     const long long i = (long long) blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] += scale * src[i];
 }
+__global__ void weighted_routes_kernel(const float* __restrict__ route_out, const float* __restrict__ weights,
+                                       float* __restrict__ out, int64_t n_embd, int64_t n_tokens, int n_used) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t n = n_embd * n_tokens;
+    if (i >= n) return;
+    const int64_t t = i / n_embd;
+    const int64_t j = i - t * n_embd;
+    float acc = 0.0f;
+    for (int k = 0; k < n_used; ++k) {
+        const int64_t p = t * n_used + k;
+        acc += weights[p] * route_out[p * n_embd + j];
+    }
+    out[i] = acc;
+}
 
 __global__ void to_f16_kernel(const float* __restrict__ x, uint16_t* __restrict__ y, int64_t n) {
     const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
@@ -179,6 +193,15 @@ void scaled_add_inplace(float* dst, const float* src, int64_t n, float scale, vo
     scaled_add_kernel<<<grid_for(n), THREADS, 0, (cudaStream_t) stream>>>(dst, src, n, scale);
     check_launch("scaled_add_inplace");
     sync_if_needed(stream, "scaled_add_inplace");
+}
+
+void weighted_routes(const float* route_out, const float* weights, float* out, int64_t n_embd,
+                     int64_t n_tokens, int n_used, void* stream) {
+    if (!route_out || !weights || !out || n_embd <= 0 || n_tokens <= 0 || n_used <= 0) return;
+    weighted_routes_kernel<<<grid_for(n_embd * n_tokens), THREADS, 0, (cudaStream_t) stream>>>(
+        route_out, weights, out, n_embd, n_tokens, n_used);
+    check_launch("weighted_routes");
+    sync_if_needed(stream, "weighted_routes");
 }
 
 void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream) {

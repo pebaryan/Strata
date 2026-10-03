@@ -30,10 +30,23 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <atomic>
+#include <condition_variable>
+#include <functional>
+#include <future>
+#include <fcntl.h>
+#include <list>
+#include <memory>
+#include <mutex>
+#include <unistd.h>
+#include <thread>
 #include <vector>
 
 #include "strata/core/expert_source.hpp"
 #include "strata/core/glm_bind.hpp"
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include "strata/core/expert_row_cache.hpp"
 #include "strata/core/glm_expert_device.hpp"
 #include "strata/core/glm_layer.hpp"
@@ -230,8 +243,25 @@ static const uint8_t* blob_adapter(void* ctx, int layer, int expert) {
     return ((C::ExpertSource*) ctx)->blob(layer, expert);
 }
 
+// Expert rows are recycled through a size-keyed free list instead of cudaMalloc/cudaFree per miss: cudaFree
+// synchronises the whole device, and a cold decode token misses on up to ~340 rows.  Row sizes take only a few distinct
+// values (one per expert format), so the list stays tiny; its contents are at most the rows evicted and not yet reused.
+static std::unordered_map<size_t, std::vector<void*>> g_row_pool;
+
+static void* row_alloc(size_t bytes) {
+    std::vector<void*>& v = g_row_pool[bytes];
+    if (!v.empty()) { void* p = v.back(); v.pop_back(); return p; }
+    void* p = nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) return nullptr;
+    return p;
+}
+
+static void row_release(void* p, size_t bytes) {
+    if (p != nullptr) g_row_pool[bytes].push_back(p);
+}
+
 static void free_expert_row(void*, const C::ExpertRowKey&, const C::ExpertRowEntry& entry) {
-    if (entry.dev != nullptr) (void) cudaFree(entry.dev);
+    row_release(entry.dev, entry.bytes);
 }
 
 static C::ExpertRowCacheConfig expert_cache_config(size_t budget) {
@@ -275,13 +305,13 @@ static bool run_cached_device_expert(void* raw, int layer, int expert, const uin
         }
         device_row = entry->dev;
     } else {
-        if (cudaMalloc(&device_row, layout.bytes) != cudaSuccess) {
+        if ((device_row = row_alloc(layout.bytes)) == nullptr) {
             err = std::string("cudaMalloc expert row: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
         if (cudaMemcpy(device_row, blob, layout.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
             err = std::string("upload expert row: ") + cudaGetErrorString(cudaGetLastError());
-            cudaFree(device_row);
+            row_release(device_row, layout.bytes);
             return false;
         }
         if (state == C::ExpertRowState::needs_upload) {
@@ -299,13 +329,17 @@ static bool run_cached_device_expert(void* raw, int layer, int expert, const uin
 
     const bool ok = C::glm_expert_ffn_device_resident((const uint8_t*) device_row, layout, fmt.gu_type, fmt.d_type,
                                                        fmt.n_embd, fmt.n_ff, x, out, runtime.scratch, err);
-    if (temporary) cudaFree(device_row);
+    if (temporary) row_release(device_row, layout.bytes);
     if (!ok && !err.empty())
         err = "layer " + std::to_string(layer) + " expert " + std::to_string(expert) + ": " + err;
     return ok;
 }
 
-static bool run_cached_device_moe(void* raw, int layer, int n_experts, const int32_t* experts,
+static void prefetch_host_rows(const uint8_t* p, size_t bytes);
+
+// The upload-every-miss decode path: every selected expert not resident on the device is copied up (and normally cached)
+// and the whole MoE runs on the GPU.  Kept as the fallback for STRATA_GLM_CPU_MISS=0 and for any CPU-tier failure.
+static bool run_cached_device_moe_upload(void* raw, int layer, int n_experts, const int32_t* experts,
                                  const uint8_t* const* blobs, const float* weights,
                                  const KCPU::NativeFmt& fmt, const float* x, float* out, std::string& err) {
     GlmExpertDeviceRuntime& runtime = *(GlmExpertDeviceRuntime*) raw;
@@ -318,6 +352,8 @@ static bool run_cached_device_moe(void* raw, int layer, int n_experts, const int
     if (runtime.scratch.n_embd == 0 && !runtime.scratch.alloc(fmt.n_embd, fmt.n_ff, err)) return false;
     std::vector<const uint8_t*> rows((size_t) n_experts);
     std::vector<void*> temporary;
+    for (int i = 0; i < n_experts; ++i)
+        if (blobs[i] && runtime.cache.find(C::ExpertRowKey{layer, (int) experts[i]}) == nullptr) prefetch_host_rows(blobs[i], layout.bytes);
     for (int i = 0; i < n_experts; ++i) {
         if (!blobs[i]) { err = "device MoE has a null host blob"; return false; }
         const C::ExpertRowKey key{layer, (int) experts[i]};
@@ -331,13 +367,13 @@ static bool run_cached_device_moe(void* raw, int layer, int n_experts, const int
             }
             device_row = entry->dev;
         } else {
-            if (cudaMalloc(&device_row, layout.bytes) != cudaSuccess) {
+            if ((device_row = row_alloc(layout.bytes)) == nullptr) {
                 err = std::string("cudaMalloc expert row: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
             if (cudaMemcpy(device_row, blobs[i], layout.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
                 err = std::string("upload expert row: ") + cudaGetErrorString(cudaGetLastError());
-                cudaFree(device_row);
+                row_release(device_row, layout.bytes);
                 return false;
             }
             if (state == C::ExpertRowState::needs_upload) {
@@ -354,46 +390,536 @@ static bool run_cached_device_moe(void* raw, int layer, int n_experts, const int
     const bool ok = C::glm_expert_moe_device_resident(rows.data(), weights, n_experts, layout,
                                                        fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff,
                                                        x, out, runtime.scratch, err);
-    for (void* row : temporary) cudaFree(row);
+    for (void* row : temporary) row_release(row, layout.bytes);
     if (!ok && !err.empty()) err = "layer " + std::to_string(layer) + " device MoE: " + err;
     return ok;
 }
 
+// ---- CPU TIER: compute the GPU cache's misses in place, from host memory, beside the GPU ----------------------------
+//
+// The engine's own design for experts that do not fit the card: the routed experts the GPU holds run there, the rest are
+// computed by the CPU straight from the RAM copy, concurrently, instead of being pushed over PCIe first.  An uploaded
+// miss costs a synchronous 6.5-8.8 MB copy (~0.7 ms) per expert and then the row sits in the cache whether or not it is
+// ever used again; the CPU needs ~1.3 ms of core time for the same expert and no bus traffic, and eight cores run eight
+// misses side by side.  A row is promoted into the GPU cache only once it has missed `g_promote_after` times (or while
+// the cache still has free room), so the cache converges on the experts the conversation actually reuses.
+class CpuPool {
+public:
+    explicit CpuPool(int workers) {
+        for (int i = 0; i < workers; ++i) threads_.emplace_back([this] { loop(); });
+    }
+    ~CpuPool() {
+        { std::lock_guard<std::mutex> l(m_); stop_ = true; }
+        cv_.notify_all();
+        for (std::thread& t : threads_) t.join();
+    }
+    int size() const { return (int) threads_.size() + 1; }
+    /// Runs fn(0..n-1) over the workers and the calling thread; returns when every index is done.
+    void run(int n, const std::function<void(int)>& fn) {
+        if (n <= 0) return;
+        if (threads_.empty() || n == 1) { for (int i = 0; i < n; ++i) fn(i); return; }
+        // Every run owns its job.  A worker still finishing the previous run holds the previous job (by shared_ptr), so
+        // it can never take an index of, or be counted into, the next one - sharing next/done/n across runs let a
+        // straggler run a task twice and overshoot the completion count, which hung the caller.
+        std::shared_ptr<Job> job = std::make_shared<Job>();
+        job->fn = &fn;
+        job->n = n;
+        {
+            std::lock_guard<std::mutex> l(m_);
+            job_ = job;
+            ++gen_;
+        }
+        cv_.notify_all();
+        work(*job);
+        std::unique_lock<std::mutex> l(job->m);
+        job->done_cv.wait(l, [&] { return job->done == job->n; });
+    }
+
+private:
+    struct Job {
+        const std::function<void(int)>* fn = nullptr;
+        int n = 0;
+        std::atomic<int> next{0};
+        int done = 0;
+        std::mutex m;
+        std::condition_variable done_cv;
+    };
+    static void work(Job& job) {
+        for (;;) {
+            const int i = job.next.fetch_add(1);
+            if (i >= job.n) break;
+            (*job.fn)(i);
+            std::lock_guard<std::mutex> l(job.m);
+            if (++job.done == job.n) job.done_cv.notify_all();
+        }
+    }
+    void loop() {
+        uint64_t seen = 0;
+        for (;;) {
+            std::shared_ptr<Job> job;
+            {
+                std::unique_lock<std::mutex> l(m_);
+                cv_.wait(l, [&] { return stop_ || gen_ != seen; });
+                if (stop_) return;
+                seen = gen_;
+                job = job_;
+            }
+            if (job) work(*job);
+        }
+    }
+    std::vector<std::thread> threads_;
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::shared_ptr<Job> job_;
+    uint64_t gen_ = 0;
+    bool stop_ = false;
+};
+
+static CpuPool& cpu_pool() {
+    static CpuPool pool([] {
+        const char* e = std::getenv("STRATA_GLM_CPU_THREADS");
+        const int n = e ? std::atoi(e) : (int) std::thread::hardware_concurrency() - 1;
+        return std::max(0, n);
+    }());
+    return pool;
+}
+
+// HOST RAM TIER: an LRU of expert rows in ordinary anonymous (hugepage-eligible) memory, between the GPU cache and the
+// SSD.  The mmap of experts.bin is a poor thing to compute from: its pages are file-backed, so each access pays page-table
+// setup (about 0.8 ms per 7.5 MB expert even with every page cached) and the kernel may unmap them under pressure.  Rows
+// are read in once with pread (the page-cache copy is dropped straight after, so RAM holds each row once) and then
+// served at memory speed to the CPU kernels, and to the GPU when a row is promoted.  Fixed-size slots: every row class
+// fits the largest, which wastes a little on the smaller classes and keeps eviction trivial.
+class HostRowCache {
+public:
+    ~HostRowCache() {
+        if (base_ != nullptr) munmap(base_, region_bytes_);
+        if (fd_ >= 0) ::close(fd_);
+    }
+    bool enabled() const { return base_ != nullptr; }
+    size_t slots() const { return n_slots_; }
+    size_t slot_bytes() const { return slot_bytes_; }
+
+    /// `typical_bytes` only sizes the "slots" figure reported at startup; rows are allocated at their exact size.
+    bool init(size_t budget_bytes, size_t typical_bytes, const std::string& path, uintptr_t map_start, uintptr_t map_end,
+              off_t map_offset) {
+        typical_bytes = (typical_bytes + 4095) & ~(size_t) 4095;
+        if (typical_bytes == 0 || budget_bytes / typical_bytes < 16) return false;
+        fd_ = ::open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) return false;
+        region_bytes_ = budget_bytes & ~(size_t) 4095;
+        void* p = mmap(nullptr, region_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (p == MAP_FAILED) { ::close(fd_); fd_ = -1; return false; }
+        (void) madvise(p, region_bytes_, MADV_HUGEPAGE);
+        base_ = (uint8_t*) p;
+        slot_bytes_ = typical_bytes;
+        n_slots_ = region_bytes_ / typical_bytes;
+        map_start_ = map_start; map_end_ = map_end; map_offset_ = map_offset;
+        return true;
+    }
+    void set_drop_page_cache(bool drop) { drop_cache_ = drop; }
+    /// Offset in experts.bin of a pointer into its mapping.
+    bool file_offset(const uint8_t* blob, off_t& off) const {
+        const uintptr_t a = (uintptr_t) blob;
+        if (a < map_start_ || a >= map_end_) return false;
+        off = map_offset_ + (off_t) (a - map_start_);
+        return true;
+    }
+    /// A resident row (made most recently used), or nullptr.
+    uint8_t* lookup(int layer, int expert) {
+        auto it = map_.find(key(layer, expert));
+        if (it == map_.end()) return nullptr;
+        lru_.splice(lru_.begin(), lru_, it->second.pos);
+        return base_ + it->second.offset;
+    }
+    /// Room for a row of `bytes` that is about to be filled: a freed block of exactly that size, else fresh space from
+    /// the region, else the least recently used rows are dropped until a block of that size frees up (rows of other
+    /// sizes freed on the way go to their own lists for reuse).  The row is recorded as resident immediately: the caller
+    /// fills it before anything reads it.  nullptr only when `bytes` cannot fit the region at all.
+    uint8_t* reserve(int layer, int expert, size_t bytes) {
+        bytes = (bytes + 4095) & ~(size_t) 4095;
+        size_t offset = 0;
+        for (;;) {
+            std::vector<size_t>& fl = free_[bytes];
+            if (!fl.empty()) { offset = fl.back(); fl.pop_back(); break; }
+            if (bump_ + bytes <= region_bytes_) { offset = bump_; bump_ += bytes; break; }
+            if (lru_.empty()) return nullptr;
+            const uint64_t victim = lru_.back();
+            lru_.pop_back();
+            const Entry& v = map_[victim];
+            free_[v.bytes].push_back(v.offset);
+            map_.erase(victim);
+        }
+        lru_.push_front(key(layer, expert));
+        map_[key(layer, expert)] = Entry{offset, bytes, lru_.begin()};
+        return base_ + offset;
+    }
+    void erase(int layer, int expert) {
+        auto it = map_.find(key(layer, expert));
+        if (it == map_.end()) return;
+        free_[it->second.bytes].push_back(it->second.offset);
+        lru_.erase(it->second.pos);
+        map_.erase(it);
+    }
+    /// pread `bytes` at `off` into `dst`, then drop the page-cache copy so the row is held once.
+    bool fill(uint8_t* dst, off_t off, size_t bytes) const {
+        size_t done = 0;
+        while (done < bytes) {
+            const ssize_t n = ::pread(fd_, dst + done, bytes - done, off + (off_t) done);
+            if (n <= 0) return false;
+            done += (size_t) n;
+        }
+        if (drop_cache_) (void) posix_fadvise(fd_, off, (off_t) bytes, POSIX_FADV_DONTNEED);
+        return true;
+    }
+
+private:
+    struct Entry { size_t offset; size_t bytes; std::list<uint64_t>::iterator pos; };
+    static uint64_t key(int layer, int expert) { return ((uint64_t) (uint32_t) layer << 32) | (uint32_t) expert; }
+    uint8_t* base_ = nullptr;
+    size_t region_bytes_ = 0, slot_bytes_ = 0, n_slots_ = 0;
+    int fd_ = -1;
+    uintptr_t map_start_ = 0, map_end_ = 0;
+    off_t map_offset_ = 0;
+    size_t bump_ = 0;
+    bool drop_cache_ = false;
+    std::unordered_map<size_t, std::vector<size_t>> free_;   // freed block offsets, by (page-rounded) size
+    std::list<uint64_t> lru_;
+    std::unordered_map<uint64_t, Entry> map_;
+};
+static HostRowCache g_host;
+static long g_host_hits = 0, g_host_fills = 0;
+
+static bool g_cpu_miss = false;         // STRATA_GLM_CPU_MISS=1 enables the hybrid CPU/GPU path once the cache is full
+static int g_promote_after = 2;         // STRATA_GLM_PROMOTE_AFTER: misses before a row is uploaded into a full cache
+static std::vector<uint8_t> g_miss_count((size_t) 46 * N_EXPERT, 0);
+static long g_cpu_experts = 0, g_gpu_experts = 0, g_promoted = 0;
+static double g_cpu_ms[7] = {0, 0, 0, 0, 0, 0, 0};   // populate, gate/up, quant h, down, wait for GPU, promote, host lookup
+static std::atomic<long> g_fill_ns{0};                // summed over threads: time inside HostRowCache::fill
+
+static double g_upload_frac = 0.5;      // STRATA_GLM_HYBRID_UPLOAD_FRAC: share of a full cache's misses that are uploaded
+
+static bool run_cached_device_moe(void* raw, int layer, int n_experts, const int32_t* experts,
+                                  const uint8_t* const* blobs, const float* weights,
+                                  const KCPU::NativeFmt& fmt, const float* x, float* out, std::string& err) {
+    if (!g_cpu_miss) return run_cached_device_moe_upload(raw, layer, n_experts, experts, blobs, weights, fmt, x, out, err);
+    GlmExpertDeviceRuntime& runtime = *(GlmExpertDeviceRuntime*) raw;
+    const KN::NativeExpertLayout layout =
+        KN::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
+    if (layout.bytes == 0 || layout.bytes != fmt.bytes || n_experts <= 0 || n_experts > 64) {
+        err = "device MoE layout/count disagrees with NativeFmt";
+        return false;
+    }
+    if (runtime.scratch.n_embd == 0 && !runtime.scratch.alloc(fmt.n_embd, fmt.n_ff, err)) return false;
+    // While the GPU cache still has room for every expert this call selects, uploading and caching them is strictly
+    // better: the rows end up on the device and every later token hits.
+    if (runtime.cache.bytes_used() + (size_t) n_experts * layout.bytes <= runtime.cache.budget())
+        return run_cached_device_moe_upload(raw, layer, n_experts, experts, blobs, weights, fmt, x, out, err);
+
+    // CACHE FULL: split the call three ways, all at once.  Resident rows and a share of the misses (which are uploaded and
+    // cached, so they hit next time) run on the GPU; the remaining misses are computed on the CPU from host memory while
+    // the PCIe copies and the GPU kernels run.  Neither side idles, and the cache still converges on the reused experts.
+    std::vector<const uint8_t*> hit_rows;
+    std::vector<float> hit_w;
+    std::vector<int> pend;
+    std::vector<C::ExpertRowState> pend_state;
+    for (int i = 0; i < n_experts; ++i) {
+        if (!blobs[i]) { err = "device MoE has a null host blob"; return false; }
+        const C::ExpertRowKey key{layer, (int) experts[i]};
+        const C::ExpertRowState state = runtime.cache.lookup(key, layout.bytes);
+        if (state == C::ExpertRowState::resident) {
+            const C::ExpertRowEntry* entry = runtime.cache.find(key);
+            if (!entry || !entry->dev || entry->bytes != layout.bytes) {
+                err = "expert cache reported a resident row without a matching device allocation";
+                return false;
+            }
+            hit_rows.push_back((const uint8_t*) entry->dev);
+            hit_w.push_back(weights[i]);
+        } else {
+            pend.push_back(i);
+            pend_state.push_back(state);
+            prefetch_host_rows(blobs[i], layout.bytes);
+        }
+    }
+    const int nh = (int) hit_rows.size();
+    g_gpu_experts += nh;
+
+    // A row that keeps missing is worth a place on the card, so it is always uploaded (and cached); the first-time misses
+    // are the ones shared between the CPU and the upload, since many of them are one-offs that would only evict
+    // something useful.  Without this the CPU's share never becomes resident and a reused expert misses forever.
+    std::vector<char> hot(pend.size(), 0);
+    int cold = 0;
+    for (size_t p = 0; p < pend.size(); ++p) {
+        uint8_t& seen = g_miss_count[(size_t) layer * N_EXPERT + (size_t) experts[pend[p]]];
+        if (seen < 255) ++seen;
+        hot[p] = seen >= g_promote_after && pend_state[p] == C::ExpertRowState::needs_upload;
+        if (!hot[p]) ++cold;
+    }
+    int cold_up_left = (int) std::ceil((double) cold * g_upload_frac);
+    std::vector<int> up_idx, miss;
+    std::vector<C::ExpertRowState> miss_state;
+    for (size_t p = 0; p < pend.size(); ++p) {
+        if (hot[p]) { up_idx.push_back(pend[p]); continue; }
+        if (pend_state[p] == C::ExpertRowState::needs_upload && cold_up_left > 0) { --cold_up_left; up_idx.push_back(pend[p]); continue; }
+        miss.push_back(pend[p]);
+        miss_state.push_back(pend_state[p]);
+    }
+    const int nm = (int) miss.size();
+    g_cpu_experts += nm;
+    const int n_embd = (int) fmt.n_embd, n_ff = (int) fmt.n_ff;
+
+    // GPU side: upload this call's share of misses, then run resident + uploaded rows in one go.
+    struct Uploaded { C::ExpertRowKey key; void* dev; };
+    std::vector<Uploaded> uploaded;
+    std::vector<float> gpu_out((size_t) n_embd);
+    std::string gpu_err;
+    const bool gpu_has = nh + (int) up_idx.size() > 0;
+    auto gpu_job = [&]() -> bool {
+        std::vector<const uint8_t*> rows = hit_rows;
+        std::vector<float> w = hit_w;
+        for (int i : up_idx) {
+            void* dev = row_alloc(layout.bytes);
+            if (dev == nullptr) { gpu_err = std::string("cudaMalloc expert row: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+            if (cudaMemcpy(dev, blobs[i], layout.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+                gpu_err = std::string("upload expert row: ") + cudaGetErrorString(cudaGetLastError());
+                row_release(dev, layout.bytes);
+                return false;
+            }
+            uploaded.push_back(Uploaded{C::ExpertRowKey{layer, (int) experts[i]}, dev});
+            rows.push_back((const uint8_t*) dev);
+            w.push_back(weights[i]);
+        }
+        if (rows.empty()) return true;
+        return C::glm_expert_moe_device_resident(rows.data(), w.data(), (int) rows.size(), layout, fmt.gu_type, fmt.d_type,
+                                                  fmt.n_embd, fmt.n_ff, x, gpu_out.data(), runtime.scratch, gpu_err);
+    };
+    auto release_uploaded = [&]() { for (const Uploaded& u : uploaded) row_release(u.dev, layout.bytes); uploaded.clear(); };
+
+    std::vector<std::vector<float>> part((size_t) nm, std::vector<float>((size_t) n_embd));
+    std::future<bool> gpu_done;
+    if (nm > 0) gpu_done = std::async(std::launch::async, gpu_job);
+
+    if (nm > 0) {
+        std::vector<uint8_t> act(fmt.act_bytes);
+        KCPU::native_quant_act(fmt, x, act.data());
+        std::vector<std::vector<float>> ff((size_t) nm, std::vector<float>((size_t) n_ff));
+        std::vector<std::vector<uint8_t>> hq((size_t) nm, std::vector<uint8_t>(fmt.h_bytes));
+
+        // Where the CPU reads each expert from: the host RAM tier when enabled (a hit, or a slot to fill), else the mmap.
+        std::vector<const uint8_t*> cblob((size_t) nm);
+        std::vector<uint8_t*> fill_dst((size_t) nm, nullptr);
+        std::vector<off_t> fill_off((size_t) nm, 0);
+        std::vector<char> fill_failed((size_t) nm, 0);
+        for (int m = 0; m < nm; ++m) {
+            const int idx = miss[(size_t) m];
+            cblob[(size_t) m] = blobs[idx];
+            if (!g_host.enabled()) continue;
+            if (uint8_t* p = g_host.lookup(layer, (int) experts[idx])) {
+                cblob[(size_t) m] = p;
+                ++g_host_hits;
+            } else if (off_t off; g_host.file_offset(blobs[idx], off)) {
+                if (uint8_t* slot = g_host.reserve(layer, (int) experts[idx], layout.bytes)) {
+                    fill_dst[(size_t) m] = slot;
+                    fill_off[(size_t) m] = off;
+                    cblob[(size_t) m] = slot;
+                    ++g_host_fills;
+                }
+            }
+        }
+
+        CpuPool& pool = cpu_pool();
+        const int gu_chunk = 128, d_chunk = 256;
+        const int gu_chunks = (n_ff + gu_chunk - 1) / gu_chunk, d_chunks = (n_embd + d_chunk - 1) / d_chunk;
+        const void* act_p[1] = {act.data()};
+        auto lap_t = std::chrono::steady_clock::now();
+        auto lap = [&](int k) {
+            const auto now = std::chrono::steady_clock::now();
+            g_cpu_ms[k] += std::chrono::duration<double, std::milli>(now - lap_t).count();
+            lap_t = now;
+        };
+        // Map each expert's pages in one call before the dot products (a per-page first-touch fault costs about 1,800
+        // faults per expert and serialises the threads on the mapping lock); or, for the host tier, fill its slot.
+        pool.run(nm, [&](int m) {
+            if (fill_dst[(size_t) m] != nullptr) {
+                const auto f0 = std::chrono::steady_clock::now();
+                if (!g_host.fill(fill_dst[(size_t) m], fill_off[(size_t) m], layout.bytes)) {
+                    fill_failed[(size_t) m] = 1;
+                    cblob[(size_t) m] = blobs[miss[(size_t) m]];
+                }
+                g_fill_ns += (long) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - f0).count();
+                return;
+            }
+            if (cblob[(size_t) m] != blobs[miss[(size_t) m]]) return;   // host tier hit: nothing to map
+            const uintptr_t pg = 4096;
+            const uintptr_t a = (uintptr_t) blobs[miss[(size_t) m]] & ~(pg - 1);
+            const uintptr_t e = ((uintptr_t) blobs[miss[(size_t) m]] + layout.bytes + pg - 1) & ~(pg - 1);
+#ifndef MADV_POPULATE_READ
+#define MADV_POPULATE_READ 22
+#endif
+            (void) madvise((void*) a, e - a, MADV_POPULATE_READ);
+        });
+        for (int m = 0; m < nm; ++m)
+            if (fill_failed[(size_t) m]) g_host.erase(layer, (int) experts[miss[(size_t) m]]);
+        lap(0);
+        pool.run(nm * gu_chunks, [&](int t) {
+            const int m = t / gu_chunks, c = t % gu_chunks;
+            float* fp[1] = {ff[(size_t) m].data()};
+            KCPU::native_gu_rows(fmt, cblob[(size_t) m], act_p, 1, fp, c * gu_chunk, std::min(n_ff, (c + 1) * gu_chunk));
+        });
+        lap(1);
+        pool.run(nm, [&](int m) { KCPU::native_quant_h(fmt, ff[(size_t) m].data(), hq[(size_t) m].data()); });
+        lap(2);
+        pool.run(nm * d_chunks, [&](int t) {
+            const int m = t / d_chunks, c = t % d_chunks;
+            const void* hp[1] = {hq[(size_t) m].data()};
+            float* op[1] = {part[(size_t) m].data()};
+            KCPU::native_down_rows(fmt, cblob[(size_t) m], hp, 1, op, c * d_chunk, std::min(n_embd, (c + 1) * d_chunk));
+        });
+        lap(3);
+    }
+
+    bool gpu_ok = true;
+    if (nm > 0) gpu_ok = gpu_done.get();
+    else gpu_ok = gpu_job();
+    if (!gpu_ok) {
+        release_uploaded();
+        err = "layer " + std::to_string(layer) + " device MoE: " + gpu_err;
+        return false;
+    }
+    for (int j = 0; j < n_embd; ++j) {
+        float acc = gpu_has ? gpu_out[(size_t) j] : 0.0f;
+        for (int m = 0; m < nm; ++m) acc += part[(size_t) m][(size_t) j] * weights[miss[(size_t) m]];
+        out[j] = acc;
+    }
+
+    // The uploaded share joins the cache (evicting the least recently used rows).
+    for (const Uploaded& u : uploaded) {
+        runtime.cache.insert(u.key, C::ExpertRowEntry{u.dev, layout.bytes});
+        const C::ExpertRowEntry* entry = runtime.cache.find(u.key);
+        if (!entry || entry->dev != u.dev) row_release(u.dev, layout.bytes);
+        ++g_promoted;
+    }
+    return true;
+}
+
+static void prefetch_host_rows(const uint8_t* p, size_t bytes) {
+    const uintptr_t pg = 4096;
+    const uintptr_t a = (uintptr_t) p & ~(pg - 1);
+    const uintptr_t e = ((uintptr_t) p + bytes + pg - 1) & ~(pg - 1);
+    (void) madvise((void*) a, e - a, MADV_WILLNEED);
+}
+
+static bool run_cached_device_moe_batch(void* raw, int layer, int n_unique, const int32_t* experts,
+                                       const uint8_t* const* blobs, int tokens, int n_used,
+                                       const int32_t* route_slot, const float* weights,
+                                       const KCPU::NativeFmt& fmt, const float* x, float* out, std::string& err) {
+    GlmExpertDeviceRuntime& runtime = *(GlmExpertDeviceRuntime*) raw;
+    const KN::NativeExpertLayout layout =
+        KN::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
+    if (!experts || !blobs || !route_slot || !weights || n_unique <= 0 || tokens <= 0 || tokens > 256 ||
+        layout.bytes == 0 || layout.bytes != fmt.bytes) {
+        err = "batched device MoE layout/count disagrees with NativeFmt";
+        return false;
+    }
+    if (runtime.scratch.n_embd == 0 && !runtime.scratch.alloc(fmt.n_embd, fmt.n_ff, err)) return false;
+    struct PendingRow { C::ExpertRowKey key; void* dev; bool cacheable; };
+    std::vector<PendingRow> pending;
+    std::vector<const uint8_t*> rows((size_t) n_unique);
+    for (int i = 0; i < n_unique; ++i)
+        if (blobs[i] && runtime.cache.find(C::ExpertRowKey{layer, experts[i]}) == nullptr) prefetch_host_rows(blobs[i], layout.bytes);
+    auto release_pending = [&]() { for (const PendingRow& p : pending) row_release(p.dev, layout.bytes); pending.clear(); };
+    for (int i = 0; i < n_unique; ++i) {
+        if (!blobs[i]) { err = "batched device MoE has a null host expert blob"; release_pending(); return false; }
+        const C::ExpertRowKey key{layer, experts[i]};
+        const C::ExpertRowState state = runtime.cache.lookup(key, layout.bytes);
+        if (state == C::ExpertRowState::resident) {
+            const C::ExpertRowEntry* entry = runtime.cache.find(key);
+            if (!entry || !entry->dev || entry->bytes != layout.bytes) {
+                err = "expert cache reported a resident batch row without a matching allocation";
+                release_pending(); return false;
+            }
+            rows[(size_t) i] = (const uint8_t*) entry->dev;
+            continue;
+        }
+        void* dev = row_alloc(layout.bytes);
+        if (dev == nullptr ||
+            cudaMemcpy(dev, blobs[i], layout.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
+            if (dev) row_release(dev, layout.bytes);
+            err = std::string("upload batched expert row: ") + cudaGetErrorString(cudaGetLastError());
+            release_pending(); return false;
+        }
+        pending.push_back(PendingRow{key, dev, state == C::ExpertRowState::needs_upload});
+        rows[(size_t) i] = (const uint8_t*) dev;
+    }
+    const bool ok = C::glm_expert_moe_device_batch_resident(rows.data(), n_unique, route_slot, weights, tokens,
+                                                             n_used, layout, fmt.gu_type, fmt.d_type,
+                                                             fmt.n_embd, fmt.n_ff, x, out, runtime.scratch, err);
+    if (!ok) { release_pending(); if (err.empty()) err = "batched expert device FFN failed"; return false; }
+    for (const PendingRow& p : pending) {
+        if (!p.cacheable) { row_release(p.dev, layout.bytes); continue; }
+        runtime.cache.insert(p.key, C::ExpertRowEntry{p.dev, layout.bytes});
+        const C::ExpertRowEntry* entry = runtime.cache.find(p.key);
+        if (!entry || entry->dev != p.dev) row_release(p.dev, layout.bytes);
+    }
+    pending.clear();
+    return true;
+}
+
 static bool native_kda_project(int count, const void* const* weights, const int* types,
-                               const float* x, int n_in, int n_out, float* const* out) {
+                               int tokens, const float* x, int n_in, int n_out, float* const* out) {
     struct Workspace {
         float* x = nullptr;
         float* y = nullptr;
         void* q = nullptr;
         cudaStream_t stream = nullptr;
+        size_t x_bytes = 0, y_bytes = 0, q_bytes = 0;
         ~Workspace() { if (x) cudaFree(x); if (y) cudaFree(y); if (q) cudaFree(q); if (stream) cudaStreamDestroy(stream); }
     };
     static Workspace ws;
-    if (!ws.stream) {
-        if (cudaStreamCreateWithFlags(&ws.stream, cudaStreamNonBlocking) != cudaSuccess ||
-            cudaMalloc(&ws.x, (size_t) 16384 * sizeof(float)) != cudaSuccess ||
-            cudaMalloc(&ws.y, (size_t) 3 * 16384 * sizeof(float)) != cudaSuccess ||
-            cudaMalloc(&ws.q, strata::kernels::native_q8_1_bytes(16384)) != cudaSuccess) return false;
-    }
-    if (count < 1 || count > 3 || n_in > 16384 || n_out > 16384) return false;
-    if (cudaMemcpyAsync(ws.x, x, (size_t) n_in * sizeof(float), cudaMemcpyHostToDevice, ws.stream) != cudaSuccess)
+    if (tokens <= 0 || count < 1 || count > 3 || n_in <= 0 || n_out <= 0 || n_in > 16384 || n_out > 16384)
         return false;
-    strata::kernels::native_quantize_q8_1(ws.x, ws.q, n_in, 1, (void*) ws.stream);
-    for (int i = 0; i < count; ++i) {
-        if (!strata::kernels::native_mmvq_supported(types[i])) return false;
-        float* dy = ws.y + (size_t) i * 16384;
-        strata::kernels::native_mmvq(types[i], weights[i], ws.q, dy, n_in, n_out, 1, (void*) ws.stream);
-        if (cudaMemcpyAsync(out[i], dy, (size_t) n_out * sizeof(float), cudaMemcpyDeviceToHost, ws.stream) != cudaSuccess)
-            return false;
+    for (int i = 0; i < count; ++i) if (!strata::kernels::native_mmvq_supported(types[i])) return false;
+    if (!ws.stream && cudaStreamCreateWithFlags(&ws.stream, cudaStreamNonBlocking) != cudaSuccess) return false;
+    const int max_rows = std::min(tokens, 8);  // native_mmvq's supported multi-column width
+    const size_t xb = (size_t) max_rows * n_in * sizeof(float);
+    const size_t yb = (size_t) count * max_rows * n_out * sizeof(float);
+    const size_t qb = strata::kernels::native_q8_1_bytes(n_in, max_rows);
+    if (xb > ws.x_bytes || yb > ws.y_bytes || qb > ws.q_bytes) {
+        if (cudaStreamSynchronize(ws.stream) != cudaSuccess) return false;
+        if (ws.x) cudaFree(ws.x);
+        if (ws.y) cudaFree(ws.y);
+        if (ws.q) cudaFree(ws.q);
+        ws.x = ws.y = nullptr; ws.q = nullptr;
+        ws.x_bytes = ws.y_bytes = ws.q_bytes = 0;
+        if (cudaMalloc(&ws.x, xb) != cudaSuccess || cudaMalloc(&ws.y, yb) != cudaSuccess ||
+            cudaMalloc(&ws.q, qb) != cudaSuccess) return false;
+        ws.x_bytes = xb; ws.y_bytes = yb; ws.q_bytes = qb;
+    }
+    for (int begin = 0; begin < tokens; begin += 8) {
+        const int rows = std::min(8, tokens - begin);
+        if (cudaMemcpyAsync(ws.x, x + (size_t) begin * n_in, (size_t) rows * n_in * sizeof(float),
+                            cudaMemcpyHostToDevice, ws.stream) != cudaSuccess) return false;
+        strata::kernels::native_quantize_q8_1(ws.x, ws.q, n_in, rows, (void*) ws.stream);
+        for (int i = 0; i < count; ++i) {
+            float* dy = ws.y + (size_t) i * rows * n_out;
+            strata::kernels::native_mmvq(types[i], weights[i], ws.q, dy, n_in, n_out, rows, (void*) ws.stream);
+            if (cudaMemcpyAsync(out[i] + (size_t) begin * n_out, dy, (size_t) rows * n_out * sizeof(float),
+                                cudaMemcpyDeviceToHost, ws.stream) != cudaSuccess) return false;
+        }
     }
     return cudaStreamSynchronize(ws.stream) == cudaSuccess;
+}
+
+static bool native_mla_project(int count, const void* const* weights, const int* types,
+                               const float* x, int n_in, int n_out, float* const* out) {
+    return native_kda_project(count, weights, types, 1, x, n_in, n_out, out);
 }
 
 static bool native_glm_ffn(const void* const* weights, const int* types, const K::MoeGeometry& g,
                            const float* x, float* out, float clamp_limit) {
     std::vector<float> gate((size_t) g.ff), up((size_t) g.ff), h((size_t) g.ff);
     float* gu_out[2] = {gate.data(), up.data()};
-    if (!native_kda_project(2, weights, types, x, g.n_embd, g.ff, gu_out)) return false;
+    if (!native_kda_project(2, weights, types, 1, x, g.n_embd, g.ff, gu_out)) return false;
     const bool clamp = clamp_limit > 1e-6f;
     for (int i = 0; i < g.ff; ++i) {
         float a = gate[(size_t) i], u = up[(size_t) i];
@@ -403,7 +929,26 @@ static bool native_glm_ffn(const void* const* weights, const int* types, const K
     const void* down[1] = {weights[2]};
     const int down_type[1] = {types[2]};
     float* down_out[1] = {out};
-    return native_kda_project(1, down, down_type, h.data(), g.ff, g.n_embd, down_out);
+    return native_kda_project(1, down, down_type, 1, h.data(), g.ff, g.n_embd, down_out);
+}
+
+static bool native_glm_ffn_batch(const void* const* weights, const int* types, const K::MoeGeometry& g,
+                                int tokens, const float* x, float* out, float clamp_limit) {
+    if (tokens <= 0 || !weights || !types || !x || !out) return false;
+    std::vector<float> gate((size_t) tokens * g.ff), up((size_t) tokens * g.ff), h((size_t) tokens * g.ff);
+    float* gu_out[2] = {gate.data(), up.data()};
+    if (!native_kda_project(2, weights, types, tokens, x, g.n_embd, g.ff, gu_out)) return false;
+    const bool clamp = clamp_limit > 1e-6f;
+    for (int t = 0; t < tokens; ++t) for (int i = 0; i < g.ff; ++i) {
+        const size_t j = (size_t) t * g.ff + i;
+        float a = gate[j], u = up[j];
+        if (clamp) { a = std::min(a, clamp_limit); u = std::max(-clamp_limit, std::min(u, clamp_limit)); }
+        h[j] = (a / (1.0f + std::exp(-a))) * u;
+    }
+    const void* down[1] = {weights[2]};
+    const int down_type[1] = {types[2]};
+    float* down_out[1] = {out};
+    return native_kda_project(1, down, down_type, tokens, h.data(), g.ff, g.n_embd, down_out);
 }
 
 static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, std::string& err) {
@@ -604,8 +1149,9 @@ int main(int argc, char** argv) {
     K::kda_set_native_project(&native_kda_project);
     // The same function serves the MLA: the signature is already generic (weights, types, shapes), so there is no reason
     // for a second implementation to exist and drift from this one.
-    K::mla_set_native_project(&native_kda_project);
+    K::mla_set_native_project(&native_mla_project);
     C::glm::glm_set_native_ffn(&native_glm_ffn);
+    C::glm::glm_set_native_ffn_batch(&native_glm_ffn_batch);
     P.kda_g.n_embd = N_EMBD; P.kda_g.nh = NH; P.kda_g.hd = HD; P.kda_g.d_conv = 4;
     P.mla_g.n_embd = N_EMBD;                                   // its defaults are this artifact's MLA geometry
     P.dense_g.n_embd = N_EMBD; P.dense_g.ff = FF_DENSE; P.dense_g.n_expert = N_EXPERT; P.dense_g.n_used = N_USED;
@@ -626,11 +1172,131 @@ int main(int argc, char** argv) {
     if (!src.open(pack, 46, N_EXPERT, err)) { std::fprintf(stderr, "open: %s\n", err.c_str()); return 1; }
     P.src = &src;
 
+    // RAM TIER.  Page-lock (cudaHostRegister) as much of the mapped expert file as the host can spare, so a GPU-cache
+    // miss is a direct DMA at PCIe speed instead of a copy through the driver's pageable bounce buffer (about 4 GB/s
+    // measured here against ~12 GB/s).  Automatic when the whole file fits in RAM with room to spare - the case the
+    // engine is designed around - and otherwise opt-in via STRATA_GLM_PIN_GB, which pins the first N GB of layers.
+    {
+        const char* pin_env = std::getenv("STRATA_GLM_PIN_GB");
+        double file_gb = 0.0, avail_gb = 0.0;
+        struct stat sb;
+        if (::stat((pack + "/experts.bin").c_str(), &sb) == 0) file_gb = (double) sb.st_size / 1073741824.0;
+        if (FILE* mi = std::fopen("/proc/meminfo", "r")) {
+            char line[256]; long kb = 0;
+            while (std::fgets(line, sizeof line, mi))
+                if (std::sscanf(line, "MemAvailable: %ld kB", &kb) == 1) { avail_gb = (double) kb / 1048576.0; break; }
+            std::fclose(mi);
+        }
+        const double want_gb = pin_env ? std::atof(pin_env) : (file_gb > 0.0 && file_gb <= avail_gb * 0.8 ? file_gb : 0.0);
+        if (want_gb > 0.0) {
+            const int first_moe = 3;
+            const uint8_t* lo = src.blob(first_moe, 0);
+            const uint8_t* hi = lo;
+            int pinned_layers = 0;
+            for (int l = first_moe; lo && l < 46; ++l) {
+                const uint8_t* b0 = src.blob(l, 0);
+                const uint8_t* b1 = src.blob(l, 1);
+                if (!b0 || !b1 || b0 != hi) break;     // stop at the first gap: one contiguous registration only
+                const size_t layer_bytes = (size_t) (b1 - b0) * N_EXPERT;
+                if ((double) ((b0 + layer_bytes) - lo) > want_gb * 1073741824.0) break;
+                hi = b0 + layer_bytes;
+                ++pinned_layers;
+            }
+            if (hi > lo) {
+                const uintptr_t pg = 4096;
+                const uintptr_t a = (uintptr_t) lo & ~(pg - 1);
+                const uintptr_t e = ((uintptr_t) hi + pg - 1) & ~(pg - 1);
+                cudaError_t pe = cudaHostRegister((void*) a, e - a, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+                if (pe != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    pe = cudaHostRegister((void*) a, e - a, cudaHostRegisterPortable);
+                }
+                if (pe == cudaSuccess)
+                    std::printf("RAM tier: %d MoE layers, %.1f GB page-locked (file %.1f GB, RAM available %.1f GB)\n",
+                                pinned_layers, (double) (e - a) / 1073741824.0, file_gb, avail_gb);
+                else {
+                    (void) cudaGetLastError();
+                    std::printf("RAM tier: cudaHostRegister of %.1f GB failed (%s); continuing pageable\n",
+                                (double) (e - a) / 1073741824.0, cudaGetErrorString(pe));
+                }
+                std::fflush(stdout);
+            }
+        }
+    }
+
     // Keep a bounded set of routed expert rows resident. The default leaves ample room for the model's other CUDA
     // allocations while fitting the measured hot set; misses upload once and then reuse the device pointer.
-    GlmExpertDeviceRuntime expert_device_runtime((size_t) 18 * 1024 * 1024 * 1024);
+    const char* cache_gb_env = std::getenv("STRATA_GLM_EXPERT_CACHE_GB");
+    const double cache_gb = cache_gb_env ? std::atof(cache_gb_env) : 16.0;
+    GlmExpertDeviceRuntime expert_device_runtime((size_t) (cache_gb * 1024.0 * 1024.0 * 1024.0));
+    {
+        const char* cm = std::getenv("STRATA_GLM_CPU_MISS");
+        // Opt-in: with the 16 GB GPU cache the plain upload-and-cache path measured 5.1 t/s against 1.4 t/s for the
+        // hybrid, which only wins (about +40%) when the conversation's experts are far larger than the card.
+        g_cpu_miss = cm && std::strcmp(cm, "0") != 0;
+        const char* pa = std::getenv("STRATA_GLM_PROMOTE_AFTER");
+        if (pa) g_promote_after = std::max(1, std::atoi(pa));
+        if (g_cpu_miss)
+            std::printf("CPU tier: misses computed on %d threads beside the GPU; promoted to the GPU cache after %d misses\n",
+                        cpu_pool().size(), g_promote_after);
+        else
+            std::printf("CPU tier: off (every miss is uploaded)\n");
+    }
+    // Host RAM tier (see HostRowCache).  Default: what the machine can spare beyond 9 GB of headroom.
+    if (g_cpu_miss) {
+        const char* hc = std::getenv("STRATA_GLM_HOST_CACHE_GB");
+        double avail_gb = 0.0;
+        if (FILE* mi = std::fopen("/proc/meminfo", "r")) {
+            char line[256]; long kb = 0;
+            while (std::fgets(line, sizeof line, mi))
+                if (std::sscanf(line, "MemAvailable: %ld kB", &kb) == 1) { avail_gb = (double) kb / 1048576.0; break; }
+            std::fclose(mi);
+        }
+        // Opt-in.  A tier only helps when RAM holds it AND the rest of the process (the GGUF-mapped non-expert weights
+        // live in the page cache) without swapping: on the 31 GB development box a 16-21 GB tier made the kernel swap
+        // it out and refault the other weights, 5x slower than no tier.  Size it to the expert working set with
+        // several GB to spare, e.g. most of a 64 GB machine.
+        (void) avail_gb;
+        const double want_gb = hc ? std::atof(hc) : 0.0;
+        if (want_gb > 0.0) {
+            size_t slot = 0;
+            if (std::ifstream ne(pack + "/native_experts.txt"); ne) {
+                std::string ln;
+                while (std::getline(ne, ln)) {
+                    if (ln.empty() || ln[0] == '#') continue;
+                    std::istringstream ls(ln);
+                    long long f[5] = {0, 0, 0, 0, 0};
+                    for (int i = 0; i < 5; ++i) ls >> f[i];
+                    slot = std::max(slot, (size_t) f[4]);
+                }
+            }
+            uintptr_t ms = 0, me = 0;
+            off_t mo = 0;
+            if (FILE* mp = std::fopen("/proc/self/maps", "r")) {
+                char line[1024];
+                while (std::fgets(line, sizeof line, mp)) {
+                    unsigned long s0, e0, off0;
+                    if (std::strstr(line, "experts.bin") && std::sscanf(line, "%lx-%lx %*s %lx", &s0, &e0, &off0) == 3 &&
+                        e0 - s0 > me - ms) { ms = s0; me = e0; mo = (off_t) off0; }
+                }
+                std::fclose(mp);
+            }
+            if (slot > 0 && me > ms &&
+                g_host.init((size_t) (want_gb * 1073741824.0), slot, pack + "/experts.bin", ms, me, mo)) {
+                const char* drop = std::getenv("STRATA_GLM_HOST_DROP_CACHE");
+                g_host.set_drop_page_cache(drop && std::strcmp(drop, "0") != 0);
+                std::printf("Host RAM tier: %zu slots of %.1f MB (%.1f GB of anonymous memory)\n", g_host.slots(),
+                            (double) g_host.slot_bytes() / 1048576.0,
+                            (double) (g_host.slots() * g_host.slot_bytes()) / 1073741824.0);
+            } else
+                std::printf("Host RAM tier: unavailable (slot %zu, mapping %s); computing from the mmap\n", slot,
+                            me > ms ? "found" : "not found");
+            std::fflush(stdout);
+        }
+    }
     C::glm::glm_set_device_expert_ffn(&run_cached_device_expert, &expert_device_runtime);
     C::glm::glm_set_device_moe_ffn(&run_cached_device_moe, &expert_device_runtime);
+    C::glm::glm_set_device_moe_batch_ffn(&run_cached_device_moe_batch, &expert_device_runtime);
     const char* kda_cuda_env = std::getenv("STRATA_GLM_KDA_CUDA");
     const bool kda_cuda = !kda_cuda_env || std::strcmp(kda_cuda_env,"0") != 0;
     K::kda_set_device_recurrence(kda_cuda);
@@ -638,6 +1304,9 @@ int main(int argc, char** argv) {
     const char* kda_gates_env = std::getenv("STRATA_GLM_KDA_GATES");
     const bool kda_gates_cuda = !kda_gates_env || std::strcmp(kda_gates_env,"0") != 0;
     K::kda_set_device_gates(kda_gates_cuda);
+    // Serve mode only: the resident KDA state stays on the device between calls (reset_state invalidates it).
+    const char* kda_lazy_env = std::getenv("STRATA_GLM_KDA_LAZY_STATE");
+    K::kda_set_lazy_state(serve && kda_cuda && (!kda_lazy_env || std::strcmp(kda_lazy_env,"0") != 0));
     std::printf("KDA gates: %s\n",kda_gates_cuda?"CUDA":"host");
     const char* mla_cuda_env = std::getenv("STRATA_GLM_MLA_CUDA");
     const bool mla_cuda = !mla_cuda_env || std::strcmp(mla_cuda_env,"0") != 0;
@@ -856,20 +1525,41 @@ int main(int argc, char** argv) {
                   cudaStreamCreateWithFlags(&head_stream, cudaStreamNonBlocking) != cudaSuccess)) {
         std::fprintf(stderr, "embedding/head scratch allocation failed\n"); return 1;
     }
+    // Prompt embeddings do not depend on trunk state. Gather them in small batches so a prompt
+    // pays one launch/sync/copy per 128 tokens instead of one per token. The trunk itself remains
+    // sequential because KDA recurrence and MLA cache updates are causal.
+    constexpr int EMBED_BATCH = 256;
+    const size_t trunk_row = (size_t) HC * N_EMBD;
+    int32_t* d_prompt_tokens = nullptr;
+    float* d_prompt_embeds = nullptr;
+    bool prompt_batch_embed = false;
+    std::vector<int32_t> prompt_token_ids(EMBED_BATCH);
+    std::vector<float> prompt_embed_rows((size_t) EMBED_BATCH * N_EMBD);
+    std::vector<float> prompt_inputs((size_t) EMBED_BATCH * trunk_row);
+    std::vector<float> prompt_outputs((size_t) EMBED_BATCH * trunk_row);
+    if (serve && head_cuda &&
+        cudaMalloc(&d_prompt_tokens, (size_t) EMBED_BATCH * sizeof(int32_t)) == cudaSuccess &&
+        cudaMalloc(&d_prompt_embeds, (size_t) EMBED_BATCH * N_EMBD * sizeof(float)) == cudaSuccess) {
+        prompt_batch_embed = true;
+    } else {
+        if (d_prompt_tokens) cudaFree(d_prompt_tokens);
+        if (d_prompt_embeds) cudaFree(d_prompt_embeds);
+        d_prompt_tokens = nullptr;
+        d_prompt_embeds = nullptr;
+        cudaGetLastError();  // the scalar gather remains a valid fallback if this optional scratch did not fit
+    }
     auto reset_state = [&]() {
         for (auto& v : kda_state) std::fill(v.begin(), v.end(), 0.0f);
+        K::kda_invalidate_state();
         for (auto& v : kda_conv) std::fill(v.begin(), v.end(), 0.0f);
         for (auto& v : mla_cache) std::fill(v.begin(), v.end(), 0.0f);
         for (int i = 0; i < N_LAYERS; ++i) mla_len[i] = 0;
     };
-    auto run_x = [&](const float* in, int pos, bool diagnostic, int& best, float& best_logit) -> bool {
-        StageCount sc; sc.token = pos;
-        if (!C::glm::glm_trunk_forward(in, N_LAYERS, provider, &P, P.kda_g, P.mla_g, EPS, st, l_out.data(), nullptr,
-                                       err, 0, diagnostic ? &stage_cb : nullptr, diagnostic ? &sc : nullptr)) return false;
-        if (!C::glm::glm_stage_head_mean_norm(l_out.data(), HC, N_EMBD, onorm.data(), hidden.data(), err)) return false;
+    auto run_head = [&](const float* trunk_out, int& best, float& best_logit) -> bool {
+        if (!C::glm::glm_stage_head_mean_norm(trunk_out, HC, N_EMBD, onorm.data(), hidden.data(), err)) return false;
         if (!head_cuda)
-            return C::glm::glm_stage_head_project(output_w.data(), (int) vocab, N_EMBD, hidden.data(), best, best_logit,
-                                                  err);
+            return C::glm::glm_stage_head_project(output_w.data(), (int) vocab, N_EMBD, hidden.data(), best,
+                                                  best_logit, err);
         if (cudaMemcpyAsync(d_hidden, hidden.data(), (size_t) N_EMBD * sizeof(float), cudaMemcpyHostToDevice,
                             head_stream) != cudaSuccess ||
             !native_head.run(d_hidden, d_logits, (void*) head_stream, err) ||
@@ -881,6 +1571,15 @@ int main(int argc, char** argv) {
         best = (int) std::distance(logits.begin(), std::max_element(logits.begin(), logits.end()));
         best_logit = logits[(size_t) best];
         return true;
+    };
+    auto run_x = [&](const float* in, int pos, bool diagnostic, bool need_logits, int& best, float& best_logit) -> bool {
+        StageCount sc; sc.token = pos;
+        if (!C::glm::glm_trunk_forward(in, N_LAYERS, provider, &P, P.kda_g, P.mla_g, EPS, st, l_out.data(), nullptr,
+                                       err, 0, diagnostic ? &stage_cb : nullptr, diagnostic ? &sc : nullptr)) return false;
+        // During prompt prefill only the final position's logits are consumed.  Projecting the full
+        // vocabulary at every earlier position adds a large redundant head pass and device sync.
+        if (!need_logits) return true;
+        return run_head(l_out.data(), best, best_logit);
     };
     auto embed = [&](int64_t tok) -> bool {
         if (tok < 0 || tok >= vocab) { err = "token outside vocabulary"; return false; }
@@ -907,25 +1606,71 @@ int main(int argc, char** argv) {
             if (max_new < 1 || ids.empty() || ids.size() + (size_t) max_new > (size_t) cache_cells) {
                 std::printf("ERR invalid request or context too long\n"); std::fflush(stdout); continue;
             }
+            bool ids_valid = true;
+            for (int64_t tok : ids) if (tok < 0 || tok >= vocab) { ids_valid = false; break; }
+            if (!ids_valid) { std::printf("ERR token outside vocabulary\n"); std::fflush(stdout); continue; }
             reset_state(); int best = -1; float logit = 0.0f; bool ok = true; int pos = 0;
-            for (int64_t tok : ids) {
-                if (!embed(tok) || !run_x(x.data(), pos++, false, best, logit)) { ok = false; break; }
+            for (size_t begin = 0; begin < ids.size() && ok; begin += EMBED_BATCH) {
+                const int count = (int) std::min((size_t) EMBED_BATCH, ids.size() - begin);
+                const float* gathered = nullptr;
+                if (prompt_batch_embed) {
+                    for (int i = 0; i < count; ++i) prompt_token_ids[(size_t) i] = (int32_t) ids[begin + (size_t) i];
+                    if (cudaMemcpy(d_prompt_tokens, prompt_token_ids.data(), (size_t) count * sizeof(int32_t),
+                                   cudaMemcpyHostToDevice) != cudaSuccess) {
+                        err = "prompt token batch upload failed"; ok = false; break;
+                    }
+                    native_embed.gather_dev(d_prompt_tokens, count, d_prompt_embeds, nullptr);
+                    if (cudaDeviceSynchronize() != cudaSuccess ||
+                        cudaMemcpy(prompt_embed_rows.data(), d_prompt_embeds,
+                                   (size_t) count * N_EMBD * sizeof(float), cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        err = "prompt embedding batch gather failed"; ok = false; break;
+                    }
+                    gathered = prompt_embed_rows.data();
+                }
+                for (int i = 0; i < count; ++i) {
+                    const int64_t tok = ids[begin + (size_t) i];
+                    if (gathered) {
+                        std::memcpy(x.data(), gathered + (size_t) i * N_EMBD, (size_t) N_EMBD * sizeof(float));
+                        for (int h = 1; h < HC; ++h)
+                            std::memcpy(x.data() + (size_t) h * N_EMBD, x.data(), (size_t) N_EMBD * sizeof(float));
+                    } else if (!embed(tok)) { ok = false; break; }
+                    std::memcpy(prompt_inputs.data() + (size_t) i * trunk_row, x.data(), trunk_row * sizeof(float));
+                }
+                if (!ok) break;
+                if (!C::glm::glm_trunk_forward_batch(prompt_inputs.data(), count, N_LAYERS, provider, &P, P.kda_g,
+                                                     P.mla_g, EPS, st, prompt_outputs.data(), nullptr, err)) {
+                    ok = false; break;
+                }
+                pos += count;
+                if (begin + (size_t) count == ids.size() &&
+                    !run_head(prompt_outputs.data() + (size_t) (count - 1) * trunk_row, best, logit)) ok = false;
             }
             long produced = 0;
             while (ok && produced < max_new) {
                 std::printf("T %d\n", best); std::fflush(stdout); ++produced;
                 if (best == 154820 || best == 154827 || produced == max_new) break;
-                if (!embed(best) || !run_x(x.data(), pos++, false, best, logit)) ok = false;
+                if (!embed(best) || !run_x(x.data(), pos++, false, true, best, logit)) ok = false;
             }
+            if (std::getenv("STRATA_GLM_TIMING"))
+                std::fprintf(stderr, "CPU tier ms (cumulative): populate %.0f  gate/up %.0f  quant %.0f  down %.0f  gpu-wait %.0f  promote %.0f  lookup %.0f  fill-thread-sum %.0f | cpu evals %ld gpu evals %ld promoted %ld | host hits %ld fills %ld\n",
+                             g_cpu_ms[0], g_cpu_ms[1], g_cpu_ms[2], g_cpu_ms[3], g_cpu_ms[4], g_cpu_ms[5], g_cpu_ms[6],
+                             (double) g_fill_ns.load() / 1e6, g_cpu_experts, g_gpu_experts, g_promoted, g_host_hits, g_host_fills);
             if (ok) std::printf("DONE %ld %zu\n", produced, ids.size());
             else std::printf("ERR %s\n", err.c_str());
             std::fflush(stdout);
         }
         cudaFree(d_embed);
+        cudaFree(d_prompt_tokens);
+        cudaFree(d_prompt_embeds);
         cudaFree(d_hidden);
         cudaFree(d_logits);
         cudaStreamDestroy(head_stream);
         std::fprintf(stderr, "%s\n", expert_device_runtime.cache.report().c_str());
+        std::fprintf(stderr, "CPU tier: %ld expert evaluations on the CPU, %ld on the GPU, %ld rows promoted\n",
+                     g_cpu_experts, g_gpu_experts, g_promoted);
+        std::fprintf(stderr, "CPU tier ms: fill/populate %.0f  gate/up %.0f  quant %.0f  down %.0f  gpu-wait %.0f  promote %.0f\n",
+                     g_cpu_ms[0], g_cpu_ms[1], g_cpu_ms[2], g_cpu_ms[3], g_cpu_ms[4], g_cpu_ms[5]);
+        std::fprintf(stderr, "Host RAM tier: %ld hits, %ld fills\n", g_host_hits, g_host_fills);
         return 0;
     }
 
@@ -935,10 +1680,12 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "cannot read compatible hc_init from %s\n", in_path.c_str()); return 1;
     }
     reset_state(); int best = -1; float best_logit = 0.0f;
-    for (int t = 0; t < TOKENS; ++t)
-        if (!run_x(inp.data() + (size_t) t * N_EMBD * HC, t, true, best, best_logit)) {
-            std::fprintf(stderr, "trunk failed at token %d: %s\n", t, err.c_str()); return 1;
-        }
+    std::vector<float> batch_out(inp.size());
+    if (!C::glm::glm_trunk_forward_batch(inp.data(), TOKENS, N_LAYERS, provider, &P, P.kda_g, P.mla_g, EPS, st,
+                                         batch_out.data(), nullptr, err) ||
+        !run_head(batch_out.data() + (size_t) (TOKENS - 1) * trunk_row, best, best_logit)) {
+        std::fprintf(stderr, "batched trunk failed: %s\n", err.c_str()); return 1;
+    }
     {
         double total = 0.0, stem = 0.0, kda_ms = 0.0, mla_ms = 0.0;
         for (const std::pair<const int, double>& kv : g_prof.ms) {

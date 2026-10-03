@@ -20,6 +20,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 
 #include <cstdint>
+#include <cstddef>
 #include <string>
 
 namespace strata {
@@ -39,6 +40,17 @@ struct GlmExpertDeviceScratch {
     float* up = nullptr;        ///< n_ff floats
     float* out = nullptr;       ///< n_embd floats, one expert result
     float* accum = nullptr;     ///< n_embd floats, weighted layer result
+    void* batch_xq = nullptr;   ///< up to 8 q8_1 activation rows
+    void* batch_hq = nullptr;   ///< up to 8 q8_1 hidden rows
+    float* batch_x = nullptr;  ///< [8][n_embd]
+    float* batch_h = nullptr;  ///< [8][n_ff]
+    float* batch_gate = nullptr;
+    float* batch_up = nullptr;
+    float* batch_out = nullptr; ///< [8][n_embd]
+    float* batch_accum = nullptr; ///< [8][n_embd]
+    float* batch_route_out = nullptr; ///< [tokens][n_used][n_embd], preserve router accumulation order
+    float* batch_weights = nullptr;
+    size_t batch_accum_bytes = 0, batch_route_out_bytes = 0, batch_weights_bytes = 0;
     void* stream = nullptr;     ///< cudaStream_t
     int64_t n_embd = 0, n_ff = 0;
 
@@ -74,6 +86,15 @@ bool glm_expert_moe_device_resident(const uint8_t* const* rows_device, const flo
                                    const kernels::NativeExpertLayout& layout, int gu_type, int d_type,
                                    int64_t n_embd, int64_t n_ff, const float* x_host, float* out_host,
                                    GlmExpertDeviceScratch& scratch, std::string& err);
+
+/// Batched MoE for up to 128 token rows. `route_slot[t*n_used+k]` selects a row from `rows_device`, and
+/// `weights` contains the corresponding router weights. Each resident expert is evaluated once for all token
+/// rows that selected it, then combined back into the per-token output rows.
+bool glm_expert_moe_device_batch_resident(const uint8_t* const* rows_device, int n_unique,
+                                          const int32_t* route_slot, const float* weights, int tokens, int n_used,
+                                          const kernels::NativeExpertLayout& layout, int gu_type, int d_type,
+                                          int64_t n_embd, int64_t n_ff, const float* x_host, float* out_host,
+                                          GlmExpertDeviceScratch& scratch, std::string& err);
 
 }  // namespace core
 }  // namespace strata

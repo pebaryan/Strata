@@ -52,6 +52,9 @@ void scale_inplace(float* x, int64_t n, float s, void* stream);
 void add_inplace(float* dst, const float* src, int64_t n, void* stream);
 /// dst[i] += scale * src[i], asynchronously on the supplied stream.
 void scaled_add_inplace(float* dst, const float* src, int64_t n, float scale, void* stream);
+/// `out[t,j]` is the route-rank-ordered weighted sum of route rows, equivalent to repeated scaled_add_inplace calls.
+void weighted_routes(const float* route_out, const float* weights, float* out, int64_t n_embd,
+                     int64_t n_tokens, int n_used, void* stream);
 
 /// `y[i] = f16(x[i])`, round-to-nearest-even, using the shared conversion in `f16_bits.hpp`.
 void f32_to_f16_bulk(const float* x, uint16_t* y, int64_t n, void* stream);

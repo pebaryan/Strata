@@ -58,7 +58,7 @@ struct KdaWeights {
     int wq_type = 0, wk_type = 0, wv_type = 0, wo_type = 0; ///< native device-block GGML types, or zero
 };
 
-using KdaNativeProjectFn = bool (*)(int count, const void* const* weights, const int* types,
+using KdaNativeProjectFn = bool (*)(int count, const void* const* weights, const int* types, int tokens,
                                     const float* x, int n_in, int n_out, float* const* out);
 void kda_set_native_project(KdaNativeProjectFn fn);
 
@@ -72,6 +72,10 @@ bool kda_gates_cuda(const float* xn, const float* ssm_f_a, const float* ssm_f_b,
                     const float* ssm_a, const float* dt_bias, int tokens, int n_embd, int nh, int hd,
                     float* g, float* beta, char* error, size_t error_capacity);
 void kda_set_device_gates(bool enabled);
+/// Serve mode: keep the recurrence state on the device and skip the per-call host compare/readback.  The host state
+/// buffer is then stale; call kda_invalidate_state() after zeroing/restoring it so the next call re-uploads it.
+void kda_set_lazy_state(bool enabled);
+void kda_invalidate_state();
 
 /// Print the KDA stage's host-time breakdown, phase by phase.  Diagnostics only.
 void kda_print_profile();

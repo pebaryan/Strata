@@ -46,6 +46,10 @@ bool mla_attention_cuda(const float*,const float*,int,int,int,int,float*,char* e
     if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
     return false;
 }
+bool mla_head_matvec_cuda(const float*,const float*,int,int,int,float*,char* error,size_t error_capacity) {
+    if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return false;
+}
 #endif
 
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
@@ -92,7 +96,13 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
 
     // Qcur[h] = wk_b[h]^T (kv_lora x head_dim) @ q[h]
     std::vector<float> qcur((size_t) n_head * kv_lora, 0.0f);
-    for (int h = 0; h < n_head; ++h) {
+    bool absorb_done = false;
+    if (g_device_attention) {
+        char cuda_err[256] = {};
+        absorb_done = mla_head_matvec_cuda(w.wk_b, q.data(), n_head, kv_lora, head_dim, qcur.data(), cuda_err, sizeof(cuda_err));
+        if (!absorb_done) std::fprintf(stderr, "GLM MLA CUDA K absorption unavailable: %s; using host\n", cuda_err);
+    }
+    for (int h = 0; !absorb_done && h < n_head; ++h) {
         const float* m = w.wk_b + (size_t) h * kv_lora * head_dim;
         const float* qh = q.data() + (size_t) h * head_dim;
         float* Qh = qcur.data() + (size_t) h * kv_lora;
@@ -160,7 +170,13 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
             }
         }
     }
-    for (int h = 0; h < n_head; ++h) {
+    bool unabsorb_done = false;
+    if (g_device_attention) {
+        char cuda_err[256] = {};
+        unabsorb_done = mla_head_matvec_cuda(w.wv_b, attn.data(), n_head, head_dim, kv_lora, v.data(), cuda_err, sizeof(cuda_err));
+        if (!unabsorb_done) std::fprintf(stderr, "GLM MLA CUDA V un-absorption unavailable: %s; using host\n", cuda_err);
+    }
+    for (int h = 0; !unabsorb_done && h < n_head; ++h) {
         const float* Ah = attn.data() + (size_t) h * kv_lora;
         // v[h] = wv_b[h] (head_dim x kv_lora) @ attn[h]
         const float* m = w.wv_b + (size_t) h * head_dim * kv_lora;

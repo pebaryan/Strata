@@ -7,6 +7,7 @@
 #include "strata/core/glm_moe_native.hpp"
 
 #include <string>
+#include <map>
 #include <vector>
 
 #include "strata/kernels/glm_moe.hpp"
@@ -17,18 +18,25 @@ namespace strata::core::glm {
 
 namespace {
 GlmNativeFfnFn g_native_ffn = nullptr;
+GlmNativeFfnBatchFn g_native_ffn_batch = nullptr;
 GlmDeviceExpertFfnFn g_device_expert_ffn = nullptr;
 GlmDeviceMoeFfnFn g_device_moe_ffn = nullptr;
+GlmDeviceMoeBatchFfnFn g_device_moe_batch_ffn = nullptr;
 void* g_device_moe_ctx = nullptr;
 void* g_device_expert_ctx = nullptr;
 }
 void glm_set_native_ffn(GlmNativeFfnFn fn) { g_native_ffn = fn; }
+void glm_set_native_ffn_batch(GlmNativeFfnBatchFn fn) { g_native_ffn_batch = fn; }
 void glm_set_device_expert_ffn(GlmDeviceExpertFfnFn fn, void* ctx) {
     g_device_expert_ffn = fn;
     g_device_expert_ctx = ctx;
 }
 void glm_set_device_moe_ffn(GlmDeviceMoeFfnFn fn, void* ctx) {
     g_device_moe_ffn = fn;
+    g_device_moe_ctx = ctx;
+}
+void glm_set_device_moe_batch_ffn(GlmDeviceMoeBatchFfnFn fn, void* ctx) {
+    g_device_moe_batch_ffn = fn;
     g_device_moe_ctx = ctx;
 }
 
@@ -158,6 +166,100 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
             kernels::glm::expert_ffn(shared[0], shared[1], shared[2], *shexp_g, xn, shr.data(), shexp_clamp);
         }
         for (int j = 0; j < g.n_embd; ++j) out[j] += shr[j];
+    }
+    return true;
+}
+bool glm_try_native_ffn_batch(const void* const* weights, const int* types, const kernels::glm::MoeGeometry& g,
+                              int tokens, const float* x, float* out, float clamp_limit) {
+    if (g_native_ffn_batch == nullptr || types == nullptr || weights == nullptr || tokens <= 0) return false;
+    if (!types[0] || !types[1] || !types[2]) return false;
+    return g_native_ffn_batch(weights, types, g, tokens, x, out, clamp_limit);
+}
+
+bool glm_stage_moe_native_batch(const float* xn, int tokens, const float* router, const float* probs_b,
+                                const kernels::glm::MoeGeometry& g, int layer,
+                                const kernels::cpu::NativeFmt& fmt,
+                                const uint8_t* (*blob_fn)(void*, int, int), void* blob_ctx,
+                                const kernels::glm::MoeGeometry* shexp_g, const float* const* shared,
+                                const int* shared_types, float shexp_clamp,
+                                float* out, std::string& err) {
+    if (!xn || !router || !out || !blob_fn || tokens <= 0 || g.n_used <= 0 || g.n_used > 64 ||
+        g.n_embd <= 0 || g.n_expert <= 0) {
+        err = "glm_stage_moe_native_batch: invalid input or geometry";
+        return false;
+    }
+    // Keep an exact fallback for any build/model without the measured batched device expert path.
+    if (!g_device_moe_batch_ffn || !glm_expert_layer_supported(fmt.gu_type, fmt.d_type)) {
+        for (int t = 0; t < tokens; ++t)
+            if (!glm_stage_moe_native(xn + (size_t) t * g.n_embd, router, probs_b, g, layer, fmt, blob_fn,
+                                      blob_ctx, shexp_g, shared, shared_types, shexp_clamp,
+                                      out + (size_t) t * g.n_embd, err)) return false;
+        return true;
+    }
+
+    const int n_used = g.n_used;
+    std::vector<int32_t> route_slot((size_t) tokens * n_used);
+    std::vector<float> weights((size_t) tokens * n_used);
+    std::map<int32_t, int32_t> unique_index;
+    std::vector<int32_t> unique_experts;
+    for (int t = 0; t < tokens; ++t) {
+        int32_t ids[64];
+        float row_weights[64];
+        kernels::glm::moe_route(router, probs_b, g, xn + (size_t) t * g.n_embd, ids, row_weights);
+        for (int k = 0; k < n_used; ++k) {
+            auto it = unique_index.find(ids[k]);
+            if (it == unique_index.end()) {
+                const int32_t slot = (int32_t) unique_experts.size();
+                unique_index.emplace(ids[k], slot);
+                unique_experts.push_back(ids[k]);
+                route_slot[(size_t) t * n_used + k] = slot;
+            } else {
+                route_slot[(size_t) t * n_used + k] = it->second;
+            }
+            weights[(size_t) t * n_used + k] = row_weights[k];
+        }
+    }
+    std::vector<const uint8_t*> blobs(unique_experts.size());
+    for (size_t u = 0; u < unique_experts.size(); ++u) {
+        blobs[u] = blob_fn(blob_ctx, layer, unique_experts[u]);
+        if (!blobs[u]) {
+            err = "glm_stage_moe_native_batch: no blob for selected expert " + std::to_string(unique_experts[u]);
+            return false;
+        }
+    }
+    if (!g_device_moe_batch_ffn(g_device_moe_ctx, layer, (int) unique_experts.size(), unique_experts.data(),
+                                blobs.data(), tokens, n_used, route_slot.data(), weights.data(), fmt, xn, out, err)) {
+        if (err.empty()) err = "glm_stage_moe_native_batch: batched device MoE failed";
+        return false;
+    }
+    // The shared expert is unweighted, just like the single-token path. Its dense projections still use the
+    // validated single-row MMVQ adapter; routed experts above are now grouped across tokens.
+    if (shared && shared[0] && shared[1] && shared[2] && shexp_g) {
+        std::vector<float> shr((size_t) tokens * g.n_embd);
+        bool batched_shared = false;
+        if (shared_types && shared_types[0] && shared_types[1] && shared_types[2] && g_native_ffn_batch) {
+            const void* nw[3] = {shared[0], shared[1], shared[2]};
+            batched_shared = g_native_ffn_batch(nw, shared_types, *shexp_g, tokens, xn, shr.data(), shexp_clamp);
+        }
+        if (!batched_shared) {
+            std::vector<float> one((size_t) g.n_embd);
+            for (int t = 0; t < tokens; ++t) {
+                const float* x = xn + (size_t) t * g.n_embd;
+                bool ok = false;
+                if (shared_types && shared_types[0] && shared_types[1] && shared_types[2] && g_native_ffn) {
+                    const void* nw[3] = {shared[0], shared[1], shared[2]};
+                    ok = g_native_ffn(nw, shared_types, *shexp_g, x, one.data(), shexp_clamp);
+                } else {
+                    kernels::glm::expert_ffn(shared[0], shared[1], shared[2], *shexp_g, x, one.data(), shexp_clamp);
+                    ok = true;
+                }
+                if (!ok) { err = "glm_stage_moe_native_batch: shared expert failed"; return false; }
+                std::copy(one.begin(), one.end(), shr.begin() + (size_t) t * g.n_embd);
+            }
+        }
+        for (int t = 0; t < tokens; ++t)
+            for (int j = 0; j < g.n_embd; ++j)
+                out[(size_t) t * g.n_embd + j] += shr[(size_t) t * g.n_embd + j];
     }
     return true;
 }
