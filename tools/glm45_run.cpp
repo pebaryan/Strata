@@ -1629,6 +1629,8 @@ int main(int argc, char** argv) {
     {
         const char* kb = std::getenv("STRATA_GLM_KDA_BLOCK");
         K::kda_set_device_block(serve && (!kb || std::strcmp(kb, "0") != 0));
+        const char* mb2 = std::getenv("STRATA_GLM_MLA_BLOCK");
+        K::mla_set_device_block(serve && (!mb2 || std::strcmp(mb2, "0") != 0));
     }
     std::printf("KDA gates: %s\n",kda_gates_cuda?"CUDA":"host");
     const char* mla_cuda_env = std::getenv("STRATA_GLM_MLA_CUDA");

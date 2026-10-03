@@ -94,6 +94,15 @@ bool mla_attend_batch_cuda(const float* wk_b, const float* wv_b, const float* q,
 /// beyond 8192 positions, a device failure) - the caller then runs mla_forward token by token.
 bool mla_forward_batch(const MlaWeights& w, const MlaGeometry& g, const float* x, int T, int c0, float* cache, float* out);
 
+/// Serve-mode decode: one token through the whole MLA layer on the device - q_a, norm, q_b, absorb, kv_a, norm, append to the
+/// resident latent cache, causal attention, un-absorb, wo - with one upload and one download (plus the new latent row, so the
+/// host cache stays complete).  Needs native projection types.  STRATA_GLM_MLA_BLOCK=0 turns it off in the runner.
+void mla_set_device_block(bool enabled);
+/// 1 = done; 0 = declined with nothing touched (the host path must run); -1 = failed after work began.
+/// `x` is the attn-normed input, `kv_row_host` receives the new latent row (cache row n_cache-1).
+int mla_block_decode_cuda(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
+                          float* kv_row_host, float* out, char* error, size_t error_capacity);
+
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
                  float* out, const MlaIntermediates& want = {});
 

@@ -1,4 +1,6 @@
 #include <cuda_runtime.h>
+#include "strata/kernels/glm_mla.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 #include <cmath>
 #include <cstdio>
 #include <mutex>
@@ -280,5 +282,134 @@ bool mla_attend_batch_cuda(const float* wk_b,const float* wv_b,const float* q,co
     if((e=cudaMemcpy(v_out,b.v,(size_t)S*q_dim*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)return fail(cudaGetErrorString(e));
     if(error&&error_capacity)error[0]='\0';
     return true;
+}
+
+// ---- the device-resident single-token MLA block (decode) ---------------------------------------------------------------
+//
+// One upload of the layer input, one download of its output (and of the new latent row, so the host cache stays complete):
+// q_a -> norm -> q_b -> absorb, kv_a -> norm -> append to the resident latent cache, causal attention, un-absorb, wo - all on
+// one stream.  The host path is ~7 synchronous round trips for the same work.
+
+namespace {
+__device__ __forceinline__ double mla_block_sum(double v,double* red){
+    for(int o=16;o>0;o>>=1)v+=__shfl_down_sync(0xffffffffu,v,o);
+    const int lane=threadIdx.x&31,warp=threadIdx.x>>5;
+    if(lane==0)red[warp]=v;
+    __syncthreads();
+    double total=0.0;
+    if(threadIdx.x==0){for(int w=0;w<(int)(blockDim.x>>5);++w)total+=red[w];red[0]=total;}
+    __syncthreads();
+    total=red[0];
+    __syncthreads();
+    return total;
+}
+// y = rms_norm(x) * w (double accumulation like the host)
+__global__ void mla_rmsnorm1(const float* x,const float* w,float* y,int n,float eps){
+    __shared__ double red[32];
+    double acc=0.0;
+    for(int i=threadIdx.x;i<n;i+=blockDim.x)acc+=(double)x[i]*(double)x[i];
+    const double ss=mla_block_sum(acc,red);
+    const float inv=1.0f/sqrtf((float)(ss/n)+eps);
+    for(int i=threadIdx.x;i<n;i+=blockDim.x)y[i]=x[i]*inv*w[i];
+}
+
+struct DecodeScratch{
+    int n_embd=0,q_lora=0,q_dim=0,lat=0,kv_lora=0;
+    float *x=nullptr,*qr=nullptr,*q=nullptr,*kv=nullptr,*qcur=nullptr,*attn=nullptr,*v=nullptr,*out=nullptr;
+    void *xq=nullptr,*qrq=nullptr,*vq=nullptr;
+    cudaStream_t stream=nullptr;
+    ~DecodeScratch(){release();if(stream)cudaStreamDestroy(stream);}
+    void release(){
+        float** all[]={&x,&qr,&q,&kv,&qcur,&attn,&v,&out};
+        for(float** p:all){if(*p)cudaFree(*p);*p=nullptr;}
+        if(xq)cudaFree(xq);if(qrq)cudaFree(qrq);if(vq)cudaFree(vq);
+        xq=qrq=vq=nullptr;n_embd=0;
+    }
+    bool alloc(const MlaGeometry& g){
+        const int qd=g.n_head*g.head_dim,lt=g.n_head*g.kv_lora;
+        if(n_embd==g.n_embd&&q_lora==g.q_lora&&q_dim==qd&&lat==lt&&kv_lora==g.kv_lora&&x)return true;
+        release();
+        auto mk=[&](float*& p,size_t n){return cudaMalloc(&p,n*sizeof(float))==cudaSuccess;};
+        if(!mk(x,g.n_embd)||!mk(qr,g.q_lora)||!mk(q,qd)||!mk(kv,g.kv_lora)||!mk(qcur,lt)||!mk(attn,lt)||!mk(v,qd)||!mk(out,g.n_embd)){release();return false;}
+        if(cudaMalloc(&xq,strata::kernels::native_q8_1_bytes(g.n_embd,1))!=cudaSuccess||
+           cudaMalloc(&qrq,strata::kernels::native_q8_1_bytes(g.q_lora,1))!=cudaSuccess||
+           cudaMalloc(&vq,strata::kernels::native_q8_1_bytes(qd,1))!=cudaSuccess){release();return false;}
+        if(!stream&&cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking)!=cudaSuccess){release();return false;}
+        n_embd=g.n_embd;q_lora=g.q_lora;q_dim=qd;lat=lt;kv_lora=g.kv_lora;
+        return true;
+    }
+};
+DecodeScratch& decode_scratch(){static DecodeScratch d;return d;}
+}  // namespace
+
+// 1 done; 0 declined (nothing touched: the host path must run); -1 failed after work began.
+int mla_block_decode_cuda(const MlaWeights& w,const MlaGeometry& g,const float* x_host,int n_cache,const float* cache_host,
+                          float* kv_row_host,float* out_host,char* error,size_t error_capacity){
+    auto decline=[&](const char* msg){if(error&&error_capacity)std::snprintf(error,error_capacity,"%s",msg);return 0;};
+    auto fail=[&](const char* msg){if(error&&error_capacity)std::snprintf(error,error_capacity,"%s",msg);return -1;};
+    using namespace strata::kernels;
+    if(!x_host||!cache_host||!kv_row_host||!out_host||n_cache<1||n_cache>8192)return decline("arguments or context out of range");
+    if(!w.wq_a_type||!w.wq_b_type||!w.kv_a_type||!w.wo_type||!native_mmvq_supported(w.wq_a_type)||
+       !native_mmvq_supported(w.wq_b_type)||!native_mmvq_supported(w.kv_a_type)||!native_mmvq_supported(w.wo_type))
+        return decline("projection types not native");
+    const int ne=g.n_embd,kvl=g.kv_lora,ql=g.q_lora,nh=g.n_head,hdim=g.head_dim,qd=nh*hdim;
+    if(kvl>512||kvl%32||ql%32||ne%32||qd%32||ne>16384||qd>16384)return decline("unsupported geometry");
+    float* dk=resident_head_weights(w.wk_b,(size_t)nh*kvl*hdim);
+    float* dv=resident_head_weights(w.wv_b,(size_t)nh*hdim*kvl);
+    float* dqn=resident_head_weights(w.q_a_norm,(size_t)ql);
+    float* dkn=resident_head_weights(w.kv_a_norm,(size_t)kvl);
+    if(!dk||!dv||!dqn||!dkn)return decline("weight upload failed");
+    Scratch& s=scratch();std::lock_guard<std::mutex> lock(s.mutex);
+    DecodeScratch& d=decode_scratch();
+    if(!d.alloc(g))return decline("scratch allocation failed");
+    // the device latent cache: rows [0, n_cache-1) must already be there; this block appends the new row
+    const size_t cn=(size_t)n_cache*kvl;
+    auto it=s.resident_caches.find(cache_host);
+    bool full=false;
+    if(it==s.resident_caches.end()){
+        Scratch::ResidentCache entry;size_t cap=1;while(cap<cn)cap*=2;
+        if(cudaMalloc(&entry.device,cap*sizeof(float))!=cudaSuccess)return decline("latent cache allocation failed");
+        entry.capacity=cap;entry.last_n=0;
+        it=s.resident_caches.emplace(cache_host,entry).first;
+        full=true;
+    }else if(cn>it->second.capacity){
+        size_t cap=it->second.capacity?it->second.capacity:1;while(cap<cn)cap*=2;
+        float* grown=nullptr;
+        if(cudaMalloc(&grown,cap*sizeof(float))!=cudaSuccess)return decline("latent cache growth failed");
+        cudaFree(it->second.device);it->second.device=grown;it->second.capacity=cap;
+        full=true;
+    }else if(it->second.last_n!=n_cache-1){
+        full=true;   // a reset, or a depth that does not follow on: the host cache is authoritative
+    }
+    cudaError_t e=cudaSuccess;
+    if(full&&n_cache>1)e=cudaMemcpy(it->second.device,cache_host,(size_t)(n_cache-1)*kvl*sizeof(float),cudaMemcpyHostToDevice);
+    if(e!=cudaSuccess)return decline(cudaGetErrorString(e));
+    it->second.last_n=n_cache;           // from here the device cache holds this position too
+    float* cache_dev=it->second.device;
+
+    cudaStream_t st=d.stream;void* sv=(void*)st;
+    e=cudaMemcpyAsync(d.x,x_host,(size_t)ne*sizeof(float),cudaMemcpyHostToDevice,st);
+    if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
+    native_quantize_q8_1(d.x,d.xq,ne,1,sv);
+    native_mmvq(w.wq_a_type,w.wq_a,d.xq,d.qr,ne,ql,1,sv);
+    mla_rmsnorm1<<<1,512,0,st>>>(d.qr,dqn,d.qr,ql,MLA_RMS_EPS);
+    native_quantize_q8_1(d.qr,d.qrq,ql,1,sv);
+    native_mmvq(w.wq_b_type,w.wq_b,d.qrq,d.q,ql,qd,1,sv);
+    native_mmvq(w.kv_a_type,w.kv_a,d.xq,d.kv,ne,kvl,1,sv);
+    mla_rmsnorm1<<<1,512,0,st>>>(d.kv,dkn,d.kv,kvl,MLA_RMS_EPS);
+    cudaMemcpyAsync(cache_dev+(size_t)(n_cache-1)*kvl,d.kv,(size_t)kvl*sizeof(float),cudaMemcpyDeviceToDevice,st);
+    cudaMemcpyAsync(kv_row_host,d.kv,(size_t)kvl*sizeof(float),cudaMemcpyDeviceToHost,st);
+    const size_t tot_k=(size_t)nh*kvl,tot_v=(size_t)nh*hdim;
+    mla_head_matvec_tokens<<<(unsigned)((tot_k+7)/8),256,0,st>>>(dk,d.q,d.qcur,kvl,hdim,nh,tot_k);
+    mla_latent_attention_batch<<<dim3(1,(unsigned)nh),256,(size_t)n_cache*sizeof(float),st>>>(
+        d.qcur,cache_dev,n_cache-1,kvl,1.0f/std::sqrt((float)hdim),d.attn);
+    mla_head_matvec_tokens<<<(unsigned)((tot_v+7)/8),256,0,st>>>(dv,d.attn,d.v,hdim,kvl,nh,tot_v);
+    native_quantize_q8_1(d.v,d.vq,qd,1,sv);
+    native_mmvq(w.wo_type,w.wo,d.vq,d.out,qd,ne,1,sv);
+    e=cudaMemcpyAsync(out_host,d.out,(size_t)ne*sizeof(float),cudaMemcpyDeviceToHost,st);
+    if(e==cudaSuccess)e=cudaStreamSynchronize(st);
+    if(e==cudaSuccess)e=cudaGetLastError();
+    if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
+    return 1;
 }
 } // namespace strata::kernels::glm

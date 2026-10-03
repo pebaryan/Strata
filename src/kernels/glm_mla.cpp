@@ -40,7 +40,9 @@ void rms_norm_inplace(float* x, int n, const float* weight) {
 
 MlaNativeProjectBatchFn g_native_project_batch = nullptr;
 MlaParallelFor g_parallel_for = nullptr;
+bool g_device_block = false;
 
+void mla_set_device_block(bool enabled) { g_device_block = enabled; }
 void mla_set_native_project(MlaNativeProjectFn fn) { g_native_project = fn; }
 void mla_set_device_attention(bool enabled) { g_device_attention = enabled; }
 void mla_set_native_project_batch(MlaNativeProjectBatchFn fn) { g_native_project_batch = fn; }
@@ -59,6 +61,11 @@ bool mla_attend_batch_cuda(const float*,const float*,const float*,const float*,i
                            char* error,size_t error_capacity) {
     if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
     return false;
+}
+int mla_block_decode_cuda(const MlaWeights&,const MlaGeometry&,const float*,int,const float*,float*,float*,
+                          char* error,size_t error_capacity) {
+    if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return 0;
 }
 #endif
 
@@ -202,6 +209,39 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
                  float* out, const MlaIntermediates& want) {
     const int n_head = g.n_head, head_dim = g.head_dim, kv_lora = g.kv_lora, q_lora = g.q_lora;
     const int q_dim = n_head * head_dim;
+
+    // A decoded token on the device-resident block: it receives the new latent through want.kv (the cache row this call
+    // appends) and declines, touching nothing, whenever a precondition is not met - then the host path below runs.
+    if (g_device_block && g_device_attention && want.kv && !want.qr && !want.qcur && !want.attn && n_cache >= 1 &&
+        want.kv == cache + (size_t) (n_cache - 1) * (size_t) kv_lora) {
+        char block_err[256] = {};
+        const int r = mla_block_decode_cuda(w, g, x, n_cache, cache, want.kv, out, block_err, sizeof(block_err));
+        if (r == 1) {
+            if (std::getenv("STRATA_GLM_MLA_BLOCK_VERIFY")) {
+                // Debug: run the host path on the same inputs, report how far the block is, and keep the host result so
+                // the run proceeds exactly as the baseline would.
+                const std::vector<float> blk(out, out + g.n_embd), kv_blk(want.kv, want.kv + kv_lora);
+                std::vector<float> ref((size_t) g.n_embd);
+                g_device_block = false;
+                mla_forward(w, g, x, n_cache, cache, ref.data(), want);
+                g_device_block = true;
+                double d = 0, m = 0, dkv = 0;
+                for (int i = 0; i < g.n_embd; ++i) {
+                    d = std::max(d, (double) std::fabs(ref[(size_t) i] - blk[(size_t) i]));
+                    m = std::max(m, (double) std::fabs(ref[(size_t) i]));
+                }
+                for (int i = 0; i < kv_lora; ++i) dkv = std::max(dkv, (double) std::fabs(want.kv[i] - kv_blk[(size_t) i]));
+                std::fprintf(stderr, "MLA_BLOCK_VERIFY n_cache %d: out diff %.3e (max|ref| %.3e), latent row diff %.3e\n", n_cache, d,
+                             m, dkv);
+                std::copy(ref.begin(), ref.end(), out);
+            }
+            return;
+        }
+        if (r < 0) {
+            std::fprintf(stderr, "GLM MLA device block failed: %s\n", block_err);
+            std::exit(1);
+        }
+    }
 
     // qr = rms_norm(wq_a @ x)
     std::vector<float> qr((size_t) q_lora, 0.0f);
