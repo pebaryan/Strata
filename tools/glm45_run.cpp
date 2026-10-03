@@ -1455,6 +1455,11 @@ int main(int argc, char** argv) {
     // The prompt path's per-token hyper-connection stages are independent across tokens: spread them over the pool
     // (STRATA_GLM_CPU_THREADS sets its size; 0 workers = serial).
     C::glm::glm_set_parallel_for([](int n, const std::function<void(int)>& job) { cpu_pool().run(n, job); });
+    K::kda_set_parallel_for([](int n, const std::function<void(int)>& job) { cpu_pool().run(n, job); });
+    K::mla_set_parallel_for([](int n, const std::function<void(int)>& job) { cpu_pool().run(n, job); });
+    // Batched MLA for prompt chunks (STRATA_GLM_MLA_BATCH=0 keeps the per-token path): see mla_forward_batch.
+    if (const char* mb = std::getenv("STRATA_GLM_MLA_BATCH"); !mb || std::strcmp(mb, "0") != 0)
+        K::mla_set_native_project_batch(&native_kda_project);
     // Prompt-path layer streamer (STRATA_GLM_STREAM_LAYERS=0 disables): see LayerStreamer.
     {
         const char* pn = std::getenv("STRATA_GLM_STREAM_LAYERS");
@@ -1895,6 +1900,7 @@ int main(int argc, char** argv) {
             }
             long produced = 0;
             while (ok && produced < max_new) {
+                if (std::getenv("STRATA_GLM_LOGITS")) std::fprintf(stderr, "LOGIT %d %.6f\n", best, logit);
                 std::printf("T %d\n", best); std::fflush(stdout); ++produced;
                 if (best == 154820 || best == 154827 || produced == max_new) break;
                 if (!embed(best) || !run_x(x.data(), pos++, false, true, best, logit)) ok = false;

@@ -4,6 +4,7 @@
 #include "strata/kernels/glm_kda.hpp"
 #include "strata/kernels/glm_mla.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -29,6 +30,14 @@ long g_kda_layers = 0;
 
 inline float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
 
+KdaParallelFor g_parallel_for = nullptr;
+
+/// Runs f(0..n-1) on the installed worker pool, or serially when none is set (or there is a single job).
+void pfor(int n, const std::function<void(int)>& f) {
+    if (g_parallel_for != nullptr && n > 1) g_parallel_for(n, f);
+    else for (int i = 0; i < n; ++i) f(i);
+}
+
 /// A matrix-times-vector with the weight's rows contiguous, which is how every projection in the block
 /// is shaped (ggml's mul_mat reduces over the weight's ne0, i.e. over the row's elements).
 inline void matvec(const float* w, const float* x, float* out, int rows, int cols) {
@@ -46,18 +55,24 @@ inline void matvec(const float* w, const float* x, float* out, int rows, int col
 /// ggml_concat(conv_state, transpose(x_proj)) and then runs ggml_ssm_conv).
 void conv1d_silu(const float* conv_w, const float* proj /* [tokens][d_inner] */, float* out, int tokens,
                  int d_inner, int d_conv, float* history) {
-    for (int t = 0; t < tokens; ++t) {
-        for (int ch = 0; ch < d_inner; ++ch) {
-            float acc = 0.0f;
-            for (int k = 0; k < d_conv; ++k) {
-                const int src = t + k - (d_conv - 1);
-                const float v = src >= 0 ? proj[(size_t) src * d_inner + ch]
-                                         : (history ? history[(size_t) (d_conv - 1 + src) * d_inner + ch] : 0.0f);
-                if (src < tokens) acc += conv_w[(size_t) k * d_inner + ch] * v;
+    // Every output row reads only the (unchanged) projection and the history snapshot, so token blocks are independent;
+    // the history update below runs after all of them.
+    constexpr int kBlock = 16;
+    pfor((tokens + kBlock - 1) / kBlock, [&](int b) {
+        const int t_end = std::min(tokens, (b + 1) * kBlock);
+        for (int t = b * kBlock; t < t_end; ++t) {
+            for (int ch = 0; ch < d_inner; ++ch) {
+                float acc = 0.0f;
+                for (int k = 0; k < d_conv; ++k) {
+                    const int src = t + k - (d_conv - 1);
+                    const float v = src >= 0 ? proj[(size_t) src * d_inner + ch]
+                                             : (history ? history[(size_t) (d_conv - 1 + src) * d_inner + ch] : 0.0f);
+                    if (src < tokens) acc += conv_w[(size_t) k * d_inner + ch] * v;
+                }
+                out[(size_t) t * d_inner + ch] = acc / (1.0f + std::exp(-acc));
             }
-            out[(size_t) t * d_inner + ch] = acc / (1.0f + std::exp(-acc));
         }
-    }
+    });
     if (history) {
         for (int h = 0; h < d_conv - 1; ++h) {
             const int src = tokens - (d_conv - 1) + h;
@@ -78,6 +93,7 @@ void conv1d_silu(const float* conv_w, const float* proj /* [tokens][d_inner] */,
 void kda_set_native_project(KdaNativeProjectFn fn) { g_native_project = fn; }
 void kda_set_device_recurrence(bool enabled) { g_device_recurrence = enabled; }
 void kda_set_device_gates(bool enabled) { g_device_gates = enabled; }
+void kda_set_parallel_for(KdaParallelFor fn) { g_parallel_for = fn; }
 
 #if !defined(STRATA_ENABLE_CUDA)
 bool kda_recurrence_cuda(const float*, const float*, const float*, const float*, const float*, int, int, int,
@@ -87,6 +103,10 @@ bool kda_recurrence_cuda(const float*, const float*, const float*, const float*,
 }
 void kda_set_lazy_state(bool) {}
 void kda_invalidate_state() {}
+bool kda_rows_cuda(const float*, const float*, int, int, int, float*, char* error, size_t error_capacity) {
+    if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return false;
+}
 bool kda_gates_cuda(const float*, const float*, const float*, const float*, const float*, const float*, int, int, int, int,
                     float*, float*, char* error, size_t error_capacity) {
     if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
@@ -293,33 +313,45 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     const double tm_rec = lap();
 
     // the gated norm: rms over ne0 = head_dim, per head, then a SIGMOID gate (not SiLU), then wo
-    std::vector<float> og((size_t) di), ga((size_t) hd), gb((size_t) di);
     std::vector<float> o((size_t) tokens * di);
-    for (int t = 0; t < tokens; ++t) {
-        const float* xt = xn.data() + (size_t) t * ne;
-        bool gate_dev = false;
-        if (g_device_gates) {
-            // Same resident-weight warp-per-row matvec the MLA absorption uses, with a single "head".
-            char cuda_err[256] = {};
-            gate_dev = mla_head_matvec_cuda(w.ssm_g_a, xt, 1, hd, ne, ga.data(), cuda_err, sizeof(cuda_err)) &&
-                       mla_head_matvec_cuda(w.ssm_g_b, ga.data(), 1, di, hd, gb.data(), cuda_err, sizeof(cuda_err));
-        }
-        if (!gate_dev) {
-            matvec(w.ssm_g_a, xt, ga.data(), hd, ne);
-            matvec(w.ssm_g_b, ga.data(), gb.data(), di, hd);
-        }
-        for (int h = 0; h < nh; ++h) {
-            const float* at = attn.data() + ((size_t) t * nh + h) * hd;
-            double ss = 0.0;
-            for (int i = 0; i < hd; ++i) ss += (double) at[i] * (double) at[i];
-            const float inv = 1.0f / std::sqrt((float) (ss / hd) + KDA_RMS_EPS);
-            for (int i = 0; i < hd; ++i) {
-                const int c = h * hd + i;
-                og[(size_t) c] = at[i] * inv * w.o_norm[i] * sigmoid(gb[(size_t) c]);
+    // The two gate projections for ALL tokens in one resident-weight GPU call each (the per-token version was two
+    // synchronous launches per token per layer); the host path below is the fallback.
+    std::vector<float> ga_all, gb_all;
+    bool gate_dev = false;
+    if (g_device_gates) {
+        char cuda_err[256] = {};
+        ga_all.resize((size_t) tokens * hd);
+        gb_all.resize((size_t) tokens * di);
+        gate_dev = kda_rows_cuda(w.ssm_g_a, xn.data(), tokens, hd, ne, ga_all.data(), cuda_err, sizeof(cuda_err)) &&
+                   kda_rows_cuda(w.ssm_g_b, ga_all.data(), tokens, di, hd, gb_all.data(), cuda_err, sizeof(cuda_err));
+    }
+    constexpr int kGateBlock = 16;
+    pfor((tokens + kGateBlock - 1) / kGateBlock, [&](int b) {
+        std::vector<float> ga((size_t) hd), gb_host((size_t) di);
+        const int t_end = std::min(tokens, (b + 1) * kGateBlock);
+        for (int t = b * kGateBlock; t < t_end; ++t) {
+            const float* gb = nullptr;
+            if (gate_dev) {
+                gb = gb_all.data() + (size_t) t * di;
+            } else {
+                const float* xt = xn.data() + (size_t) t * ne;
+                matvec(w.ssm_g_a, xt, ga.data(), hd, ne);
+                matvec(w.ssm_g_b, ga.data(), gb_host.data(), di, hd);
+                gb = gb_host.data();
+            }
+            float* og = o.data() + (size_t) t * di;
+            for (int h = 0; h < nh; ++h) {
+                const float* at = attn.data() + ((size_t) t * nh + h) * hd;
+                double ss = 0.0;
+                for (int i = 0; i < hd; ++i) ss += (double) at[i] * (double) at[i];
+                const float inv = 1.0f / std::sqrt((float) (ss / hd) + KDA_RMS_EPS);
+                for (int i = 0; i < hd; ++i) {
+                    const int c = h * hd + i;
+                    og[c] = at[i] * inv * w.o_norm[i] * sigmoid(gb[c]);
+                }
             }
         }
-        std::memcpy(o.data() + (size_t) t * di, og.data(), (size_t) di * sizeof(float));
-    }
+    });
     if (mid && mid->o) std::memcpy(mid->o, o.data(), o.size() * sizeof(float));
     const double tm_gateout = lap();
 

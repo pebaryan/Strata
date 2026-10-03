@@ -165,6 +165,23 @@ bool kda_recurrence_cuda(const float* q, const float* k, const float* v, const f
     return true;
 }
 
+bool kda_rows_cuda(const float* weight,const float* x,int tokens,int rows,int cols,float* y,char* error,size_t error_capacity) {
+    auto fail=[&](const char* msg) { if(error&&error_capacity) std::snprintf(error,error_capacity,"%s",msg); return false; };
+    if(!weight||!x||!y||tokens<1||rows<1||cols<1) return fail("invalid KDA rows arguments");
+    Scratch& s=scratch(); std::lock_guard<std::mutex> lock(s.mutex);
+    const size_t xn=(size_t)tokens*cols,yn=(size_t)tokens*rows;
+    if(!s.reserve(s.x,s.x_cap,xn)||!s.reserve(s.gate_out,s.gate_cap,yn)) return fail("KDA rows scratch allocation failed");
+    float* dw=nullptr;
+    if(!resident_weight(s,weight,(size_t)rows*cols,dw)) return fail("KDA rows weight upload failed");
+    cudaError_t e=cudaMemcpy(s.x,x,xn*sizeof(float),cudaMemcpyHostToDevice);
+    if(e!=cudaSuccess) return fail(cudaGetErrorString(e));
+    kda_rows<<<(unsigned)(((size_t)tokens*rows+7)/8),256>>>(dw,s.x,s.gate_out,tokens,rows,cols);
+    if((e=cudaGetLastError())!=cudaSuccess||(e=cudaDeviceSynchronize())!=cudaSuccess) return fail(cudaGetErrorString(e));
+    if((e=cudaMemcpy(y,s.gate_out,yn*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess) return fail(cudaGetErrorString(e));
+    if(error&&error_capacity) error[0]='\0';
+    return true;
+}
+
 void kda_set_lazy_state(bool enabled) { std::lock_guard<std::mutex> lock(scratch().mutex); g_lazy_state=enabled; }
 
 void kda_invalidate_state() {

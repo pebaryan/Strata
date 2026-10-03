@@ -129,7 +129,9 @@ bool mla_attention_cuda(const float* qcur,const float* cache,int n_cache,int n_h
     }
     cudaError_t e=cudaMemcpy(s.q,qcur,qn*sizeof(float),cudaMemcpyHostToDevice);
     if(e==cudaSuccess){
-        const size_t first=full_upload?0:(size_t)it->second.last_n;
+        // `first` is a FLOAT offset: last_n counts rows of kv_lora floats.  (Used unscaled, every incremental row landed at
+        // float index last_n instead of last_n*kv_lora, so past ~257 cached positions the kernel attended to stale data.)
+        const size_t first=full_upload?0:(size_t)it->second.last_n*(size_t)kv_lora;
         const size_t count=full_upload?cn:(size_t)kv_lora;
         e=cudaMemcpy(it->second.device+first,cache+first,count*sizeof(float),cudaMemcpyHostToDevice);
     }
@@ -139,5 +141,144 @@ bool mla_attention_cuda(const float* qcur,const float* cache,int n_cache,int n_h
     if((e=cudaGetLastError())!=cudaSuccess||(e=cudaDeviceSynchronize())!=cudaSuccess)return fail(cudaGetErrorString(e));
     if((e=cudaMemcpy(attn,s.attn,on*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)return fail(cudaGetErrorString(e));
     if(error&&error_capacity)error[0]='\0';return true;
+}
+
+// ---- batched (prompt-chunk) MLA: absorb -> causal latent attention -> un-absorb, all tokens at once, on the device ----
+
+namespace {
+// y[idx] for idx = (t, h, i): sum_j W[(h*rows+i)*cols + j] * x[(t*n_head+h)*cols + j].  One warp per output element.
+__global__ void mla_head_matvec_tokens(const float* m,const float* x,float* y,int rows,int cols,int n_head,size_t total){
+    const size_t idx=(size_t)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
+    const int lane=(int)(threadIdx.x&31);
+    if(idx>=total)return;
+    const size_t per_token=(size_t)n_head*rows;
+    const size_t t=idx/per_token,rem=idx%per_token;
+    const int h=(int)(rem/rows);
+    const float* row=m+rem*cols;const float* xh=x+(t*n_head+h)*cols;
+    float acc=0.0f;
+    for(int j=lane;j<cols;j+=32)acc=fmaf(row[j],xh[j],acc);
+    for(int o=16;o>0;o>>=1)acc+=__shfl_down_sync(0xffffffffu,acc,o);
+    if(lane==0)y[idx]=acc;
+}
+
+// Causal latent attention for a block of S tokens: token t sees cache rows [0, c_base+t].  One thread block per
+// (token, head); the scores live in dynamic shared memory (<= 8192 positions = 32 KB), so nothing is materialised in
+// global memory however long the chunk is.  Warp-per-position dots keep the cache reads coalesced.
+__global__ void mla_latent_attention_batch(const float* qcur,const float* cache,int c_base,int kv_lora,float scale,float* out){
+    extern __shared__ float sc[];
+    __shared__ float qs[512];
+    __shared__ float red[8];
+    __shared__ float bcast;
+    const int t=(int)blockIdx.x,h=(int)blockIdx.y,tid=(int)threadIdx.x,warp=tid>>5,lane=tid&31;
+    const int n=c_base+t+1;
+    const float* qh=qcur+((size_t)t*gridDim.y+h)*kv_lora;
+    for(int i=tid;i<kv_lora;i+=blockDim.x)qs[i]=qh[i];
+    __syncthreads();
+    float local_max=-1.0e30f;
+    for(int pos=warp;pos<n;pos+=8){
+        const float* kt=cache+(size_t)pos*kv_lora;float acc=0.0f;
+        for(int i=lane;i<kv_lora;i+=32)acc=fmaf(qs[i],kt[i],acc);
+        for(int o=16;o>0;o>>=1)acc+=__shfl_down_sync(0xffffffffu,acc,o);
+        if(lane==0){const float s=acc*scale;sc[pos]=s;local_max=fmaxf(local_max,s);}
+    }
+    // block max (only lane 0 of each warp holds a value; the others carry the -1e30 floor)
+    for(int o=16;o>0;o>>=1)local_max=fmaxf(local_max,__shfl_down_sync(0xffffffffu,local_max,o));
+    if(lane==0)red[warp]=local_max;
+    __syncthreads();
+    if(tid==0){float m=red[0];for(int w=1;w<8;++w)m=fmaxf(m,red[w]);bcast=m;}
+    __syncthreads();
+    const float max_score=bcast;
+    float local_sum=0.0f;
+    for(int pos=tid;pos<n;pos+=blockDim.x){const float p=expf(sc[pos]-max_score);sc[pos]=p;local_sum+=p;}
+    for(int o=16;o>0;o>>=1)local_sum+=__shfl_down_sync(0xffffffffu,local_sum,o);
+    __syncthreads();
+    if(lane==0)red[warp]=local_sum;
+    __syncthreads();
+    if(tid==0){float s=0.0f;for(int w=0;w<8;++w)s+=red[w];bcast=s;}
+    __syncthreads();
+    const float denom=bcast;
+    float* oh=out+((size_t)t*gridDim.y+h)*kv_lora;
+    for(int i=tid;i<kv_lora;i+=blockDim.x){
+        float acc=0.0f;
+        for(int pos=0;pos<n;++pos)acc=fmaf(sc[pos],cache[(size_t)pos*kv_lora+i],acc);
+        oh[i]=acc/denom;
+    }
+}
+
+struct BatchScratch{
+    float *q=nullptr,*qcur=nullptr,*attn=nullptr,*v=nullptr;
+    size_t q_cap=0,qcur_cap=0,attn_cap=0,v_cap=0;
+    std::mutex mutex;
+    ~BatchScratch(){cudaFree(q);cudaFree(qcur);cudaFree(attn);cudaFree(v);}
+    bool reserve(float*& p,size_t& cap,size_t n){
+        if(p&&n<=cap)return true;
+        if(p)cudaFree(p);
+        p=nullptr;cap=0;
+        if(cudaMalloc(&p,n*sizeof(float))!=cudaSuccess)return false;
+        cap=n;return true;
+    }
+};
+BatchScratch& batch_scratch(){static BatchScratch s;return s;}
+
+float* resident_head_weights(const float* host,size_t n){
+    HeadMatvecState& hs=head_state();std::lock_guard<std::mutex> lock(hs.mutex);
+    auto it=hs.weights.find(host);
+    if(it!=hs.weights.end())return it->second;
+    float* dev=nullptr;
+    if(cudaMalloc(&dev,n*sizeof(float))!=cudaSuccess)return nullptr;
+    if(cudaMemcpy(dev,host,n*sizeof(float),cudaMemcpyHostToDevice)!=cudaSuccess){cudaFree(dev);return nullptr;}
+    hs.weights.emplace(host,dev);
+    return dev;
+}
+}  // namespace
+
+bool mla_attend_batch_cuda(const float* wk_b,const float* wv_b,const float* q,const float* cache,int c_base,int S,
+                           int n_head,int head_dim,int kv_lora,float* v_out,char* error,size_t error_capacity){
+    auto fail=[&](const char* msg){if(error&&error_capacity)std::snprintf(error,error_capacity,"%s",msg);return false;};
+    const int n_total=c_base+S;
+    if(!wk_b||!wv_b||!q||!cache||!v_out||S<1||c_base<0||n_total>8192||n_head<1||head_dim<1||kv_lora<1||kv_lora>512)
+        return fail("invalid batched MLA arguments");
+    float* dk=resident_head_weights(wk_b,(size_t)n_head*kv_lora*head_dim);
+    float* dv=resident_head_weights(wv_b,(size_t)n_head*head_dim*kv_lora);
+    if(!dk||!dv)return fail("batched MLA weight upload failed");
+    const size_t q_dim=(size_t)n_head*head_dim,lat=(size_t)n_head*kv_lora;
+    BatchScratch& b=batch_scratch();std::lock_guard<std::mutex> blk(b.mutex);
+    Scratch& s=scratch();std::lock_guard<std::mutex> lock(s.mutex);
+    if(!b.reserve(b.q,b.q_cap,(size_t)S*q_dim)||!b.reserve(b.qcur,b.qcur_cap,(size_t)S*lat)||
+       !b.reserve(b.attn,b.attn_cap,(size_t)S*lat)||!b.reserve(b.v,b.v_cap,(size_t)S*q_dim))
+        return fail("batched MLA scratch allocation failed");
+    // the device copy of the latent cache: rows [0, c_base) must already be there, rows [c_base, n_total) are new
+    const size_t cn=(size_t)n_total*kv_lora;
+    auto it=s.resident_caches.find(cache);
+    size_t upload_from=(size_t)c_base;
+    if(it==s.resident_caches.end()){
+        Scratch::ResidentCache entry;size_t cap=1;while(cap<cn)cap*=2;
+        if(cudaMalloc(&entry.device,cap*sizeof(float))!=cudaSuccess)return fail("MLA resident cache allocation failed");
+        entry.capacity=cap;entry.last_n=0;
+        it=s.resident_caches.emplace(cache,entry).first;
+        upload_from=0;
+    }else if(cn>it->second.capacity){
+        size_t cap=it->second.capacity?it->second.capacity:1;while(cap<cn)cap*=2;
+        float* grown=nullptr;
+        if(cudaMalloc(&grown,cap*sizeof(float))!=cudaSuccess)return fail("MLA resident cache growth failed");
+        cudaFree(it->second.device);it->second.device=grown;it->second.capacity=cap;
+        upload_from=0;
+    }else if(it->second.last_n!=c_base){
+        upload_from=0;   // the host cache may have been rewritten (a reset, or a depth that does not follow on)
+    }
+    cudaError_t e=cudaMemcpy(it->second.device+upload_from*kv_lora,cache+upload_from*kv_lora,
+                             (size_t)(n_total-(int)upload_from)*kv_lora*sizeof(float),cudaMemcpyHostToDevice);
+    if(e==cudaSuccess)e=cudaMemcpy(b.q,q,(size_t)S*q_dim*sizeof(float),cudaMemcpyHostToDevice);
+    if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
+    it->second.last_n=n_total;
+    const size_t tot_k=(size_t)S*n_head*kv_lora,tot_v=(size_t)S*n_head*head_dim;
+    mla_head_matvec_tokens<<<(unsigned)((tot_k+7)/8),256>>>(dk,b.q,b.qcur,kv_lora,head_dim,n_head,tot_k);
+    mla_latent_attention_batch<<<dim3((unsigned)S,(unsigned)n_head),256,(size_t)n_total*sizeof(float)>>>(
+        b.qcur,it->second.device,c_base,kv_lora,1.0f/std::sqrt((float)head_dim),b.attn);
+    mla_head_matvec_tokens<<<(unsigned)((tot_v+7)/8),256>>>(dv,b.attn,b.v,head_dim,kv_lora,n_head,tot_v);
+    if((e=cudaGetLastError())!=cudaSuccess||(e=cudaDeviceSynchronize())!=cudaSuccess)return fail(cudaGetErrorString(e));
+    if((e=cudaMemcpy(v_out,b.v,(size_t)S*q_dim*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)return fail(cudaGetErrorString(e));
+    if(error&&error_capacity)error[0]='\0';
+    return true;
 }
 } // namespace strata::kernels::glm

@@ -38,8 +38,13 @@ void rms_norm_inplace(float* x, int n, const float* weight) {
 
 }  // namespace
 
+MlaNativeProjectBatchFn g_native_project_batch = nullptr;
+MlaParallelFor g_parallel_for = nullptr;
+
 void mla_set_native_project(MlaNativeProjectFn fn) { g_native_project = fn; }
 void mla_set_device_attention(bool enabled) { g_device_attention = enabled; }
+void mla_set_native_project_batch(MlaNativeProjectBatchFn fn) { g_native_project_batch = fn; }
+void mla_set_parallel_for(MlaParallelFor fn) { g_parallel_for = fn; }
 
 #if !defined(STRATA_ENABLE_CUDA)
 bool mla_attention_cuda(const float*,const float*,int,int,int,int,float*,char* error,size_t error_capacity) {
@@ -50,7 +55,148 @@ bool mla_head_matvec_cuda(const float*,const float*,int,int,int,float*,char* err
     if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
     return false;
 }
+bool mla_attend_batch_cuda(const float*,const float*,const float*,const float*,int,int,int,int,int,float*,
+                           char* error,size_t error_capacity) {
+    if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return false;
+}
 #endif
+
+bool mla_forward_batch(const MlaWeights& w, const MlaGeometry& g, const float* x, int T, int c0, float* cache, float* out) {
+    if (!g_native_project_batch || !g_device_attention || T < 1 || c0 < 0 || c0 + T > 8192) return false;
+    if (!w.wq_a_type || !w.wq_b_type || !w.kv_a_type || !w.wo_type) return false;
+    const int n_head = g.n_head, head_dim = g.head_dim, kv_lora = g.kv_lora, q_lora = g.q_lora, n_embd = g.n_embd;
+    const int q_dim = n_head * head_dim;
+    // Sub-blocks bound the device scratch (q, qcur, attn, v are all [S][n_head * ...]); the cache grows block by block, so
+    // the causal order across blocks is preserved.
+    constexpr int kBlock = 512;
+    for (int t0 = 0; t0 < T; t0 += kBlock) {
+        const int S = std::min(kBlock, T - t0);
+        const float* xs = x + (size_t) t0 * n_embd;
+        float* kv_rows = cache + (size_t) (c0 + t0) * kv_lora;      // the new latents are computed straight into the cache
+        std::vector<float> qr((size_t) S * q_lora), q((size_t) S * q_dim), v((size_t) S * q_dim);
+        {
+            const void* nw[1] = {w.wq_a};
+            const int nt[1] = {w.wq_a_type};
+            float* no[1] = {qr.data()};
+            if (!g_native_project_batch(1, nw, nt, S, xs, n_embd, q_lora, no)) return false;
+        }
+        {
+            const void* nw[1] = {w.kv_a};
+            const int nt[1] = {w.kv_a_type};
+            float* no[1] = {kv_rows};
+            if (!g_native_project_batch(1, nw, nt, S, xs, n_embd, kv_lora, no)) return false;
+        }
+        const std::function<void(int)> norms = [&](int t) {
+            rms_norm_inplace(qr.data() + (size_t) t * q_lora, q_lora, w.q_a_norm);
+            rms_norm_inplace(kv_rows + (size_t) t * kv_lora, kv_lora, w.kv_a_norm);
+        };
+        if (g_parallel_for != nullptr && S > 1) g_parallel_for(S, norms);
+        else for (int t = 0; t < S; ++t) norms(t);
+        {
+            const void* nw[1] = {w.wq_b};
+            const int nt[1] = {w.wq_b_type};
+            float* no[1] = {q.data()};
+            if (!g_native_project_batch(1, nw, nt, S, qr.data(), q_lora, q_dim, no)) return false;
+        }
+        char cuda_err[256] = {};
+        if (!mla_attend_batch_cuda(w.wk_b, w.wv_b, q.data(), cache, c0 + t0, S, n_head, head_dim, kv_lora, v.data(),
+                                   cuda_err, sizeof(cuda_err))) {
+            std::fprintf(stderr, "GLM MLA batched attention unavailable: %s; falling back to per-token\n", cuda_err);
+            return false;
+        }
+        if (std::getenv("STRATA_GLM_MLA_DEBUG")) {
+            // Debug: which stage disagrees?  (a) batched projections vs single-row projections of the same inputs;
+            // (b) the device absorb/attention/un-absorb chain vs a host computation of it from the same q.
+            for (const int tt : {0, S - 1}) {
+                std::vector<float> qr1((size_t) q_lora), q1((size_t) q_dim);
+                {
+                    const void* nw[1] = {w.wq_a};
+                    const int nt[1] = {w.wq_a_type};
+                    float* no[1] = {qr1.data()};
+                    g_native_project_batch(1, nw, nt, 1, xs + (size_t) tt * n_embd, n_embd, q_lora, no);
+                    rms_norm_inplace(qr1.data(), q_lora, w.q_a_norm);
+                }
+                {
+                    const void* nw[1] = {w.wq_b};
+                    const int nt[1] = {w.wq_b_type};
+                    float* no[1] = {q1.data()};
+                    g_native_project_batch(1, nw, nt, 1, qr.data() + (size_t) tt * q_lora, q_lora, q_dim, no);
+                }
+                double d_qr = 0, d_q = 0, r_q = 0;
+                for (int i = 0; i < q_lora; ++i) d_qr = std::max(d_qr, (double) std::fabs(qr1[(size_t) i] - qr[(size_t) tt * q_lora + i]));
+                for (int i = 0; i < q_dim; ++i) {
+                    d_q = std::max(d_q, (double) std::fabs(q1[(size_t) i] - q[(size_t) tt * q_dim + i]));
+                    r_q = std::max(r_q, (double) std::fabs(q1[(size_t) i]));
+                }
+                // host chain from the batched q row
+                const int n = c0 + t0 + tt + 1;
+                const float scale = 1.0f / std::sqrt((float) head_dim);
+                std::vector<float> vref((size_t) q_dim, 0.0f), scores((size_t) n), attn_h((size_t) kv_lora);
+                for (int h = 0; h < n_head; ++h) {
+                    const float* qh = q.data() + (size_t) tt * q_dim + (size_t) h * head_dim;
+                    std::vector<float> qc((size_t) kv_lora);
+                    for (int i = 0; i < kv_lora; ++i) {
+                        const float* row = w.wk_b + ((size_t) h * kv_lora + i) * head_dim;
+                        float acc = 0.0f;
+                        for (int j = 0; j < head_dim; ++j) acc += row[j] * qh[j];
+                        qc[(size_t) i] = acc;
+                    }
+                    float best = -INFINITY;
+                    for (int p = 0; p < n; ++p) {
+                        const float* kt = cache + (size_t) p * kv_lora;
+                        float acc = 0.0f;
+                        for (int i = 0; i < kv_lora; ++i) acc += qc[(size_t) i] * kt[i];
+                        scores[(size_t) p] = acc * scale;
+                        best = std::max(best, scores[(size_t) p]);
+                    }
+                    double sum = 0.0;
+                    for (int p = 0; p < n; ++p) { scores[(size_t) p] = std::exp(scores[(size_t) p] - best); sum += scores[(size_t) p]; }
+                    std::fill(attn_h.begin(), attn_h.end(), 0.0f);
+                    for (int p = 0; p < n; ++p) {
+                        const float pr = (float) (scores[(size_t) p] / sum);
+                        const float* kt = cache + (size_t) p * kv_lora;
+                        for (int i = 0; i < kv_lora; ++i) attn_h[(size_t) i] += pr * kt[i];
+                    }
+                    for (int i = 0; i < head_dim; ++i) {
+                        const float* row = w.wv_b + ((size_t) h * head_dim + i) * kv_lora;
+                        float acc = 0.0f;
+                        for (int j = 0; j < kv_lora; ++j) acc += row[j] * attn_h[(size_t) j];
+                        vref[(size_t) h * head_dim + i] = acc;
+                    }
+                }
+                double d_v = 0, r_v = 0;
+                for (int i = 0; i < q_dim; ++i) {
+                    d_v = std::max(d_v, (double) std::fabs(vref[(size_t) i] - v[(size_t) tt * q_dim + i]));
+                    r_v = std::max(r_v, (double) std::fabs(vref[(size_t) i]));
+                }
+                std::fprintf(stderr,
+                             "MLA_DEBUG t0 %d tok %d: qr diff %.2e | q diff %.2e (max %.2e) | device-chain vs host-chain v diff %.2e (max %.2e)\n",
+                             t0, tt, d_qr, d_q, r_q, d_v, r_v);
+            }
+        }
+        {
+            const void* nw[1] = {w.wo};
+            const int nt[1] = {w.wo_type};
+            float* no[1] = {out + (size_t) t0 * n_embd};
+            if (!g_native_project_batch(1, nw, nt, S, v.data(), q_dim, n_embd, no)) return false;
+            if (std::getenv("STRATA_GLM_MLA_DEBUG")) {
+                for (const int tt : {0, S - 1}) {
+                    std::vector<float> o1((size_t) n_embd);
+                    float* no1[1] = {o1.data()};
+                    g_native_project_batch(1, nw, nt, 1, v.data() + (size_t) tt * q_dim, q_dim, n_embd, no1);
+                    double d = 0, r = 0;
+                    for (int i = 0; i < n_embd; ++i) {
+                        d = std::max(d, (double) std::fabs(o1[(size_t) i] - out[(size_t) (t0 + tt) * n_embd + i]));
+                        r = std::max(r, (double) std::fabs(o1[(size_t) i]));
+                    }
+                    std::fprintf(stderr, "MLA_DEBUG wo tok %d: batched vs single-row diff %.2e (max %.2e)\n", tt, d, r);
+                }
+            }
+        }
+    }
+    return true;
+}
 
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
                  float* out, const MlaIntermediates& want) {

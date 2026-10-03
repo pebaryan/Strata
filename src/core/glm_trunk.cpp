@@ -11,6 +11,8 @@
 /// which rather than leaving it to the reader.
 #include "strata/core/glm_trunk.hpp"
 
+#include <algorithm>
+#include <cmath>
 #include <vector>
 #include <chrono>
 #include <cstdio>
@@ -259,7 +261,7 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
     copy_floats(buf_a.data(), x, n * row);
     float* cur = buf_a.data();
     float* nxt = buf_b.data();
-    double phase_ms[3] = {0.0, 0.0, 0.0};   // hyper-connection stages, attention, routed/dense FFN
+    double phase_ms[4] = {0.0, 0.0, 0.0, 0.0};   // hyper-connection stages, attention, routed/dense FFN, (MLA share of attention)
     auto lap_t = std::chrono::steady_clock::now();
     auto lap = [&]() {
         const auto now = std::chrono::steady_clock::now();
@@ -307,16 +309,59 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
                 return false;
             }
             float* cache = state.mla_cache[slot];
-            for (int t = 0; t < tokens; ++t) {
-                const int cells = state.mla_len[slot];
-                kernels::glm::MlaIntermediates want;
-                want.kv = cache + (size_t) cells * (size_t) mla_g.kv_lora;
-                if (!glm_stage_mla(*w.mla, mla_g, xn.data() + (size_t) t * ne, cells + 1, cache,
-                                   attn_out.data() + (size_t) t * ne, err, &want)) {
-                    err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " MLA: " + err;
-                    return false;
+            // The whole chunk at once (batched projections, one causal attention launch, resident device cache); when that
+            // path is unavailable it declines and the chunk runs token by token exactly as before.
+            const int cells0 = state.mla_len[slot];
+            if (kernels::glm::mla_forward_batch(*w.mla, mla_g, xn.data(), tokens, cells0, cache, attn_out.data())) {
+                state.mla_len[slot] += tokens;
+                if (std::getenv("STRATA_GLM_MLA_VERIFY")) {
+                    // Debug: run the per-token reference over the same chunk and report how far the batched result is.
+                    const std::vector<float> batched(attn_out.begin(), attn_out.begin() + (size_t) tokens * ne);
+                    std::vector<float> ref_cache((size_t) (cells0 + tokens) * mla_g.kv_lora);
+                    for (size_t i = 0; i < (size_t) cells0 * mla_g.kv_lora; ++i) ref_cache[i] = cache[i];
+                    std::vector<float> ref((size_t) tokens * ne);
+                    for (int t = 0; t < tokens; ++t) {
+                        kernels::glm::MlaIntermediates want;
+                        want.kv = ref_cache.data() + (size_t) (cells0 + t) * mla_g.kv_lora;
+                        std::string e2;
+                        if (!glm_stage_mla(*w.mla, mla_g, xn.data() + (size_t) t * ne, cells0 + t + 1, ref_cache.data(),
+                                           ref.data() + (size_t) t * ne, e2, &want)) break;
+                    }
+                    double max_abs = 0.0, max_ref = 0.0, kv_diff = 0.0;
+                    std::vector<double> tok_diff((size_t) tokens, 0.0);
+                    for (size_t i = 0; i < ref.size(); ++i) {
+                        const double d = (double) std::fabs(ref[i] - batched[i]);
+                        max_abs = std::max(max_abs, d);
+                        max_ref = std::max(max_ref, (double) std::fabs(ref[i]));
+                        tok_diff[i / (size_t) ne] = std::max(tok_diff[i / (size_t) ne], d);
+                    }
+                    int first_bad = -1;
+                    for (int t = 0; t < tokens; ++t) if (tok_diff[(size_t) t] > 1e-3) { first_bad = t; break; }
+                    std::fprintf(stderr, "MLA_VERIFY layer %d: first token with diff > 1e-3: %d; per-token diff @0 %.2e @1 %.2e @2 %.2e @10 %.2e @100 %.2e @254 %.2e @255 %.2e @256 %.2e @last %.2e\n",
+                                 layer, first_bad, tok_diff[0], tokens > 1 ? tok_diff[1] : 0.0, tokens > 2 ? tok_diff[2] : 0.0,
+                                 tokens > 10 ? tok_diff[10] : 0.0, tokens > 100 ? tok_diff[100] : 0.0,
+                                 tokens > 254 ? tok_diff[254] : 0.0, tokens > 255 ? tok_diff[255] : 0.0,
+                                 tokens > 256 ? tok_diff[256] : 0.0, tok_diff[(size_t) tokens - 1]);
+                    for (size_t i = (size_t) cells0 * mla_g.kv_lora; i < ref_cache.size(); ++i)
+                        kv_diff = std::max(kv_diff, (double) std::fabs(ref_cache[i] - cache[i]));
+                    std::fprintf(stderr, "MLA_VERIFY layer %d tokens %d: max|batched-ref| %.3e (max|ref| %.3e), kv rows diff %.3e\n",
+                                 layer, tokens, max_abs, max_ref, kv_diff);
+                    // later tokens (and layers) must keep seeing the reference's cache rows and outputs
+                    for (size_t i = (size_t) cells0 * mla_g.kv_lora; i < ref_cache.size(); ++i) cache[i] = ref_cache[i];
+                    for (size_t i = 0; i < ref.size(); ++i) attn_out[i] = ref[i];
                 }
-                state.mla_len[slot] = cells + 1;
+            } else {
+                for (int t = 0; t < tokens; ++t) {
+                    const int cells = state.mla_len[slot];
+                    kernels::glm::MlaIntermediates want;
+                    want.kv = cache + (size_t) cells * (size_t) mla_g.kv_lora;
+                    if (!glm_stage_mla(*w.mla, mla_g, xn.data() + (size_t) t * ne, cells + 1, cache,
+                                       attn_out.data() + (size_t) t * ne, err, &want)) {
+                        err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " MLA: " + err;
+                        return false;
+                    }
+                    state.mla_len[slot] = cells + 1;
+                }
             }
         } else {
             const int slot = state.kda_index ? state.kda_index[layer] : -1;
@@ -330,7 +375,11 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
                 return false;
             }
         }
-        phase_ms[1] += lap();
+        {
+            const double a = lap();
+            phase_ms[1] += a;
+            if (is_mla) phase_ms[3] += a;
+        }
         if (!for_tokens(tokens, err, [&](int t, std::string& e) {
                 return glm_stage_hc_post(attn_out.data() + (size_t) t * ne, cur + (size_t) t * row, mix_a[(size_t) t], ne,
                                          mid.data() + (size_t) t * row, e) &&
@@ -376,8 +425,8 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
     }
     copy_floats(l_out, cur, n * row);
     if (std::getenv("STRATA_GLM_TIMING"))
-        std::fprintf(stderr, "BATCH_TIMING tokens=%d hc=%.0f attn=%.0f ffn=%.0f ms\n", tokens,
-                     phase_ms[0], phase_ms[1], phase_ms[2]);
+        std::fprintf(stderr, "BATCH_TIMING tokens=%d hc=%.0f attn=%.0f (MLA %.0f, KDA %.0f) ffn=%.0f ms\n", tokens,
+                     phase_ms[0], phase_ms[1], phase_ms[3], phase_ms[1] - phase_ms[3], phase_ms[2]);
     return true;
 }
 

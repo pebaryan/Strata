@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <functional>
 
 namespace strata::kernels::glm {
 
@@ -72,6 +73,26 @@ bool mla_attention_cuda(const float* qcur, const float* cache, int n_cache, int 
 
 bool mla_head_matvec_cuda(const float* weights, const float* x, int n_head, int rows, int cols, float* y,
                           char* error, size_t error_capacity);
+
+/// Prompt-chunk MLA.  The batched projection hook has the KDA's signature (several weights, `tokens` rows of x, one
+/// shared n_in/n_out); `parallel_for` runs the independent per-token host work (row norms) on a pool.
+using MlaNativeProjectBatchFn = bool (*)(int count, const void* const* weights, const int* types, int tokens,
+                                         const float* x, int n_in, int n_out, float* const* out);
+using MlaParallelFor = void (*)(int n, const std::function<void(int)>& job);
+void mla_set_native_project_batch(MlaNativeProjectBatchFn fn);
+void mla_set_parallel_for(MlaParallelFor fn);
+
+/// For a block of S tokens: absorb the K up-projection into q, causal attention over cache rows [0, c_base + t] for token t,
+/// then un-absorb V.  `q` is [S][n_head*head_dim], `cache` the host latent cache whose rows [0, c_base + S) are filled, and
+/// `v_out` is [S][n_head*head_dim].  The latent cache is kept resident on the device across calls.
+bool mla_attend_batch_cuda(const float* wk_b, const float* wv_b, const float* q, const float* cache, int c_base, int S,
+                           int n_head, int head_dim, int kv_lora, float* v_out, char* error, size_t error_capacity);
+
+/// Runs T prompt tokens through one MLA block, causally, appending their latents to `cache` at rows [c0, c0 + T).
+/// `x` is [T][n_embd] (already attn-normed), `out` is [T][n_embd].  Returns false, leaving the cache rows possibly
+/// written but harmless, when the batched path is not available (no hooks, a type without a native projection, a context
+/// beyond 8192 positions, a device failure) - the caller then runs mla_forward token by token.
+bool mla_forward_batch(const MlaWeights& w, const MlaGeometry& g, const float* x, int T, int c0, float* cache, float* out);
 
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
                  float* out, const MlaIntermediates& want = {});

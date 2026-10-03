@@ -26,6 +26,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <functional>
 
 namespace strata::kernels::glm {
 
@@ -76,6 +77,16 @@ void kda_set_device_gates(bool enabled);
 /// buffer is then stale; call kda_invalidate_state() after zeroing/restoring it so the next call re-uploads it.
 void kda_set_lazy_state(bool enabled);
 void kda_invalidate_state();
+
+/// Optional worker pool for the host loops that are independent across tokens (the causal convs and the gated output norm).
+/// `fn(n, job)` must run job(0..n-1), in any order on any threads, and return when all are done.  Unset: serial.
+using KdaParallelFor = void (*)(int n, const std::function<void(int)>& job);
+void kda_set_parallel_for(KdaParallelFor fn);
+
+/// y[t][r] = sum_c weight[r][c] * x[t][c] for every token at once, with `weight` (a host pointer, [rows][cols]) kept resident
+/// on the device after its first use.  One launch for the whole chunk, where a per-token call is a synchronous round trip.
+bool kda_rows_cuda(const float* weight, const float* x, int tokens, int rows, int cols, float* y,
+                   char* error, size_t error_capacity);
 
 /// Print the KDA stage's host-time breakdown, phase by phase.  Diagnostics only.
 void kda_print_profile();
