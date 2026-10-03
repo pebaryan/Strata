@@ -100,6 +100,28 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
         return std::chrono::duration<double, std::milli>(Clock::now() - a).count();
     };
 
+    // STRATA_GLM_LOOKAHEAD_STATS: how well can layer L+1's routed experts be predicted from the state before its attention?
+    // Predictor A applies L+1's FFN hyper-connection + norm + router to the streams after layer L; predictor B to the streams
+    // after layer L's attention (earlier, so a longer window to act on the prediction).  Diagnostics only: no result changes.
+    static const bool lookahead_stats = std::getenv("STRATA_GLM_LOOKAHEAD_STATS") != nullptr;
+    static double la_hit[4] = {0, 0, 0, 0};   // A@8, A@12, B@8, B@12: predicted experts that the layer really used
+    static double la_total = 0;
+    static long la_pairs = 0;
+    int pend_layer = -1, pred_a[12], pred_b[12];
+    auto predict_ids = [&](const float* streams, const GlmTrunkLayerWeights& w2, int* out12) {
+        std::vector<float> in((size_t) ne);
+        kernels::glm::HcMix mx;
+        std::string e3;
+        glm_stage_hc_norm(streams, ne, w2.hc_ffn_fn, w2.hc_ffn_base, w2.hc_ffn_scale, w2.ffn_norm, in.data(), &mx,
+                          hc_rms_eps, stream, e3);
+        kernels::glm::MoeGeometry g12 = *w2.moe_g;
+        g12.n_used = 12;
+        int32_t ids[64];
+        float wt[64];
+        kernels::glm::moe_route(w2.moe_router, w2.moe_probs_b, g12, in.data(), ids, wt);
+        for (int k = 0; k < 12; ++k) out12[k] = ids[k];
+    };
+
     for (int i = 0; i < layers; ++i) {
         // the artifact's layer number, not the loop's counter: every dispatch and lookup below is keyed by it
         const int layer = first_layer + i;
@@ -217,6 +239,20 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
                 err = "glm_trunk_forward: layer " + std::to_string(layer) + " routed FFN: " + err;
                 return false;
             }
+            if (lookahead_stats && pend_layer == layer) {
+                const int n8 = w.moe_g->n_used < 8 ? w.moe_g->n_used : 8;
+                for (int k = 0; k < n8; ++k)
+                    for (int j = 0; j < 12; ++j) {
+                        if (pred_a[j] == moe_ids[k]) { if (j < 8) la_hit[0] += 1; la_hit[1] += 1; }
+                        if (pred_b[j] == moe_ids[k]) { if (j < 8) la_hit[2] += 1; la_hit[3] += 1; }
+                    }
+                la_total += n8;
+                if (++la_pairs % 400 == 0)
+                    std::fprintf(stderr, "LOOKAHEAD after %ld layer pairs - share of the layer's 8 experts predicted: "
+                                         "A(top8) %.1f%% A(top12) %.1f%%  B(top8) %.1f%% B(top12) %.1f%%\n", la_pairs,
+                                 100 * la_hit[0] / la_total, 100 * la_hit[1] / la_total, 100 * la_hit[2] / la_total,
+                                 100 * la_hit[3] / la_total);
+            }
             // the ids as floats, so the one stage stream carries them: the callback is float-based because it carries
             // activations, and these are small integers that survive the round trip exactly
             const int n_report = w.moe_g->n_used < 64 ? w.moe_g->n_used : 64;
@@ -233,6 +269,15 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
         }
         tm_hcfp += elapsed(tick);
         stage("l_out", nxt, (int) (hc * (size_t) ne));
+        if (lookahead_stats && i + 1 < layers && !glm_ffn_is_dense(layer + 1)) {
+            GlmTrunkLayerWeights w2;
+            std::string e2;
+            if (provider(provider_ctx, layer + 1, w2, e2) && w2.moe_router && w2.moe_g && w2.hc_ffn_fn && w2.ffn_norm) {
+                predict_ids(nxt, w2, pred_a);       // streams after this layer
+                predict_ids(mid.data(), w2, pred_b); // streams after this layer's attention (before its FFN)
+                pend_layer = layer + 1;
+            }
+        }
 
         float* swap = cur; cur = nxt; nxt = swap;   // this layer's output is the next layer's input
     }
