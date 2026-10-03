@@ -1110,8 +1110,22 @@ static bool run_cached_device_moe_batch(void* raw, int layer, int n_unique, cons
     return true;
 }
 
+static bool native_kda_project_impl(int count, const void* const* weights, const int* types,
+                                    int tokens, const float* x, int n_in, int n_out, float* const* out);
+static long g_proj_calls1 = 0;     // single-token (decode) calls and their summed latency, for STRATA_GLM_TIMING
+static double g_proj_ms1 = 0.0;
 static bool native_kda_project(int count, const void* const* weights, const int* types,
                                int tokens, const float* x, int n_in, int n_out, float* const* out) {
+    if (tokens != 1) return native_kda_project_impl(count, weights, types, tokens, x, n_in, n_out, out);
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool ok = native_kda_project_impl(count, weights, types, tokens, x, n_in, n_out, out);
+    g_proj_ms1 += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ++g_proj_calls1;
+    return ok;
+}
+
+static bool native_kda_project_impl(int count, const void* const* weights, const int* types,
+                                    int tokens, const float* x, int n_in, int n_out, float* const* out) {
     struct Workspace {
         float* x = nullptr;
         float* y = nullptr;
@@ -1962,7 +1976,14 @@ int main(int argc, char** argv) {
                 if (!embed(best) || !run_x(x.data(), pos++, false, true, best, logit)) ok = false;
             }
             if (std::getenv("STRATA_GLM_TIMING"))
-                std::fprintf(stderr, "CACHE@request-end: %s\n", expert_device_runtime.cache.report().c_str());
+            {
+                double mm[4]; long mc = 0;
+                C::glm::glm_moe_single_token_timing(mm, &mc);
+                std::fprintf(stderr, "CACHE@request-end: %s\nPROJECT (single-token, cumulative): %ld calls, %.1f ms total, %.0f us each\n"
+                             "MOE1 (single-token stage, cumulative over %ld calls, ms): route %.0f  blobs %.0f  experts %.0f  shared %.0f\n",
+                             expert_device_runtime.cache.report().c_str(), g_proj_calls1, g_proj_ms1,
+                             g_proj_calls1 ? 1000.0 * g_proj_ms1 / (double) g_proj_calls1 : 0.0, mc, mm[0], mm[1], mm[2], mm[3]);
+            }
             if (std::getenv("STRATA_GLM_TIMING"))
                 std::fprintf(stderr, "CPU tier ms (cumulative): populate %.0f  gate/up %.0f  quant %.0f  down %.0f  gpu-wait %.0f  promote %.0f  lookup %.0f  fill-thread-sum %.0f | cpu evals %ld gpu evals %ld promoted %ld | host hits %ld fills %ld\n",
                              g_cpu_ms[0], g_cpu_ms[1], g_cpu_ms[2], g_cpu_ms[3], g_cpu_ms[4], g_cpu_ms[5], g_cpu_ms[6],

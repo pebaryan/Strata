@@ -22,6 +22,8 @@
 namespace strata::core::glm {
 
 namespace {
+double g_moe1_ms[4] = {0.0, 0.0, 0.0, 0.0};   // single-token MoE stage: route, blob lookup, experts, shared expert
+long g_moe1_calls = 0;
 GlmNativeFfnFn g_native_ffn = nullptr;
 GlmNativeFfnBatchFn g_native_ffn_batch = nullptr;
 GlmDeviceExpertFfnFn g_device_expert_ffn = nullptr;
@@ -97,7 +99,15 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
 
     int32_t ids[64];
     float weights[64];
+    auto lap_t = std::chrono::steady_clock::now();
+    auto lap = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - lap_t).count();
+        lap_t = now;
+        return ms;
+    };
     kernels::glm::moe_route(router, probs_b, g, xn, ids, weights);
+    g_moe1_ms[0] += lap();
     // Reported for the caller's benefit: which experts were chosen is otherwise invisible, and a mixture of
     // the right magnitude from the wrong experts looks exactly like a numerical error from the outside.
     if (ids_out != nullptr) {
@@ -115,6 +125,7 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
             return false;
         }
     }
+    g_moe1_ms[1] += lap();
 
     bool device_combined = false;
     if (g_device_moe_ffn != nullptr && glm_expert_layer_supported(fmt.gu_type, fmt.d_type)) {
@@ -149,6 +160,7 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
         }
     }
 
+    g_moe1_ms[2] += lap();
     // the weight is applied here, once - the per-expert work above is deliberately UNWEIGHTED
     if (!device_combined) {
         for (int j = 0; j < g.n_embd; ++j) {
@@ -172,7 +184,13 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
         }
         for (int j = 0; j < g.n_embd; ++j) out[j] += shr[j];
     }
+    g_moe1_ms[3] += lap();
+    ++g_moe1_calls;
     return true;
+}
+void glm_moe_single_token_timing(double ms[4], long* calls) {
+    for (int i = 0; i < 4; ++i) ms[i] = g_moe1_ms[i];
+    *calls = g_moe1_calls;
 }
 bool glm_try_native_ffn_batch(const void* const* weights, const int* types, const kernels::glm::MoeGeometry& g,
                               int tokens, const float* x, float* out, float clamp_limit) {

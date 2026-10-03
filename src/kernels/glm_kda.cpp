@@ -53,35 +53,45 @@ inline void matvec(const float* w, const float* x, float* out, int rows, int col
 /// [state(d_conv-1) | tokens]: out[t][ch] = sum_k w[k][ch] * x_conv[t+k][ch].  The state is the previous
 /// d_conv-1 inputs per channel and is zero for a fresh sequence (the reference concatenates it as
 /// ggml_concat(conv_state, transpose(x_proj)) and then runs ggml_ssm_conv).
-void conv1d_silu(const float* conv_w, const float* proj /* [tokens][d_inner] */, float* out, int tokens,
-                 int d_inner, int d_conv, float* history) {
-    // Every output row reads only the (unchanged) projection and the history snapshot, so token blocks are independent;
-    // the history update below runs after all of them.
-    constexpr int kBlock = 16;
-    pfor((tokens + kBlock - 1) / kBlock, [&](int b) {
-        const int t_end = std::min(tokens, (b + 1) * kBlock);
-        for (int t = b * kBlock; t < t_end; ++t) {
-            for (int ch = 0; ch < d_inner; ++ch) {
+void conv1d_silu_multi(int n_conv, const float* const* conv_w, const float* const* proj /* each [tokens][d_inner] */,
+                       float* const* out, int tokens, int d_inner, int d_conv, float* const* history) {
+    // Every output element reads only the (unchanged) projection and the history snapshot, so (conv, token block, channel
+    // block) jobs are independent: a single decoded token is still 3 x 8192 channels of SiLU (an expf each), which is why
+    // the channel axis is blocked too.  The history updates run after all of them.
+    constexpr int kTokBlock = 16, kChBlock = 2048;
+    const int tok_blocks = (tokens + kTokBlock - 1) / kTokBlock, ch_blocks = (d_inner + kChBlock - 1) / kChBlock;
+    pfor(n_conv * tok_blocks * ch_blocks, [&](int job) {
+        const int which = job / (tok_blocks * ch_blocks), rem = job % (tok_blocks * ch_blocks);
+        const int tb = rem / ch_blocks, cb = rem % ch_blocks;
+        const float* w = conv_w[which];
+        const float* src_x = proj[which];
+        const float* hist = history ? history[which] : nullptr;
+        float* dst = out[which];
+        const int t_end = std::min(tokens, (tb + 1) * kTokBlock), ch_end = std::min(d_inner, (cb + 1) * kChBlock);
+        for (int t = tb * kTokBlock; t < t_end; ++t) {
+            for (int ch = cb * kChBlock; ch < ch_end; ++ch) {
                 float acc = 0.0f;
                 for (int k = 0; k < d_conv; ++k) {
                     const int src = t + k - (d_conv - 1);
-                    const float v = src >= 0 ? proj[(size_t) src * d_inner + ch]
-                                             : (history ? history[(size_t) (d_conv - 1 + src) * d_inner + ch] : 0.0f);
-                    if (src < tokens) acc += conv_w[(size_t) k * d_inner + ch] * v;
+                    const float v = src >= 0 ? src_x[(size_t) src * d_inner + ch]
+                                             : (hist ? hist[(size_t) (d_conv - 1 + src) * d_inner + ch] : 0.0f);
+                    if (src < tokens) acc += w[(size_t) k * d_inner + ch] * v;
                 }
-                out[(size_t) t * d_inner + ch] = acc / (1.0f + std::exp(-acc));
+                dst[(size_t) t * d_inner + ch] = acc / (1.0f + std::exp(-acc));
             }
         }
     });
-    if (history) {
+    for (int which = 0; which < n_conv; ++which) {
+        float* hist = history ? history[which] : nullptr;
+        if (!hist) continue;
         for (int h = 0; h < d_conv - 1; ++h) {
             const int src = tokens - (d_conv - 1) + h;
             if (src >= 0) {
-                std::memcpy(history + (size_t) h * d_inner, proj + (size_t) src * d_inner,
+                std::memcpy(hist + (size_t) h * d_inner, proj[which] + (size_t) src * d_inner,
                             (size_t) d_inner * sizeof(float));
             } else {
-                std::memmove(history + (size_t) h * d_inner,
-                             history + (size_t) (d_conv - 1 + src) * d_inner,
+                std::memmove(hist + (size_t) h * d_inner,
+                             hist + (size_t) (d_conv - 1 + src) * d_inner,
                              (size_t) d_inner * sizeof(float));
             }
         }
@@ -170,9 +180,12 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
                 matvec(proj_w[which], xn.data() + (size_t) t * ne,
                        raw_dst[which] + (size_t) t * di, di, ne);
     }
-    for (int which = 0; which < 3; ++which) {
-        float* history = conv_state ? conv_state + (size_t) which * (g.d_conv - 1) * di : nullptr;
-        conv1d_silu(conv_w[which], raw_dst[which], conv_dst[which], tokens, di, g.d_conv, history);
+    {
+        float* histories[3];
+        for (int which = 0; which < 3; ++which)
+            histories[which] = conv_state ? conv_state + (size_t) which * (g.d_conv - 1) * di : nullptr;
+        const float* raw_in[3] = {raw_dst[0], raw_dst[1], raw_dst[2]};
+        conv1d_silu_multi(3, conv_w, raw_in, conv_dst, tokens, di, g.d_conv, conv_state ? histories : nullptr);
     }
     if (mid && mid->qc) std::memcpy(mid->qc, qc.data(), qc.size() * sizeof(float));
     if (mid && mid->kc) std::memcpy(mid->kc, kc.data(), kc.size() * sizeof(float));

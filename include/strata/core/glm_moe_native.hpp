@@ -41,6 +41,9 @@ void glm_set_device_moe_batch_ffn(GlmDeviceMoeBatchFfnFn fn, void* ctx);
 /// this build has no device path, so the caller degrades rather than failing.
 bool glm_try_native_ffn(const void* const* weights, const int* types, const kernels::glm::MoeGeometry& g,
                         const float* x, float* out, float clamp_limit);
+/// Cumulative wall time (ms) the single-token MoE stage spent in: routing, expert-blob lookup, the routed experts, the
+/// shared expert; and how many calls.  Diagnostics for STRATA_GLM_TIMING.
+void glm_moe_single_token_timing(double ms[4], long* calls);
 bool glm_try_native_ffn_batch(const void* const* weights, const int* types,
                               const kernels::glm::MoeGeometry& g, int tokens, const float* x,
                               float* out, float clamp_limit);
