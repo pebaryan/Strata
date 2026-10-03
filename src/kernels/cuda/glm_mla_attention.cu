@@ -49,6 +49,54 @@ __global__ void mla_latent_attention(const float* q,const float* cache,int n_cac
         out[(size_t)h*kv_lora+i]=acc/denom;
     }
 }
+
+// One warp per output row of a per-head matrix-vector product: y[h*rows+i] = sum_j m[(h*rows+i)*cols+j] * x[h*cols+j].
+// Serves both the K absorption (rows=kv_lora, cols=head_dim) and the V un-absorption (rows=head_dim, cols=kv_lora).
+__global__ void mla_head_matvec(const float* m,const float* x,float* y,int rows,int cols,int total_rows){
+    const int warp=(int)(blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5)),lane=(int)(threadIdx.x&31);
+    if(warp>=total_rows)return;
+    const int h=warp/rows;
+    const float* row=m+(size_t)warp*cols;const float* xh=x+(size_t)h*cols;
+    float acc=0.0f;
+    for(int j=lane;j<cols;j+=32)acc=fmaf(row[j],xh[j],acc);
+    for(int o=16;o>0;o>>=1)acc+=__shfl_down_sync(0xffffffffu,acc,o);
+    if(lane==0)y[warp]=acc;
+}
+}
+
+namespace {
+struct HeadMatvecState {
+    std::unordered_map<const float*,float*> weights;   // host pointer -> resident device copy (uploaded once)
+    float *x=nullptr,*y=nullptr;size_t x_cap=0,y_cap=0;
+    std::mutex mutex;
+    ~HeadMatvecState(){for(auto& kv:weights)cudaFree(kv.second);cudaFree(x);cudaFree(y);}
+};
+HeadMatvecState& head_state(){static HeadMatvecState s;return s;}
+}
+
+bool mla_head_matvec_cuda(const float* weights,const float* x,int n_head,int rows,int cols,float* y,
+                          char* error,size_t error_capacity){
+    auto fail=[&](const char* msg){if(error&&error_capacity)std::snprintf(error,error_capacity,"%s",msg);return false;};
+    if(!weights||!x||!y||n_head<1||rows<1||cols<1)return fail("invalid MLA head matvec arguments");
+    HeadMatvecState& s=head_state();std::lock_guard<std::mutex> lock(s.mutex);
+    const size_t wn=(size_t)n_head*rows*cols,xn=(size_t)n_head*cols,yn=(size_t)n_head*rows;
+    cudaError_t e=cudaSuccess;
+    auto it=s.weights.find(weights);
+    if(it==s.weights.end()){
+        float* dev=nullptr;
+        if((e=cudaMalloc(&dev,wn*sizeof(float)))!=cudaSuccess)return fail(cudaGetErrorString(e));
+        if((e=cudaMemcpy(dev,weights,wn*sizeof(float),cudaMemcpyHostToDevice))!=cudaSuccess){cudaFree(dev);return fail(cudaGetErrorString(e));}
+        it=s.weights.emplace(weights,dev).first;
+    }
+    if(xn>s.x_cap){cudaFree(s.x);s.x=nullptr;if(cudaMalloc(&s.x,xn*sizeof(float))!=cudaSuccess)return fail("MLA matvec scratch");s.x_cap=xn;}
+    if(yn>s.y_cap){cudaFree(s.y);s.y=nullptr;if(cudaMalloc(&s.y,yn*sizeof(float))!=cudaSuccess)return fail("MLA matvec scratch");s.y_cap=yn;}
+    if((e=cudaMemcpy(s.x,x,xn*sizeof(float),cudaMemcpyHostToDevice))!=cudaSuccess)return fail(cudaGetErrorString(e));
+    const int total=n_head*rows,blocks=(total+7)/8;
+    mla_head_matvec<<<blocks,256>>>(it->second,s.x,s.y,rows,cols,total);
+    if((e=cudaGetLastError())!=cudaSuccess)return fail(cudaGetErrorString(e));
+    if((e=cudaMemcpy(y,s.y,yn*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)return fail(cudaGetErrorString(e));
+    if(error&&error_capacity)error[0]='\0';
+    return true;
 }
 
 bool mla_attention_cuda(const float* qcur,const float* cache,int n_cache,int n_head,int head_dim,int kv_lora,

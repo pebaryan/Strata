@@ -12,8 +12,10 @@
 
 #include <cuda_runtime.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 #include "strata/kernels/elementwise.hpp"
 
@@ -55,6 +57,17 @@ bool GlmExpertDeviceScratch::alloc(int64_t n_embd_in, int64_t n_ff_in, std::stri
     if (up == nullptr && cudaMalloc((void**) &up, (size_t) n_ff * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc up"); return false; }
     if (out == nullptr && cudaMalloc((void**) &out, (size_t) n_embd * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc out"); return false; }
     if (accum == nullptr && cudaMalloc((void**) &accum, (size_t) n_embd * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc accum"); return false; }
+    const size_t bxq = 8 * (size_t) (n_embd / 32) * 40;
+    const size_t bhq = 8 * (size_t) (n_ff / 32) * 40;
+    if (batch_xq == nullptr && cudaMalloc(&batch_xq, bxq) != cudaSuccess) { err = cuda_reason("cudaMalloc batch_xq"); return false; }
+    if (batch_hq == nullptr && cudaMalloc(&batch_hq, bhq) != cudaSuccess) { err = cuda_reason("cudaMalloc batch_hq"); return false; }
+    if (batch_x == nullptr && cudaMalloc((void**) &batch_x, 8 * (size_t) n_embd * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc batch_x"); return false; }
+    if (batch_h == nullptr && cudaMalloc((void**) &batch_h, 8 * (size_t) n_ff * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc batch_h"); return false; }
+    if (batch_gate == nullptr && cudaMalloc((void**) &batch_gate, 8 * (size_t) n_ff * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc batch_gate"); return false; }
+    if (batch_up == nullptr && cudaMalloc((void**) &batch_up, 8 * (size_t) n_ff * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc batch_up"); return false; }
+    if (batch_out == nullptr && cudaMalloc((void**) &batch_out, 8 * (size_t) n_embd * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc batch_out"); return false; }
+    if (batch_accum == nullptr && cudaMalloc((void**) &batch_accum, 8 * (size_t) n_embd * 4) != cudaSuccess) { err = cuda_reason("cudaMalloc batch_accum"); return false; }
+    if (batch_accum && batch_accum_bytes == 0) batch_accum_bytes = 8 * (size_t) n_embd * sizeof(float);
     return true;
 }
 
@@ -68,6 +81,17 @@ void GlmExpertDeviceScratch::release() {
     if (up != nullptr) { cudaFree(up); up = nullptr; }
     if (out != nullptr) { cudaFree(out); out = nullptr; }
     if (accum != nullptr) { cudaFree(accum); accum = nullptr; }
+    if (batch_xq != nullptr) { cudaFree(batch_xq); batch_xq = nullptr; }
+    if (batch_hq != nullptr) { cudaFree(batch_hq); batch_hq = nullptr; }
+    if (batch_x != nullptr) { cudaFree(batch_x); batch_x = nullptr; }
+    if (batch_h != nullptr) { cudaFree(batch_h); batch_h = nullptr; }
+    if (batch_gate != nullptr) { cudaFree(batch_gate); batch_gate = nullptr; }
+    if (batch_up != nullptr) { cudaFree(batch_up); batch_up = nullptr; }
+    if (batch_out != nullptr) { cudaFree(batch_out); batch_out = nullptr; }
+    if (batch_accum != nullptr) { cudaFree(batch_accum); batch_accum = nullptr; }
+    if (batch_route_out != nullptr) { cudaFree(batch_route_out); batch_route_out = nullptr; }
+    if (batch_weights != nullptr) { cudaFree(batch_weights); batch_weights = nullptr; }
+    batch_accum_bytes = batch_route_out_bytes = batch_weights_bytes = 0;
     if (stream != nullptr) { cudaStreamDestroy((cudaStream_t) stream); stream = nullptr; }
     n_embd = n_ff = 0;
 }
@@ -161,6 +185,119 @@ bool glm_expert_moe_device_resident(const uint8_t* const* rows_device, const flo
     }
     const cudaError_t last = cudaGetLastError();
     if (last != cudaSuccess) { err = cuda_reason("after batched expert FFNs"); return false; }
+    return true;
+}
+
+bool glm_expert_moe_device_batch_resident(const uint8_t* const* rows_device, int n_unique,
+                                          const int32_t* route_slot, const float* weights, int tokens, int n_used,
+                                          const kernels::NativeExpertLayout& layout, int gu_type, int d_type,
+                                          int64_t n_embd, int64_t n_ff, const float* x_host, float* out_host,
+                                          GlmExpertDeviceScratch& s, std::string& err) {
+    if (!rows_device || !route_slot || !weights || !x_host || !out_host || n_unique <= 0 || n_used <= 0 ||
+        tokens <= 0 || tokens > 256 || n_unique > tokens * n_used) {
+        err = "batched device MoE requires valid rows/routes and 1..256 tokens";
+        return false;
+    }
+    if (!glm_expert_layer_supported(gu_type, d_type)) {
+        char buf[192];
+        std::snprintf(buf, sizeof buf, "iq_mmvq dispatch does not cover (gu %d, down %d); refusing batch MoE", gu_type, d_type);
+        err = buf;
+        return false;
+    }
+    if (layout.bytes == 0 || layout.gu_row == 0 || layout.d_row == 0 || layout.up_off >= layout.bytes ||
+        layout.down_off >= layout.bytes || s.n_embd != n_embd || s.n_ff != n_ff || !s.batch_xq || !s.batch_hq ||
+        !s.batch_x || !s.batch_h || !s.batch_gate || !s.batch_up || !s.batch_out || !s.batch_accum ||
+        !s.batch_accum || !s.stream || n_used > 64) {
+        err = "batched device MoE layout or scratch is invalid";
+        return false;
+    }
+    const size_t accum_bytes = (size_t) tokens * n_embd * sizeof(float);
+    const size_t route_bytes = (size_t) tokens * n_used * n_embd * sizeof(float);
+    const size_t weights_bytes = (size_t) tokens * n_used * sizeof(float);
+    if (accum_bytes > s.batch_accum_bytes) {
+        cudaFree(s.batch_accum); s.batch_accum = nullptr; s.batch_accum_bytes = 0;
+        if (cudaMalloc((void**) &s.batch_accum, accum_bytes) != cudaSuccess) {
+            err = cuda_reason("grow batch accumulator"); return false;
+        }
+        s.batch_accum_bytes = accum_bytes;
+    }
+    if (route_bytes > s.batch_route_out_bytes) {
+        cudaFree(s.batch_route_out); s.batch_route_out = nullptr; s.batch_route_out_bytes = 0;
+        if (cudaMalloc((void**) &s.batch_route_out, route_bytes) != cudaSuccess) {
+            err = cuda_reason("grow batch route outputs"); return false;
+        }
+        s.batch_route_out_bytes = route_bytes;
+    }
+    if (weights_bytes > s.batch_weights_bytes) {
+        cudaFree(s.batch_weights); s.batch_weights = nullptr; s.batch_weights_bytes = 0;
+        if (cudaMalloc((void**) &s.batch_weights, weights_bytes) != cudaSuccess) {
+            err = cuda_reason("grow batch route weights"); return false;
+        }
+        s.batch_weights_bytes = weights_bytes;
+    }
+    cudaStream_t stream = (cudaStream_t) s.stream;
+    if (cudaMemsetAsync(s.batch_accum, 0, accum_bytes, stream) != cudaSuccess) {
+        err = cuda_reason("clear batched MoE accumulator");
+        return false;
+    }
+    std::vector<int> selected((size_t) tokens), selected_route((size_t) tokens);
+    std::vector<float> input((size_t) 8 * n_embd);
+    for (int u = 0; u < n_unique; ++u) {
+        if (!rows_device[u]) { err = "batched device MoE contains a null expert row"; return false; }
+        int count = 0;
+        for (int t = 0; t < tokens; ++t) {
+            for (int k = 0; k < n_used; ++k) {
+                const size_t p = (size_t) t * n_used + k;
+                if (route_slot[p] == u) {
+                    selected[(size_t) count] = t;
+                    selected_route[(size_t) count++] = (int) p;
+                } else if (route_slot[p] < 0 || route_slot[p] >= n_unique) {
+                    err = "batched device MoE route index is outside the expert table";
+                    return false;
+                }
+            }
+        }
+        if (count == 0) continue;
+        for (int begin = 0; begin < count; begin += 8) {
+            const int rows = std::min(8, count - begin);
+            for (int r = 0; r < rows; ++r)
+                std::memcpy(input.data() + (size_t) r * n_embd,
+                            x_host + (size_t) selected[(size_t) (begin + r)] * n_embd,
+                            (size_t) n_embd * sizeof(float));
+            if (cudaMemcpyAsync(s.batch_x, input.data(), (size_t) rows * n_embd * sizeof(float),
+                                cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+                err = cuda_reason("upload grouped MoE activations");
+                return false;
+            }
+            kernels::quantize_q8_1_rows(s.batch_x, rows, n_embd, s.batch_xq, stream);
+            const uint8_t* row = rows_device[u];
+            kernels::iq_mmvq(gu_type, row, s.batch_xq, s.batch_gate, (int) n_embd, (int) n_ff, rows, stream);
+            kernels::iq_mmvq(gu_type, row + layout.up_off, s.batch_xq, s.batch_up, (int) n_embd, (int) n_ff,
+                            rows, stream);
+            kernels::silu_mul(s.batch_gate, s.batch_up, s.batch_h, rows * n_ff, stream);
+            kernels::quantize_q8_1_rows(s.batch_h, rows, n_ff, s.batch_hq, stream);
+            kernels::iq_mmvq(d_type, row + layout.down_off, s.batch_hq, s.batch_out, (int) n_ff, (int) n_embd,
+                            rows, stream);
+            for (int r = 0; r < rows; ++r)
+                if (cudaMemcpyAsync(s.batch_route_out + (size_t) selected_route[(size_t) (begin + r)] * n_embd,
+                                    s.batch_out + (size_t) r * n_embd, (size_t) n_embd * sizeof(float),
+                                    cudaMemcpyDeviceToDevice, stream) != cudaSuccess) {
+                    err = cuda_reason("stage grouped expert result");
+                    return false;
+                }
+        }
+    }
+    if (cudaMemcpyAsync(s.batch_weights, weights, weights_bytes, cudaMemcpyHostToDevice, stream) != cudaSuccess) {
+        err = cuda_reason("upload batch route weights"); return false;
+    }
+    kernels::weighted_routes(s.batch_route_out, s.batch_weights, s.batch_accum, n_embd, tokens, n_used, stream);
+    if (cudaStreamSynchronize(stream) != cudaSuccess) { err = cuda_reason("grouped expert kernels"); return false; }
+    if (cudaMemcpy(out_host, s.batch_accum, accum_bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+        err = cuda_reason("download batched MoE result");
+        return false;
+    }
+    const cudaError_t last = cudaGetLastError();
+    if (last != cudaSuccess) { err = cuda_reason("after grouped expert kernels"); return false; }
     return true;
 }
 

@@ -15,6 +15,10 @@ using GlmNativeFfnFn = bool (*)(const void* const* weights, const int* types,
                                 const kernels::glm::MoeGeometry& g, const float* x,
                                 float* out, float clamp_limit);
 void glm_set_native_ffn(GlmNativeFfnFn fn);
+using GlmNativeFfnBatchFn = bool (*)(const void* const* weights, const int* types,
+                                     const kernels::glm::MoeGeometry& g, int tokens, const float* x,
+                                     float* out, float clamp_limit);
+void glm_set_native_ffn_batch(GlmNativeFfnBatchFn fn);
 
 using GlmDeviceExpertFfnFn = bool (*)(void* ctx, int layer, int expert, const uint8_t* blob,
                                       const kernels::cpu::NativeFmt& fmt, const float* x, float* out,
@@ -25,12 +29,21 @@ using GlmDeviceMoeFfnFn = bool (*)(void* ctx, int layer, int n_experts, const in
                                    const kernels::cpu::NativeFmt& fmt, const float* x, float* out,
                                    std::string& err);
 void glm_set_device_moe_ffn(GlmDeviceMoeFfnFn fn, void* ctx);
+using GlmDeviceMoeBatchFfnFn = bool (*)(void* ctx, int layer, int n_unique, const int32_t* experts,
+                                        const uint8_t* const* blobs, int tokens, int n_used,
+                                        const int32_t* route_slot, const float* weights,
+                                        const kernels::cpu::NativeFmt& fmt, const float* x, float* out,
+                                        std::string& err);
+void glm_set_device_moe_batch_ffn(GlmDeviceMoeBatchFfnFn fn, void* ctx);
 
 /// Run the dense feed-forward through the native (device MMVQ) hook if one is installed and all three types are set.
 /// Returns false when the caller should fall back to the host expert_ffn - a missing hook is not an error, it just means
 /// this build has no device path, so the caller degrades rather than failing.
 bool glm_try_native_ffn(const void* const* weights, const int* types, const kernels::glm::MoeGeometry& g,
                         const float* x, float* out, float clamp_limit);
+bool glm_try_native_ffn_batch(const void* const* weights, const int* types,
+                              const kernels::glm::MoeGeometry& g, int tokens, const float* x,
+                              float* out, float clamp_limit);
 
 /// Stage 4c: the MoE site for streamed, quantized experts - what the 86 GB pack actually takes.
 ///
@@ -49,5 +62,14 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
                           const kernels::glm::MoeGeometry* shexp_g, const float* const* shared,
                           const int* shared_types, float shexp_clamp,
                           float* out, std::string& err, int* ids_out = nullptr);
+
+/// Multi-token routed FFN. Routing remains per row; selected expert rows are deduplicated and dispatched in groups.
+bool glm_stage_moe_native_batch(const float* xn, int tokens, const float* router, const float* probs_b,
+                                const kernels::glm::MoeGeometry& g, int layer,
+                                const kernels::cpu::NativeFmt& fmt,
+                                const uint8_t* (*blob_fn)(void*, int, int), void* blob_ctx,
+                                const kernels::glm::MoeGeometry* shexp_g, const float* const* shared,
+                                const int* shared_types, float shexp_clamp,
+                                float* out, std::string& err);
 
 }  // namespace strata::core::glm

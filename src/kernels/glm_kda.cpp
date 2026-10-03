@@ -2,6 +2,7 @@
 // correctness against the reference first, like the mHC and MLA.  The math and the traps are quoted in
 // the header; the oracle is tools/glm5_kda_reference.py and src/kernels/glm_kda_parity.cpp compares.
 #include "strata/kernels/glm_kda.hpp"
+#include "strata/kernels/glm_mla.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -84,6 +85,8 @@ bool kda_recurrence_cuda(const float*, const float*, const float*, const float*,
     if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
     return false;
 }
+void kda_set_lazy_state(bool) {}
+void kda_invalidate_state() {}
 bool kda_gates_cuda(const float*, const float*, const float*, const float*, const float*, const float*, int, int, int, int,
                     float*, float*, char* error, size_t error_capacity) {
     if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
@@ -135,9 +138,9 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     const int proj_type[3] = {w.wq_type, w.wk_type, w.wv_type};
     float* conv_dst[3] = {qc.data(), kc.data(), vc.data()};
     float* raw_dst[3] = {raw_q.data(), raw_k.data(), raw_v.data()};
-    if (tokens == 1 && g_native_project && proj_type[0] && proj_type[1] && proj_type[2]) {
+    if (g_native_project && proj_type[0] && proj_type[1] && proj_type[2]) {
         const void* native_w[3] = {proj_w[0], proj_w[1], proj_w[2]};
-        if (!g_native_project(3, native_w, proj_type, xn.data(), ne, di, raw_dst)) {
+        if (!g_native_project(3, native_w, proj_type, tokens, xn.data(), ne, di, raw_dst)) {
             std::fprintf(stderr, "GLM KDA native QKV projection failed\n");
             std::exit(1);
         }
@@ -294,8 +297,17 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
     std::vector<float> o((size_t) tokens * di);
     for (int t = 0; t < tokens; ++t) {
         const float* xt = xn.data() + (size_t) t * ne;
-        matvec(w.ssm_g_a, xt, ga.data(), hd, ne);
-        matvec(w.ssm_g_b, ga.data(), gb.data(), di, hd);
+        bool gate_dev = false;
+        if (g_device_gates) {
+            // Same resident-weight warp-per-row matvec the MLA absorption uses, with a single "head".
+            char cuda_err[256] = {};
+            gate_dev = mla_head_matvec_cuda(w.ssm_g_a, xt, 1, hd, ne, ga.data(), cuda_err, sizeof(cuda_err)) &&
+                       mla_head_matvec_cuda(w.ssm_g_b, ga.data(), 1, di, hd, gb.data(), cuda_err, sizeof(cuda_err));
+        }
+        if (!gate_dev) {
+            matvec(w.ssm_g_a, xt, ga.data(), hd, ne);
+            matvec(w.ssm_g_b, ga.data(), gb.data(), di, hd);
+        }
         for (int h = 0; h < nh; ++h) {
             const float* at = attn.data() + ((size_t) t * nh + h) * hd;
             double ss = 0.0;
@@ -313,11 +325,11 @@ void kda_forward(const KdaWeights& w, const KdaGeometry& g, const float* x, int 
 
     g_kda_ms[3] += kd_since(kd_t3);            // the delta-rule recurrence and its state traffic
     auto kd_t4 = kd_t();
-    if (tokens == 1 && g_native_project && w.wo_type) {
+    if (g_native_project && w.wo_type) {
         const void* native_w[1] = {w.wo};
         const int native_type[1] = {w.wo_type};
         float* native_out[1] = {out};
-        if (!g_native_project(1, native_w, native_type, o.data(), di, ne, native_out)) {
+        if (!g_native_project(1, native_w, native_type, tokens, o.data(), di, ne, native_out)) {
             std::fprintf(stderr, "GLM KDA native output projection failed\n");
             std::exit(1);
         }

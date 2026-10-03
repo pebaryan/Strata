@@ -70,6 +70,9 @@ void mla_set_device_attention(bool enabled);
 bool mla_attention_cuda(const float* qcur, const float* cache, int n_cache, int n_head, int head_dim, int kv_lora,
                         float* attn, char* error, size_t error_capacity);
 
+bool mla_head_matvec_cuda(const float* weights, const float* x, int n_head, int rows, int cols, float* y,
+                          char* error, size_t error_capacity);
+
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
                  float* out, const MlaIntermediates& want = {});
 

@@ -36,6 +36,9 @@ struct Scratch {
     }
 };
 Scratch& scratch() { static Scratch s; return s; }
+// Lazy state: the device copy is authoritative once uploaded; the host buffer goes stale and is only re-read after
+// kda_invalidate_state() (the serve loop's reset).  Saves a 4 MB compare and a 4 MB readback per KDA layer per call.
+bool g_lazy_state=false;
 
 __global__ void kda_recur(const float* q, const float* k, const float* v, const float* g,
                           const float* beta, int tokens, int nh, int hd, float* state, float* attn) {
@@ -70,13 +73,15 @@ __global__ void kda_recur(const float* q, const float* k, const float* v, const 
 }
 
 __global__ void kda_rows(const float* w,const float* x,float* y,int tokens,int rows,int cols) {
-    const int ix=(int)(blockIdx.x*blockDim.x+threadIdx.x), total=tokens*rows;
+    // One warp per output element: lanes stride the dot product, so the weight row is read coalesced.
+    const int ix=(int)(blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5)), lane=(int)(threadIdx.x&31), total=tokens*rows;
     if (ix>=total) return;
     const int t=ix/rows,r=ix%rows;
     const float* wr=w+(size_t)r*cols; const float* xr=x+(size_t)t*cols;
     float acc=0.0f;
-    for (int c=0;c<cols;++c) acc=fmaf(wr[c],xr[c],acc);
-    y[(size_t)t*rows+r]=acc;
+    for (int c=lane;c<cols;c+=32) acc=fmaf(wr[c],xr[c],acc);
+    for (int o=16;o>0;o>>=1) acc+=__shfl_down_sync(0xffffffffu,acc,o);
+    if (lane==0) y[(size_t)t*rows+r]=acc;
 }
 
 __global__ void kda_apply_gates(const float* fb,const float* beta_pre,const float* ssm_a,const float* dt_bias,
@@ -135,7 +140,7 @@ bool kda_recurrence_cuda(const float* q, const float* k, const float* v, const f
             e=cudaMemcpy(entry.device,state,st*sizeof(float),cudaMemcpyHostToDevice);
             if (e!=cudaSuccess) { cudaFree(entry.device); return fail(cudaGetErrorString(e)); }
             it=s.resident_states.emplace(state,std::move(entry)).first;
-        } else if (std::memcmp(it->second.host_shadow.data(),state,st*sizeof(float))!=0) {
+        } else if (!g_lazy_state && std::memcmp(it->second.host_shadow.data(),state,st*sizeof(float))!=0) {
             // The host buffer is authoritative: a request reset or external state edit invalidates residency.
             e=cudaMemcpy(it->second.device,state,st*sizeof(float),cudaMemcpyHostToDevice);
             if (e!=cudaSuccess) return fail(cudaGetErrorString(e));
@@ -151,13 +156,21 @@ bool kda_recurrence_cuda(const float* q, const float* k, const float* v, const f
         return fail(cudaGetErrorString(e));
     if ((e=cudaMemcpy(attn,s.attn,seq*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)
         return fail(cudaGetErrorString(e));
-    if (state) {
+    if (state && !g_lazy_state) {
         if ((e=cudaMemcpy(state,state_device,st*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)
             return fail(cudaGetErrorString(e));
         s.resident_states.find(state)->second.host_shadow.assign(state,state+st);
     }
     if (error && error_capacity) error[0]='\0';
     return true;
+}
+
+void kda_set_lazy_state(bool enabled) { std::lock_guard<std::mutex> lock(scratch().mutex); g_lazy_state=enabled; }
+
+void kda_invalidate_state() {
+    Scratch& s=scratch(); std::lock_guard<std::mutex> lock(s.mutex);
+    for (auto& kv:s.resident_states) cudaFree(kv.second.device);
+    s.resident_states.clear();
 }
 
 bool kda_gates_cuda(const float* xn,const float* ssm_f_a,const float* ssm_f_b,const float* ssm_beta,
@@ -180,9 +193,9 @@ bool kda_gates_cuda(const float* xn,const float* ssm_f_a,const float* ssm_f_b,co
         return fail("KDA gate weight upload failed");
     cudaError_t e=cudaMemcpy(s.x,xn,x_n*sizeof(float),cudaMemcpyHostToDevice);
     if(e!=cudaSuccess) return fail(cudaGetErrorString(e));
-    kda_rows<<<(tokens*hd+255)/256,256>>>(d_fa_w,s.x,s.fa,tokens,hd,n_embd);
-    kda_rows<<<(tokens*di+255)/256,256>>>(d_fb_w,s.fa,s.fb,tokens,di,hd);
-    kda_rows<<<(tokens*nh+255)/256,256>>>(d_beta_w,s.x,s.beta_pre,tokens,nh,n_embd);
+    kda_rows<<<(tokens*hd+7)/8,256>>>(d_fa_w,s.x,s.fa,tokens,hd,n_embd);
+    kda_rows<<<(tokens*di+7)/8,256>>>(d_fb_w,s.fa,s.fb,tokens,di,hd);
+    kda_rows<<<(tokens*nh+7)/8,256>>>(d_beta_w,s.x,s.beta_pre,tokens,nh,n_embd);
     const int count=(int)std::max(gate_n,beta_n);
     kda_apply_gates<<<(count+255)/256,256>>>(s.fb,s.beta_pre,d_a,d_bias,tokens,nh,hd,s.gate_out,s.beta_out);
     if((e=cudaGetLastError())!=cudaSuccess||(e=cudaDeviceSynchronize())!=cudaSuccess) return fail(cudaGetErrorString(e));

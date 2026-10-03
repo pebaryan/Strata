@@ -213,4 +213,130 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
     return true;
 }
 
+bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkProvider provider, void* provider_ctx,
+                             const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
+                             float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
+                             int first_layer) {
+    if (!x || !provider || !l_out) { err = "glm_trunk_forward_batch: null argument"; return false; }
+    if (tokens <= 0 || tokens > 256 || layers <= 0 || layers > GLM_TRUNK_BLOCKS) {
+        err = "glm_trunk_forward_batch: tokens must be 1..256 and layers within the trunk";
+        return false;
+    }
+    const int ne = kda_g.n_embd;
+    if (ne <= 0 || mla_g.n_embd != ne) {
+        err = "glm_trunk_forward_batch: the two attention geometries disagree on n_embd";
+        return false;
+    }
+    const size_t hc = HC_STREAMS, row = hc * (size_t) ne, n = (size_t) tokens;
+    std::vector<float> buf_a(n * row), buf_b(n * row), xn(n * ne), attn_out(n * ne), mid(n * row);
+    std::vector<float> ffn_in(n * ne), ffn_out(n * ne);
+    std::vector<kernels::glm::HcMix> mix_a(n), mix_f(n);
+    copy_floats(buf_a.data(), x, n * row);
+    float* cur = buf_a.data();
+    float* nxt = buf_b.data();
+
+    for (int i = 0; i < layers; ++i) {
+        const int layer = first_layer + i;
+        const bool is_mla = glm_attention_is_mla(layer) == 1;
+        const bool is_dense = glm_ffn_is_dense(layer);
+        GlmTrunkLayerWeights w;
+        if (!provider(provider_ctx, layer, w, err)) {
+            err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + ": " + err;
+            return false;
+        }
+        const bool common_ok = w.hc_attn_fn && w.hc_attn_base && w.hc_attn_scale && w.attn_norm &&
+                               w.hc_ffn_fn && w.hc_ffn_base && w.hc_ffn_scale && w.ffn_norm;
+        const bool attn_ok = is_mla ? (w.mla != nullptr) : (w.kda != nullptr);
+        const bool ffn_ok = is_dense ? (w.ffn_gate && w.ffn_up && w.ffn_down && w.moe_g)
+                                     : (w.moe_router && w.moe_g && w.moe_fmt && w.blob_fn);
+        if (!common_ok || !attn_ok || !ffn_ok) {
+            err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + ": required weights are missing";
+            return false;
+        }
+
+        for (int t = 0; t < tokens; ++t) {
+            if (!glm_stage_hc_norm(cur + (size_t) t * row, ne, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale,
+                                   is_mla ? w.attn_norm : nullptr, xn.data() + (size_t) t * ne, &mix_a[(size_t) t],
+                                   hc_rms_eps, stream, err)) {
+                err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " attention site: " + err;
+                return false;
+            }
+        }
+        if (is_mla) {
+            const int slot = state.mla_index ? state.mla_index[layer] : -1;
+            if (slot < 0 || !state.mla_cache || !state.mla_len) {
+                err = "glm_trunk_forward_batch: MLA layer has no cache slot";
+                return false;
+            }
+            float* cache = state.mla_cache[slot];
+            for (int t = 0; t < tokens; ++t) {
+                const int cells = state.mla_len[slot];
+                kernels::glm::MlaIntermediates want;
+                want.kv = cache + (size_t) cells * (size_t) mla_g.kv_lora;
+                if (!glm_stage_mla(*w.mla, mla_g, xn.data() + (size_t) t * ne, cells + 1, cache,
+                                   attn_out.data() + (size_t) t * ne, err, &want)) {
+                    err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " MLA: " + err;
+                    return false;
+                }
+                state.mla_len[slot] = cells + 1;
+            }
+        } else {
+            const int slot = state.kda_index ? state.kda_index[layer] : -1;
+            if (slot < 0 || !state.kda_state) {
+                err = "glm_trunk_forward_batch: KDA layer has no state slot";
+                return false;
+            }
+            float* conv = state.kda_conv ? state.kda_conv[slot] : nullptr;
+            if (!glm_stage_kda(xn.data(), *w.kda, kda_g, tokens, attn_out.data(), state.kda_state[slot], err, conv)) {
+                err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " KDA: " + err;
+                return false;
+            }
+        }
+        for (int t = 0; t < tokens; ++t) {
+            if (!glm_stage_hc_post(attn_out.data() + (size_t) t * ne, cur + (size_t) t * row,
+                                   mix_a[(size_t) t], ne, mid.data() + (size_t) t * row, err)) {
+                err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " attention hc_post: " + err;
+                return false;
+            }
+            if (!glm_stage_hc_norm(mid.data() + (size_t) t * row, ne, w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale,
+                                   w.ffn_norm, ffn_in.data() + (size_t) t * ne, &mix_f[(size_t) t], hc_rms_eps,
+                                   stream, err)) {
+                err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " FFN site: " + err;
+                return false;
+            }
+        }
+        if (is_dense) {
+            const void* weights[3] = {w.ffn_gate, w.ffn_up, w.ffn_down};
+            bool used_batch = glm_try_native_ffn_batch(weights, w.ffn_types, *w.moe_g, tokens,
+                                                        ffn_in.data(), ffn_out.data(), w.clamp_limit);
+            if (!used_batch) {
+                for (int t = 0; t < tokens; ++t) {
+                    if (!glm_stage_ffn(ffn_in.data() + (size_t) t * ne, w.ffn_gate, w.ffn_up, w.ffn_down, *w.moe_g,
+                                       ffn_out.data() + (size_t) t * ne, w.clamp_limit, err, w.ffn_types)) {
+                        err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " dense FFN: " + err;
+                        return false;
+                    }
+                }
+            }
+        } else {
+            if (!glm_stage_moe_native_batch(ffn_in.data(), tokens, w.moe_router, w.moe_probs_b, *w.moe_g,
+                                            layer, *w.moe_fmt, w.blob_fn, w.blob_ctx, w.shexp_g, w.shexp,
+                                            w.shexp_types, w.shexp_clamp, ffn_out.data(), err)) {
+                err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " routed FFN: " + err;
+                return false;
+            }
+        }
+        for (int t = 0; t < tokens; ++t) {
+            if (!glm_stage_hc_post(ffn_out.data() + (size_t) t * ne, mid.data() + (size_t) t * row,
+                                   mix_f[(size_t) t], ne, nxt + (size_t) t * row, err)) {
+                err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " FFN hc_post: " + err;
+                return false;
+            }
+        }
+        std::swap(cur, nxt);
+    }
+    copy_floats(l_out, cur, n * row);
+    return true;
+}
+
 }  // namespace strata::core::glm
