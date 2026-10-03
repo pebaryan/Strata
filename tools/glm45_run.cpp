@@ -302,16 +302,27 @@ public:
         cv_.notify_all();
     }
     void end() {
-        std::lock_guard<std::mutex> l(m_);
-        active_ = false;
-        ++gen_;
-        cv_.notify_all();
+        {
+            std::lock_guard<std::mutex> l(m_);
+            active_ = false;
+            ++gen_;
+            cv_.notify_all();
+        }
+        if (enabled_ && std::getenv("STRATA_GLM_TIMING"))
+            std::fprintf(stderr, "STREAMER (cumulative): reader busy %.1f s, compute side waited %.1f s for it\n",
+                         read_seconds(), wait_seconds());
     }
     bool active() const { return enabled_ && active_; }
 
     /// The staged row for (layer, expert), waiting for its bytes to arrive; nullptr when this layer is not being streamed.
     const uint8_t* blob(int layer, int expert) {
         if (!active() || layer < first_ || layer >= n_layers_ || expert < 0 || expert >= N_EXPERT) return nullptr;
+        struct WaitTimer {   // time the compute side spends waiting for the reader (the rest of a chunk is compute-bound)
+            std::atomic<long>& total; std::chrono::steady_clock::time_point t0;
+            ~WaitTimer() {
+                total += (long) std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count();
+            }
+        } wait_timer{wait_ns_, std::chrono::steady_clock::now()};
         std::unique_lock<std::mutex> l(m_);
         const size_t need = ((size_t) expert + 1) * row_[(size_t) layer];
         int s = -1;
@@ -1089,10 +1100,15 @@ static bool native_kda_project(int count, const void* const* weights, const int*
         return false;
     for (int i = 0; i < count; ++i) if (!strata::kernels::native_mmvq_supported(types[i])) return false;
     if (!ws.stream && cudaStreamCreateWithFlags(&ws.stream, cudaStreamNonBlocking) != cudaSuccess) return false;
-    const int max_rows = std::min(tokens, 8);  // native_mmvq's supported multi-column width
+    // A BLOCK of up to 256 tokens moves as one: one upload of its activations, quantization and mmvq in groups of 8 (the
+    // kernels' multi-column width) entirely on the device, and one download per weight.  Per-group copies to and from
+    // pageable host memory are synchronous, so with 8-token groups every group was a full host round trip and a
+    // 1024-token projection spent its time waiting rather than computing.
+    const int max_rows = std::min(tokens, 256);
+    const size_t q8_row = strata::kernels::native_q8_1_bytes(n_in, 1);          // bytes of one quantized activation column
     const size_t xb = (size_t) max_rows * n_in * sizeof(float);
     const size_t yb = (size_t) count * max_rows * n_out * sizeof(float);
-    const size_t qb = strata::kernels::native_q8_1_bytes(n_in, max_rows);
+    const size_t qb = (size_t) max_rows * q8_row;
     if (xb > ws.x_bytes || yb > ws.y_bytes || qb > ws.q_bytes) {
         if (cudaStreamSynchronize(ws.stream) != cudaSuccess) return false;
         if (ws.x) cudaFree(ws.x);
@@ -1104,19 +1120,26 @@ static bool native_kda_project(int count, const void* const* weights, const int*
             cudaMalloc(&ws.q, qb) != cudaSuccess) return false;
         ws.x_bytes = xb; ws.y_bytes = yb; ws.q_bytes = qb;
     }
-    for (int begin = 0; begin < tokens; begin += 8) {
-        const int rows = std::min(8, tokens - begin);
+    for (int begin = 0; begin < tokens; begin += max_rows) {
+        const int rows = std::min(max_rows, tokens - begin);
         if (cudaMemcpyAsync(ws.x, x + (size_t) begin * n_in, (size_t) rows * n_in * sizeof(float),
                             cudaMemcpyHostToDevice, ws.stream) != cudaSuccess) return false;
-        strata::kernels::native_quantize_q8_1(ws.x, ws.q, n_in, rows, (void*) ws.stream);
-        for (int i = 0; i < count; ++i) {
-            float* dy = ws.y + (size_t) i * rows * n_out;
-            strata::kernels::native_mmvq(types[i], weights[i], ws.q, dy, n_in, n_out, rows, (void*) ws.stream);
-            if (cudaMemcpyAsync(out[i] + (size_t) begin * n_out, dy, (size_t) rows * n_out * sizeof(float),
-                                cudaMemcpyDeviceToHost, ws.stream) != cudaSuccess) return false;
+        for (int g = 0; g < rows; g += 8) {
+            const int gr = std::min(8, rows - g);
+            uint8_t* gq = (uint8_t*) ws.q + (size_t) g * q8_row;
+            strata::kernels::native_quantize_q8_1(ws.x + (size_t) g * n_in, gq, n_in, gr, (void*) ws.stream);
+            for (int i = 0; i < count; ++i)
+                strata::kernels::native_mmvq(types[i], weights[i], gq, ws.y + ((size_t) i * max_rows + g) * n_out, n_in,
+                                             n_out, gr, (void*) ws.stream);
         }
+        for (int i = 0; i < count; ++i)
+            if (cudaMemcpyAsync(out[i] + (size_t) begin * n_out, ws.y + (size_t) i * max_rows * n_out,
+                                (size_t) rows * n_out * sizeof(float), cudaMemcpyDeviceToHost, ws.stream) != cudaSuccess)
+                return false;
+        // the block's device buffers are reused by the next block, so it must finish first
+        if (cudaStreamSynchronize(ws.stream) != cudaSuccess) return false;
     }
-    return cudaStreamSynchronize(ws.stream) == cudaSuccess;
+    return true;
 }
 
 static bool native_mla_project(int count, const void* const* weights, const int* types,

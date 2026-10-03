@@ -53,6 +53,11 @@ bool for_tokens(int n, std::string& err, F&& f) {
 
 void glm_set_parallel_for(GlmParallelForFn fn) { g_parallel_for = fn; }
 
+void glm_parallel_for(int n, const std::function<void(int)>& job) {
+    if (g_parallel_for != nullptr && n > 1) g_parallel_for(n, job);
+    else for (int i = 0; i < n; ++i) job(i);
+}
+
 namespace {
 GlmPrefetchFn g_layer_prefetch = nullptr;
 void* g_layer_prefetch_ctx = nullptr;

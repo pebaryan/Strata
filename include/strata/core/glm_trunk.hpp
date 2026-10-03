@@ -110,6 +110,8 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
 /// done.  Unset, those loops run serially.
 using GlmParallelForFn = void (*)(int n, const std::function<void(int)>& job);
 void glm_set_parallel_for(GlmParallelForFn fn);
+/// Runs job(0..n-1) on that pool, or serially when none is installed.  For other core stages with token-independent host work.
+void glm_parallel_for(int n, const std::function<void(int)>& job);
 
 /// Optional notification from the prompt path: called at the top of every layer with that layer's index, so every earlier
 /// layer is finished and the layers after it will be wanted next.  A streaming expert source uses it to keep reading ahead

@@ -5,7 +5,12 @@
 /// CPU library into a host-only binary drags ggml and its backends in, and every stage gate in this port is host-only
 /// and should stay that way.  The eventual chain target links both.
 #include "strata/core/glm_moe_native.hpp"
+#include "strata/core/glm_trunk.hpp"   // glm_parallel_for
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <map>
 #include <vector>
@@ -198,27 +203,45 @@ bool glm_stage_moe_native_batch(const float* xn, int tokens, const float* router
     }
 
     const int n_used = g.n_used;
+    using Clock = std::chrono::steady_clock;
+    const bool timing = std::getenv("STRATA_GLM_TIMING") != nullptr;
+    auto lap_t = Clock::now();
+    double ms_route = 0, ms_blobs = 0, ms_device = 0, ms_shared = 0;
+    auto lap = [&]() { const auto n = Clock::now(); const double ms = std::chrono::duration<double, std::milli>(n - lap_t).count(); lap_t = n; return ms; };
     std::vector<int32_t> route_slot((size_t) tokens * n_used);
     std::vector<float> weights((size_t) tokens * n_used);
+    std::vector<int32_t> ids_all((size_t) tokens * n_used);
+    // Routing is a 288 x n_embd matvec per token: independent across tokens, so it runs on the worker pool in blocks.
+    constexpr int kRouteBlock = 16;
+    glm_parallel_for((tokens + kRouteBlock - 1) / kRouteBlock, [&](int b) {
+        const int t_end = std::min(tokens, (b + 1) * kRouteBlock);
+        for (int t = b * kRouteBlock; t < t_end; ++t) {
+            int32_t ids[64];
+            float row_weights[64];
+            kernels::glm::moe_route(router, probs_b, g, xn + (size_t) t * g.n_embd, ids, row_weights);
+            for (int k = 0; k < n_used; ++k) {
+                ids_all[(size_t) t * n_used + k] = ids[k];
+                weights[(size_t) t * n_used + k] = row_weights[k];
+            }
+        }
+    });
     std::map<int32_t, int32_t> unique_index;
     std::vector<int32_t> unique_experts;
     for (int t = 0; t < tokens; ++t) {
-        int32_t ids[64];
-        float row_weights[64];
-        kernels::glm::moe_route(router, probs_b, g, xn + (size_t) t * g.n_embd, ids, row_weights);
         for (int k = 0; k < n_used; ++k) {
-            auto it = unique_index.find(ids[k]);
+            const int32_t id = ids_all[(size_t) t * n_used + k];
+            auto it = unique_index.find(id);
             if (it == unique_index.end()) {
                 const int32_t slot = (int32_t) unique_experts.size();
-                unique_index.emplace(ids[k], slot);
-                unique_experts.push_back(ids[k]);
+                unique_index.emplace(id, slot);
+                unique_experts.push_back(id);
                 route_slot[(size_t) t * n_used + k] = slot;
             } else {
                 route_slot[(size_t) t * n_used + k] = it->second;
             }
-            weights[(size_t) t * n_used + k] = row_weights[k];
         }
     }
+    ms_route = lap();
     std::vector<const uint8_t*> blobs(unique_experts.size());
     for (size_t u = 0; u < unique_experts.size(); ++u) {
         blobs[u] = blob_fn(blob_ctx, layer, unique_experts[u]);
@@ -227,11 +250,13 @@ bool glm_stage_moe_native_batch(const float* xn, int tokens, const float* router
             return false;
         }
     }
+    ms_blobs = lap();
     if (!g_device_moe_batch_ffn(g_device_moe_ctx, layer, (int) unique_experts.size(), unique_experts.data(),
                                 blobs.data(), tokens, n_used, route_slot.data(), weights.data(), fmt, xn, out, err)) {
         if (err.empty()) err = "glm_stage_moe_native_batch: batched device MoE failed";
         return false;
     }
+    ms_device = lap();
     // The shared expert is unweighted, just like the single-token path. Its dense projections still use the
     // validated single-row MMVQ adapter; routed experts above are now grouped across tokens.
     if (shared && shared[0] && shared[1] && shared[2] && shexp_g) {
@@ -261,6 +286,10 @@ bool glm_stage_moe_native_batch(const float* xn, int tokens, const float* router
             for (int j = 0; j < g.n_embd; ++j)
                 out[(size_t) t * g.n_embd + j] += shr[(size_t) t * g.n_embd + j];
     }
+    ms_shared = lap();
+    if (timing)
+        std::fprintf(stderr, "MOE_BATCH layer %d tokens %d unique %zu: route %.0f  blobs(wait) %.0f  device %.0f  shared %.0f ms\n",
+                     layer, tokens, unique_experts.size(), ms_route, ms_blobs, ms_device, ms_shared);
     return true;
 }
 
