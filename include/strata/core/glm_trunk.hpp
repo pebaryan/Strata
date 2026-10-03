@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <string>
 
 #include "strata/kernels/glm_kda.hpp"
@@ -103,6 +104,12 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
                        const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
                        float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
                        int first_layer = 0, GlmStageFn stage_fn = nullptr, void* stage_ctx = nullptr);
+
+/// Optional worker pool for the prompt path's per-token host stages (hyper-connection pre/norm/post), which are
+/// independent across tokens.  `fn(n, job)` must run job(0..n-1), in any order and on any threads, and return when all are
+/// done.  Unset, those loops run serially.
+using GlmParallelForFn = void (*)(int n, const std::function<void(int)>& job);
+void glm_set_parallel_for(GlmParallelForFn fn);
 
 /// Layer-major prompt path for a causal token chunk. Input/output rows are [tokens][HC][n_embd].
 /// KDA recurrence and MLA cache updates advance in token order within each layer; only independent

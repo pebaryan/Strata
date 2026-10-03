@@ -69,6 +69,22 @@ void ExpertRowCache::evict_until(std::size_t want) {
     }
 }
 
+bool ExpertRowCache::trim_one() {
+    while (!lru_.empty()) {
+        const ExpertRowKey victim = lru_.back();
+        lru_.pop_back();
+        pos_.erase(victim);
+        const auto it = map_.find(victim);
+        if (it == map_.end()) continue;
+        used_ -= it->second.bytes;
+        ++evictions_;
+        if (cfg_.on_evict != nullptr) cfg_.on_evict(cfg_.evict_ctx, victim, it->second);
+        map_.erase(it);
+        return true;
+    }
+    return false;
+}
+
 void ExpertRowCache::clear() {
     for (const auto& kv : map_) {
         if (cfg_.on_evict != nullptr) cfg_.on_evict(cfg_.evict_ctx, kv.first, kv.second);

@@ -80,6 +80,10 @@ public:
 
     void clear();
 
+    /// Drop the least recently used row (through on_evict) to give its memory back; false when the cache is empty.
+    /// For a caller that ran out of device memory for something more urgent than the cache.
+    bool trim_one();
+
     std::size_t bytes_used() const { return used_; }
     std::size_t budget() const { return cfg_.budget_bytes; }
     std::size_t entries() const { return map_.size(); }

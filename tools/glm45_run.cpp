@@ -247,17 +247,67 @@ static const uint8_t* blob_adapter(void* ctx, int layer, int expert) {
 // synchronises the whole device, and a cold decode token misses on up to ~340 rows.  Row sizes take only a few distinct
 // values (one per expert format), so the list stays tiny; its contents are at most the rows evicted and not yet reused.
 static std::unordered_map<size_t, std::vector<void*>> g_row_pool;
+static C::ExpertRowCache* g_reclaim_cache = nullptr;   // the GPU row cache; trimmed when an allocation cannot be met
+
+// Device memory that rows must never take: everything else the engine allocates lazily (projection and KDA workspaces,
+// MoE scratch that grows with the chunk, the CUDA runtime itself) needs room too, and a row allocation that leaves the
+// card at exactly zero free turns the next small cudaMalloc elsewhere into a hard failure.
+static const size_t kVramReserve = (size_t) 768 * 1024 * 1024;
+
+static void row_pool_drain() {
+    for (auto& kv : g_row_pool) {
+        for (void* q : kv.second) (void) cudaFree(q);
+        kv.second.clear();
+    }
+}
+
+static bool vram_room(size_t bytes) {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void) cudaGetLastError(); return true; }
+    return free_b >= bytes + kVramReserve;
+}
 
 static void* row_alloc(size_t bytes) {
     std::vector<void*>& v = g_row_pool[bytes];
     if (!v.empty()) { void* p = v.back(); v.pop_back(); return p; }
+    // Not enough room (counting the reserve): idle rows of OTHER sizes may be what holds it (a freed row only serves its
+    // own size class, and layers use several), so give those back first; then the coldest cached rows, one at a time -
+    // a prompt chunk needs every expert it selects at once (up to ~2.3 GB beyond the cache), a more urgent use of the
+    // memory than the least recently used cache entries.
+    if (!vram_room(bytes)) {
+        row_pool_drain();
+        for (int tries = 0; tries < 4096 && !vram_room(bytes) && g_reclaim_cache != nullptr && g_reclaim_cache->trim_one();
+             ++tries)
+            row_pool_drain();
+    }
     void* p = nullptr;
-    if (cudaMalloc(&p, bytes) != cudaSuccess) return nullptr;
+    if (cudaMalloc(&p, bytes) != cudaSuccess) { (void) cudaGetLastError(); return nullptr; }
     return p;
 }
 
 static void row_release(void* p, size_t bytes) {
     if (p != nullptr) g_row_pool[bytes].push_back(p);
+}
+
+// Before a prompt chunk: make sure the device has room for its workspaces (projection/KDA/MoE scratch scale with the
+// chunk length) by giving back the coldest cached rows if it does not.  Without this a cache sized for decode can fill
+// the card and the chunk dies on an allocation the row pool knows nothing about.
+static void ensure_prefill_headroom(int tokens) {
+    const size_t need = (size_t) 600 * 1024 * 1024 + (size_t) tokens * 768 * 1024;
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    int trimmed = 0;
+    while (free_b < need && g_reclaim_cache != nullptr && g_reclaim_cache->trim_one()) {
+        for (auto& kv : g_row_pool) {
+            for (void* q : kv.second) (void) cudaFree(q);
+            kv.second.clear();
+        }
+        ++trimmed;
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void) cudaGetLastError(); return; }
+    }
+    if (trimmed > 0)
+        std::fprintf(stderr, "prefill headroom: trimmed %d cached expert rows (%.2f GB free, %.2f GB wanted)\n", trimmed,
+                     (double) free_b / 1073741824.0, (double) need / 1073741824.0);
 }
 
 static void free_expert_row(void*, const C::ExpertRowKey&, const C::ExpertRowEntry& entry) {
@@ -816,7 +866,7 @@ static bool run_cached_device_moe_batch(void* raw, int layer, int n_unique, cons
     GlmExpertDeviceRuntime& runtime = *(GlmExpertDeviceRuntime*) raw;
     const KN::NativeExpertLayout layout =
         KN::native_expert_layout(fmt.gu_type, fmt.d_type, fmt.n_embd, fmt.n_ff);
-    if (!experts || !blobs || !route_slot || !weights || n_unique <= 0 || tokens <= 0 || tokens > 256 ||
+    if (!experts || !blobs || !route_slot || !weights || n_unique <= 0 || tokens <= 0 || tokens > 2048 ||
         layout.bytes == 0 || layout.bytes != fmt.bytes) {
         err = "batched device MoE layout/count disagrees with NativeFmt";
         return false;
@@ -1229,6 +1279,7 @@ int main(int argc, char** argv) {
     const char* cache_gb_env = std::getenv("STRATA_GLM_EXPERT_CACHE_GB");
     const double cache_gb = cache_gb_env ? std::atof(cache_gb_env) : 16.0;
     GlmExpertDeviceRuntime expert_device_runtime((size_t) (cache_gb * 1024.0 * 1024.0 * 1024.0));
+    g_reclaim_cache = &expert_device_runtime.cache;
     {
         const char* cm = std::getenv("STRATA_GLM_CPU_MISS");
         // Opt-in: with the 16 GB GPU cache the plain upload-and-cache path measured 5.1 t/s against 1.4 t/s for the
@@ -1242,6 +1293,9 @@ int main(int argc, char** argv) {
         else
             std::printf("CPU tier: off (every miss is uploaded)\n");
     }
+    // The prompt path's per-token hyper-connection stages are independent across tokens: spread them over the pool
+    // (STRATA_GLM_CPU_THREADS sets its size; 0 workers = serial).
+    C::glm::glm_set_parallel_for([](int n, const std::function<void(int)>& job) { cpu_pool().run(n, job); });
     // Host RAM tier (see HostRowCache).  Default: what the machine can spare beyond 9 GB of headroom.
     if (g_cpu_miss) {
         const char* hc = std::getenv("STRATA_GLM_HOST_CACHE_GB");
@@ -1528,7 +1582,7 @@ int main(int argc, char** argv) {
     // Prompt embeddings do not depend on trunk state. Gather them in small batches so a prompt
     // pays one launch/sync/copy per 128 tokens instead of one per token. The trunk itself remains
     // sequential because KDA recurrence and MLA cache updates are causal.
-    constexpr int EMBED_BATCH = 256;
+    constexpr int EMBED_BATCH = 2048;
     const size_t trunk_row = (size_t) HC * N_EMBD;
     int32_t* d_prompt_tokens = nullptr;
     float* d_prompt_embeds = nullptr;
@@ -1637,6 +1691,7 @@ int main(int argc, char** argv) {
                     std::memcpy(prompt_inputs.data() + (size_t) i * trunk_row, x.data(), trunk_row * sizeof(float));
                 }
                 if (!ok) break;
+                ensure_prefill_headroom(count);
                 if (!C::glm::glm_trunk_forward_batch(prompt_inputs.data(), count, N_LAYERS, provider, &P, P.kda_g,
                                                      P.mla_g, EPS, st, prompt_outputs.data(), nullptr, err)) {
                     ok = false; break;

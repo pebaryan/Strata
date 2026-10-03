@@ -30,7 +30,26 @@ void copy_floats(float* dst, const float* src, size_t n) {
     for (size_t i = 0; i < n; ++i) dst[i] = src[i];
 }
 
+GlmParallelForFn g_parallel_for = nullptr;
+
+/// Runs f(t, err_t) for every token, across the installed worker pool when there is one.  The per-token hyper-connection
+/// stages are host code with no shared state, so a 1024-token chunk is 1024 independent jobs; run serially they were
+/// ~35 s of the chunk.  Returns false with the first failing token's message.
+template <class F>
+bool for_tokens(int n, std::string& err, F&& f) {
+    std::vector<char> ok((size_t) n, 1);
+    std::vector<std::string> errs((size_t) n);
+    const std::function<void(int)> job = [&](int t) { if (!f(t, errs[(size_t) t])) ok[(size_t) t] = 0; };
+    if (g_parallel_for != nullptr && n > 1) g_parallel_for(n, job);
+    else for (int t = 0; t < n; ++t) job(t);
+    for (int t = 0; t < n; ++t)
+        if (!ok[(size_t) t]) { err = errs[(size_t) t]; return false; }
+    return true;
+}
+
 }  // namespace
+
+void glm_set_parallel_for(GlmParallelForFn fn) { g_parallel_for = fn; }
 
 bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, void* provider_ctx,
                        const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
@@ -218,8 +237,8 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
                              float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
                              int first_layer) {
     if (!x || !provider || !l_out) { err = "glm_trunk_forward_batch: null argument"; return false; }
-    if (tokens <= 0 || tokens > 256 || layers <= 0 || layers > GLM_TRUNK_BLOCKS) {
-        err = "glm_trunk_forward_batch: tokens must be 1..256 and layers within the trunk";
+    if (tokens <= 0 || tokens > 2048 || layers <= 0 || layers > GLM_TRUNK_BLOCKS) {
+        err = "glm_trunk_forward_batch: tokens must be 1..2048 and layers within the trunk";
         return false;
     }
     const int ne = kda_g.n_embd;
@@ -234,6 +253,14 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
     copy_floats(buf_a.data(), x, n * row);
     float* cur = buf_a.data();
     float* nxt = buf_b.data();
+    double phase_ms[3] = {0.0, 0.0, 0.0};   // hyper-connection stages, attention, routed/dense FFN
+    auto lap_t = std::chrono::steady_clock::now();
+    auto lap = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        const double ms = std::chrono::duration<double, std::milli>(now - lap_t).count();
+        lap_t = now;
+        return ms;
+    };
 
     for (int i = 0; i < layers; ++i) {
         const int layer = first_layer + i;
@@ -254,14 +281,16 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
             return false;
         }
 
-        for (int t = 0; t < tokens; ++t) {
-            if (!glm_stage_hc_norm(cur + (size_t) t * row, ne, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale,
-                                   is_mla ? w.attn_norm : nullptr, xn.data() + (size_t) t * ne, &mix_a[(size_t) t],
-                                   hc_rms_eps, stream, err)) {
-                err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " attention site: " + err;
-                return false;
-            }
+        lap();
+        if (!for_tokens(tokens, err, [&](int t, std::string& e) {
+                return glm_stage_hc_norm(cur + (size_t) t * row, ne, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale,
+                                         is_mla ? w.attn_norm : nullptr, xn.data() + (size_t) t * ne,
+                                         &mix_a[(size_t) t], hc_rms_eps, stream, e);
+            })) {
+            err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " attention site: " + err;
+            return false;
         }
+        phase_ms[0] += lap();
         if (is_mla) {
             const int slot = state.mla_index ? state.mla_index[layer] : -1;
             if (slot < 0 || !state.mla_cache || !state.mla_len) {
@@ -292,19 +321,18 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
                 return false;
             }
         }
-        for (int t = 0; t < tokens; ++t) {
-            if (!glm_stage_hc_post(attn_out.data() + (size_t) t * ne, cur + (size_t) t * row,
-                                   mix_a[(size_t) t], ne, mid.data() + (size_t) t * row, err)) {
-                err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " attention hc_post: " + err;
-                return false;
-            }
-            if (!glm_stage_hc_norm(mid.data() + (size_t) t * row, ne, w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale,
-                                   w.ffn_norm, ffn_in.data() + (size_t) t * ne, &mix_f[(size_t) t], hc_rms_eps,
-                                   stream, err)) {
-                err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " FFN site: " + err;
-                return false;
-            }
+        phase_ms[1] += lap();
+        if (!for_tokens(tokens, err, [&](int t, std::string& e) {
+                return glm_stage_hc_post(attn_out.data() + (size_t) t * ne, cur + (size_t) t * row, mix_a[(size_t) t], ne,
+                                         mid.data() + (size_t) t * row, e) &&
+                       glm_stage_hc_norm(mid.data() + (size_t) t * row, ne, w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale,
+                                         w.ffn_norm, ffn_in.data() + (size_t) t * ne, &mix_f[(size_t) t], hc_rms_eps,
+                                         stream, e);
+            })) {
+            err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " attention hc_post / FFN site: " + err;
+            return false;
         }
+        phase_ms[0] += lap();
         if (is_dense) {
             const void* weights[3] = {w.ffn_gate, w.ffn_up, w.ffn_down};
             bool used_batch = glm_try_native_ffn_batch(weights, w.ffn_types, *w.moe_g, tokens,
@@ -326,16 +354,21 @@ bool glm_trunk_forward_batch(const float* x, int tokens, int layers, GlmTrunkPro
                 return false;
             }
         }
-        for (int t = 0; t < tokens; ++t) {
-            if (!glm_stage_hc_post(ffn_out.data() + (size_t) t * ne, mid.data() + (size_t) t * row,
-                                   mix_f[(size_t) t], ne, nxt + (size_t) t * row, err)) {
-                err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " FFN hc_post: " + err;
-                return false;
-            }
+        phase_ms[2] += lap();
+        if (!for_tokens(tokens, err, [&](int t, std::string& e) {
+                return glm_stage_hc_post(ffn_out.data() + (size_t) t * ne, mid.data() + (size_t) t * row,
+                                         mix_f[(size_t) t], ne, nxt + (size_t) t * row, e);
+            })) {
+            err = "glm_trunk_forward_batch: layer " + std::to_string(layer) + " FFN hc_post: " + err;
+            return false;
         }
+        phase_ms[0] += lap();
         std::swap(cur, nxt);
     }
     copy_floats(l_out, cur, n * row);
+    if (std::getenv("STRATA_GLM_TIMING"))
+        std::fprintf(stderr, "BATCH_TIMING tokens=%d hc=%.0f attn=%.0f ffn=%.0f ms\n", tokens,
+                     phase_ms[0], phase_ms[1], phase_ms[2]);
     return true;
 }
 
