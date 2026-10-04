@@ -63,19 +63,8 @@ def write_profile(path, ranked, n_expert=N_EXPERT):
             f.write(struct.pack("<%di" % n_expert, *table[layer]))
 
 
-def main():
-    global N_LAYER, N_EXPERT
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("traces", nargs="*", help="routing traces from --dump-routing")
-    ap.add_argument("--base", default=str(ROOT / "data" / "expert-profile.bin"), help="ranking to keep first")
-    ap.add_argument("--no-base", action="store_true", help="rank by the traces only")
-    ap.add_argument("--out", default=str(ROOT / "data" / "expert-profile.bin"))
-    # A derived (pruned) checkpoint has its own shape: the profile it needs is LAYERS x EXPERTS pairs, and the
-    # shipped base profile describes the unpruned original, so such a model needs --no-base as well.
-    ap.add_argument("--layers", type=int, default=N_LAYER, help="model layers (default %(default)s)")
-    ap.add_argument("--n-expert", type=int, default=N_EXPERT, help="experts per layer (default %(default)s)")
-    a = ap.parse_args()
-    N_LAYER, N_EXPERT = a.layers, a.n_expert
+def rank_profile(base_pairs, trace_freq, n_expert=N_EXPERT, no_base=False, reorder=False):
+    """The ranked (layer, expert) list and the counts it was built from (`base`, `trace`, `fill`).
 
     Default: the base's order, then the traces' pairs most frequent first, then the fill.  With `reorder` (or
     `no_base`) the traces' pairs come first, so a base that already ranks every pair no longer hides them; the base
@@ -102,6 +91,7 @@ def main():
 
 
 def main():
+    global N_LAYER, N_EXPERT
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("traces", nargs="*", help="routing traces from --dump-routing")
     ap.add_argument("--base", default=str(ROOT / "data" / "expert-profile.bin"), help="ranking to keep first")
@@ -110,8 +100,10 @@ def main():
                     help="rank the traces' pairs before the base's (the base, then the fill, follow); needed with a "
                          "base that already ranks every pair, where --base alone cannot change the order")
     ap.add_argument("--out", default=str(ROOT / "data" / "expert-profile.bin"))
+    ap.add_argument("--layers", type=int, default=N_LAYER, help="model layers (default %(default)s)")
     ap.add_argument("--n-expert", type=int, default=N_EXPERT, help="experts per layer (default 512)")
     a = ap.parse_args()
+    N_LAYER, N_EXPERT = a.layers, a.n_expert
 
     ne = a.n_expert
     freq = defaultdict(int)
@@ -122,8 +114,8 @@ def main():
     ranked, counts = rank_profile(base_pairs, freq, ne, no_base=a.no_base, reorder=a.reorder)
     write_profile(a.out, ranked, ne)
     assert read_profile(a.out, ne) == ranked, "the profile did not survive the round trip"
-    print(f"wrote {a.out}: {N_LAYER}x{ne}, {len(ranked)} ranked pairs ({n_base} from the base, {n_trace} from the traces, "
-          f"{len(ranked) - n_base - n_trace} filled in)")
+    print(f"wrote {a.out}: {len(ranked)} ranked pairs ({counts['base']} from the base, {counts['trace']} from the "
+          f"traces, {counts['fill']} filled in)")
 
 
 if __name__ == "__main__":

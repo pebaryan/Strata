@@ -1,6 +1,7 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/verify.hpp"
-#include <cmath>          // LOCAL VOLTA PORT: std::isfinite at line 864 needs this under libstdc++
+#include <cmath>
+#include "strata/core/remote_expert_opt.hpp"
 #if defined(_WIN32)
 #include <intrin.h>
 #endif

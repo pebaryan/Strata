@@ -40,6 +40,12 @@ static bool glm5_eligible_name(const std::string& name) {
 /// different and which belong to the expert cache reading the pack's experts.bin, and their block-geometry
 /// check rejects them outright.
 static bool g_glm5_only = false;
+static int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1 means every layer
+static bool in_range(const std::string& name) {
+    if (g_layer_lb < 0 || name.rfind("blk.", 0) != 0) return true;
+    const int l = std::atoi(name.c_str() + 4);
+    return l >= g_layer_lb && l < g_layer_le;
+}
 
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     if (g_glm5_only) return glm5_eligible_name(tensor.name);
@@ -112,7 +118,14 @@ NativeDense::~NativeDense() {
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
-                       bool include_ple_key) {
+                       bool include_ple_key, int64_t layer_lo, int64_t layer_hi) {
+    auto outside = [&](const std::string& name) {
+        if (layer_hi >= 0 && name.rfind("blk.", 0) == 0) {
+            const long l = std::strtol(name.c_str() + 4, nullptr, 10);
+            return l < layer_lo || l >= layer_hi;
+        }
+        return false;
+    };
     // The artifact's OWN metadata decides which naming applies, before anything is served.
     try {
         strata::GgufFile first(shards.empty() ? std::string() : shards.front());
@@ -226,7 +239,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 }
             }
             for (const auto& tensor : gguf.tensors()) {
-                if (!eligible(tensor, include_ple_key)) continue;
+                if (!eligible(tensor, include_ple_key) || outside(tensor.name)) continue;
+                if (!in_range(tensor.name) && tensor.name.find("ple") == std::string::npos) continue;
                 // 3-D tensors (glm5next's MLA k_b/v_b): mark only, do not upload.  The MMVQ
                 // upload path is 2-D by construction - "incompatible matrix" is that assumption
                 // firing - and the MLA kernel wants its own layout anyway, so glm_bind.cpp fetches

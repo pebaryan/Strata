@@ -47,6 +47,23 @@ struct ExpertLayout {
 /// Plan v0.3 P6: whether this CPU (and its OS) runs the AVX-512 kernels (F, BW, VL, VNNI, VBMI).  Probed in a
 /// file compiled without AVX-512, so asking is safe everywhere; STRATA_FORCE_AVX2=1 answers no (for tests).
 bool cpu_avx512_ok();
+/// AVX-512BW / AVX-512VL / AVX-512DQ support used by the i-quant AVX-512 kernels.
+bool cpu_avx512bw_ok();
+/// AVX2 + FMA + F16C support.
+bool cpu_avx2_ok();
+/// AVX support for the AVX1 router path and older CPU builds.
+bool cpu_avx1_ok();
+/// SSE4.2 + POPCNT support for older CPU builds.
+bool cpu_sse42_ok();
+/// STRATA_FORCE_ISA cap: 3=none, 2=AVX2, 1=AVX, 0=SSE4.2.
+int cpu_isa_cap();
+/// The experimental CPU build's ISA floor, or empty for the normal build.
+const char* isa_floor_build();
+/// Whether Q2_0 uses Strata's native kernels on this CPU.
+inline bool q2_native_kernels(int type) { return type == 42 && cpu_avx2_ok(); }
+/// CPU brand string, or "unknown".
+std::string cpu_name();
+
 /// Q2_0 GGUF rows / activation quantizer on the kernels this CPU has.
 void q2_rows_any(const uint8_t* w, size_t row_bytes, int nblocks, const ActQ* const* a, int nt, float* const* out,
                  int r0, int r1);
