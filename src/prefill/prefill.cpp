@@ -92,6 +92,7 @@ constexpr int64_t N = 2560, HC = 4, D = N * HC, LR = 320, K = 10;
 // It sizes buffers AND drives the host-side expert loops (`host_res[l * NE + e]`, which is allocated as
 // g.n_layers * g.n_expert), so a pruned pack (256 experts) would both fail the geometry check below and
 // index past its own arrays.  Every NE site now resolves to the loaded layout's count.
+constexpr int MAX_NE = strata::kernels::cpu::NE;  // storage bounds; the active expert count comes from the loaded layout
 #define NE (strata::kernels::cpu::expert_layout().n_expert)
 constexpr int64_t C = 10240, ZV = 6144, HV = 48;
 // plan v0.3 P6: staging holds the largest blob of the pack (a native pack's blobs differ per layer)
@@ -399,7 +400,7 @@ struct PeerPrefill {
     cudaEvent_t ev_done = nullptr;  // on the peer: its rows have landed in the primary's Dm
     // multi-GPU: the result rows go back group by group on a second stream while the next group computes
     cudaStream_t s_out = nullptr;
-    static constexpr int kGrpEv = NE / 16 + 2;
+    static constexpr int kGrpEv = MAX_NE / 16 + 2;
     cudaEvent_t ev_grp[kGrpEv] = {};
     bool out_pending = false;       // s_out may still read Dm (the next layer's products wait for it)
     bool out_pipe = true;
@@ -448,7 +449,7 @@ struct PeerPrefill {
     int32_t* host_src = nullptr;          // the peer's rows' tokens (mapped, portable)
     int32_t* host_bounds = nullptr;       // its group bounds (mapped, portable)
     size_t host_x_cap = 0, host_rows_cap = 0, host_src_cap = 0;   // elements
-    static constexpr size_t kHostBounds = 2 * (NE + NE / 16 + 2) + 64;
+    static constexpr size_t kHostBounds = 2 * (MAX_NE + MAX_NE / 16 + 2) + 64;
     int64_t back_at = 0, back_rows = 0;
     std::vector<int32_t> bounds_host;
     std::vector<void*> owned;
