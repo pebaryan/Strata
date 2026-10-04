@@ -10,6 +10,7 @@
 /// between the sites is HC rows ([HC][n_embd]).  Both are float*, which is why the buffer names below say which is
 /// which rather than leaving it to the reader.
 #include "strata/core/glm_trunk.hpp"
+#include "strata/kernels/glm_indexer_device.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -79,6 +80,7 @@ bool device_trunk_eligible(GlmTrunkProvider provider, void* provider_ctx, int fi
     if (!state.kda_state || !state.kda_conv || !state.kda_index || !state.mla_cache || !state.mla_len || !state.mla_index)
         return false;
     static int weights_ok = -1;   // -1 unknown, 0 no, 1 yes
+    static bool sparse_ok = true;   // every MLA layer carries the indexer, so the 8192-position dense limit does not apply
     if (weights_ok < 0) {
         weights_ok = 1;
         for (int i = 0; i < layers && weights_ok; ++i) {
@@ -93,6 +95,7 @@ bool device_trunk_eligible(GlmTrunkProvider provider, void* provider_ctx, int fi
                 if (!w.mla || !w.attn_norm || !w.mla->wq_a_type || !w.mla->wq_b_type || !w.mla->kv_a_type || !w.mla->wo_type ||
                     !native_mmvq_supported(w.mla->wq_a_type) || !native_mmvq_supported(w.mla->wq_b_type) ||
                     !native_mmvq_supported(w.mla->kv_a_type) || !native_mmvq_supported(w.mla->wo_type)) weights_ok = 0;
+                if (!kernels::glm::idx_available(*w.mla)) sparse_ok = false;
             } else {
                 if (!w.kda || !w.kda->wq_type || !w.kda->wk_type || !w.kda->wv_type || !w.kda->wo_type ||
                     !native_mmvq_supported(w.kda->wq_type) || !native_mmvq_supported(w.kda->wk_type) ||
@@ -105,7 +108,7 @@ bool device_trunk_eligible(GlmTrunkProvider provider, void* provider_ctx, int fi
         const int layer = first_layer + i;
         if (glm_attention_is_mla(layer) != 1) continue;
         const int slot = state.mla_index[layer];
-        if (slot < 0 || state.mla_len[slot] + 1 > 8192) return false;
+        if (slot < 0 || (!sparse_ok && state.mla_len[slot] + 1 > 8192)) return false;
     }
     return true;
 }

@@ -33,7 +33,10 @@ class Runtime:
         while time.time() < deadline:
             line = self.proc.stdout.readline()
             if not line: raise RuntimeError("Strata GLM exited during startup")
-            if line.startswith("READY "): break
+            if line.startswith("READY "):
+                try: self.max_ctx = int(line.split()[3])
+                except (IndexError, ValueError): self.max_ctx = 8192
+                break
         else: raise TimeoutError("Strata GLM did not become ready")
 
     def _drain_err(self):
@@ -86,7 +89,7 @@ class Handler(BaseHTTPRequestHandler):
             prompt=rt.chat_prompt(req) if chat else req.get("prompt",req.get("content",""))
             if isinstance(prompt,list): prompt=prompt[0]
             ids=rt.tok.encode(str(prompt),True); max_new=int(req.get("max_tokens",req.get("n_predict",128)))
-            max_new=max(1,min(max_new,8192-len(ids)))
+            max_new=max(1,min(max_new,rt.max_ctx-len(ids)))
             if self.path == "/completion":
                 out=list(rt.generate_iter(ids,max_new)); text=rt.tok.decode(out)
                 return self.send_json(200,{"content":text,"tokens_predicted":len(out),"stop":bool(out and out[-1] in rt.eos)})

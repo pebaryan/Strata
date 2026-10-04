@@ -60,6 +60,7 @@
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/glm_indexer_device.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 
@@ -453,6 +454,26 @@ static void* row_alloc(size_t bytes) {
     void* p = nullptr;
     if (cudaMalloc(&p, bytes) != cudaSuccess) { (void) cudaGetLastError(); return nullptr; }
     return p;
+}
+
+// The indexer's device caches grow with the context while the expert cache is sized to fill the card: when one of its
+// allocations fails (kernels::glm::vram_malloc), give back the coldest cached expert rows until `bytes` plus a margin is free.
+static bool indexer_reclaim(size_t bytes) {
+    if (g_reclaim_cache == nullptr) return false;
+    const size_t want = bytes + (size_t) 256 * 1024 * 1024;
+    size_t free_b = 0, total_b = 0;
+    bool any = false;
+    row_pool_drain();
+    for (int tries = 0; tries < 65536; ++tries) {
+        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) { (void) cudaGetLastError(); break; }
+        if (free_b >= want) break;
+        if (!g_reclaim_cache->trim_one()) break;
+        any = true;
+        if ((tries & 15) == 15) row_pool_drain();
+    }
+    row_pool_drain();
+    if (any) std::fprintf(stderr, "indexer cache growth: trimmed expert rows to free %.2f GB\n", (double) want / 1073741824.0);
+    return any;
 }
 
 static void row_release(void* p, size_t bytes) {
@@ -1248,7 +1269,9 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
                 strata::kernels::native_mmvq_supported(t.native_type);
             const bool native_mla = !kda_layer && !dense &&
                 (t.name == "attn_q_a.weight" || t.name == "attn_q_b.weight" ||
-                 t.name == "attn_kv_a_mqa.weight" || t.name == "attn_output.weight") &&
+                 t.name == "attn_kv_a_mqa.weight" || t.name == "attn_output.weight" ||
+                 t.name == "indexer.attn_k.weight" || t.name == "indexer.attn_q_b.weight" ||
+                 t.name == "indexer_compressor_gate.weight") &&
                 strata::kernels::native_mmvq_supported(t.native_type);
             if (native_projection || native_shared || native_mla || native_dense_ffn) continue;
             // NO EXCEPTIONS, and the measurement is why: I first skipped the dense FFN's three tensors on blocks
@@ -1288,6 +1311,9 @@ static bool provider(void* raw, int layer, C::glm::GlmTrunkLayerWeights& out, st
             mw.wq_b_type = type_of("attn_q_b.weight");
             mw.kv_a_type = type_of("attn_kv_a_mqa.weight");
             mw.wo_type = type_of("attn_output.weight");
+            mw.idx_attn_k_type = type_of("indexer.attn_k.weight");
+            mw.idx_attn_q_b_type = type_of("indexer.attn_q_b.weight");
+            mw.idx_c_gate_type = type_of("indexer_compressor_gate.weight");
         }
         if (dense) {
             C::glm::GlmTrunkLayerWeights& tw = p->w[(size_t) layer];
@@ -1501,6 +1527,7 @@ int main(int argc, char** argv) {
     const double cache_gb = cache_gb_env ? std::atof(cache_gb_env) : 16.0;
     GlmExpertDeviceRuntime expert_device_runtime((size_t) (cache_gb * 1024.0 * 1024.0 * 1024.0));
     g_reclaim_cache = &expert_device_runtime.cache;
+    strata::kernels::glm::vram_set_reclaim(&indexer_reclaim);
     {
         const char* cm = std::getenv("STRATA_GLM_CPU_MISS");
         // Opt-in: with the 16 GB GPU cache the plain upload-and-cache path measured 5.1 t/s against 1.4 t/s for the
@@ -1744,7 +1771,13 @@ int main(int argc, char** argv) {
     }
 
     // ---- state: one KDA state per KDA layer, one MLA cache per MLA layer, both keyed by the ARTIFACT's layer number
-    const int cache_cells = serve ? 8192 : TOKENS;
+    // Context cells per MLA cache in serve mode.  Beyond 2051 positions the model reads only what its sparse indexer selects,
+    // which the device blocks apply, so the old 8192 ceiling is just a memory default now: STRATA_GLM_CTX raises or lowers it
+    // (host latent cache 22 KB/cell over the 11 MLA layers plus the same on the device and 2.8 KB/cell of indexer rows).
+    int serve_cells = 32768;
+    if (const char* env = std::getenv("STRATA_GLM_CTX")) serve_cells = std::max(2052, std::min(262144, std::atoi(env)));
+    const int cache_cells = serve ? serve_cells : TOKENS;
+    strata::kernels::glm::idx_set_capacity(cache_cells);
     std::vector<std::vector<float> > kda_state(N_LAYERS);
     std::vector<std::vector<float> > kda_conv(N_LAYERS);
     std::vector<std::vector<float> > mla_cache(N_LAYERS);
@@ -1923,7 +1956,7 @@ int main(int argc, char** argv) {
     };
 
     if (serve) {
-        std::printf("READY glm-5.3-flash %ld 8192\n", vocab); std::fflush(stdout);
+        std::printf("READY glm-5.3-flash %ld %d\n", vocab, cache_cells); std::fflush(stdout);
         std::string line;
         while (std::getline(std::cin, line)) {
             if (line == "QUIT") break;

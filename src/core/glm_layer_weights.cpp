@@ -123,20 +123,20 @@ bool glm_fill_layer_weights(const GlmBoundBlock& b, int layer, const kernels::gl
         }
         out.mla = &mla_storage;
         out.kda = nullptr;
-        // The indexer's twelve tensors (indexer.proj, indexer.k_norm.*, indexer_compressor_*, indexer.attn_{q_b,k})
-        // have no field in MlaWeights.  TOLERATED, not refused.  Refusing was right when a fixture could omit them
-        // and wrong the moment a real PACK was mapped: the pack always carries them, so this check made every one of
-        // the model's eleven MLA layers unmappable - which is exactly how it surfaced, on the engine's first attempt
-        // to build its own trunk.  They are legitimately unused here, because this model's selection is all-tokens
-        // below 8192 positions (mla_forward has no indexer fields for the same reason).  Still REPORTED - once, since
-        // it is a per-layer fact - because a prompt long enough to need the indexer would have to start here.
-        if (opt(b, "indexer.proj.weight") && !kGlmAppliesIndexer && !g_indexer_reported) {
-            std::fprintf(stderr,
-                         "glm_fill_layer_weights: the pack carries indexer tensors (first seen at layer %d); this "
-                         "build does not apply them - all-tokens selection below 8192 positions\n",
-                         layer);
-            g_indexer_reported = true;
-        }
+        // The indexer's tensors (indexer.proj, indexer.k_norm.*, indexer_compressor_*, indexer.attn_{q_b,k}) are optional
+        // here - a fixture may omit them - and bound when the pack has them.  The model reads only the best 512 four-cell
+        // pools plus the tail once a context passes ~2051 positions (top_k 2048 CELLS, kpool 4: confirmed from the GGUF
+        // metadata and the reference's build_dsa_top_k); the device MLA blocks apply it.  Anything that cannot (the host
+        // fallback path) is dense beyond that point and says so (mla_forward).  The loader's old claim that selection is
+        // all-tokens "below 8192 positions" was wrong: it holds only below ~2051.
+        mla_storage.idx_attn_k = opt(b, "indexer.attn_k.weight");
+        mla_storage.idx_attn_q_b = opt(b, "indexer.attn_q_b.weight");
+        mla_storage.idx_c_gate = opt(b, "indexer_compressor_gate.weight");
+        mla_storage.idx_k_norm_w = opt(b, "indexer.k_norm.weight");
+        mla_storage.idx_k_norm_b = opt(b, "indexer.k_norm.bias");
+        mla_storage.idx_proj = opt(b, "indexer.proj.weight");
+        mla_storage.idx_ape = opt(b, "indexer_compressor_ape.weight");
+        (void) g_indexer_reported;
     } else {
         kernels::glm::KdaWeights& k = kda_storage;
         if (!want(b, Names::kda_q, k.wq, err) || !want(b, Names::kda_k, k.wk, err) ||

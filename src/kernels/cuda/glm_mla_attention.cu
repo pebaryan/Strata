@@ -1,6 +1,7 @@
 #include <cuda_runtime.h>
 #include "strata/kernels/glm_mla.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/glm_indexer_device.hpp"
 #include <cmath>
 #include <cstdio>
 #include <mutex>
@@ -207,11 +208,56 @@ __global__ void mla_latent_attention_batch(const float* qcur,const float* cache,
     }
 }
 
+
+// The same attention over an explicit cell list (the indexer's selection): token t reads cells[t*IDX_CELL_STRIDE .. + ncells[t]).
+// Scores live in shared memory (<= IDX_CELL_STRIDE floats).
+__global__ void mla_latent_attention_cells(const float* qcur,const float* cache,const int* cells,const int* ncells,int kv_lora,float scale,float* out){
+    extern __shared__ float sc[];
+    __shared__ float qs[512];
+    __shared__ float red[8];
+    __shared__ float bcast;
+    const int t=(int)blockIdx.x,h=(int)blockIdx.y,tid=(int)threadIdx.x,warp=tid>>5,lane=tid&31;
+    const int n=ncells[t];
+    const int* cl=cells+(size_t)t*IDX_CELL_STRIDE;
+    const float* qh=qcur+((size_t)t*gridDim.y+h)*kv_lora;
+    for(int i=tid;i<kv_lora;i+=blockDim.x)qs[i]=qh[i];
+    __syncthreads();
+    float local_max=-1.0e30f;
+    for(int j=warp;j<n;j+=8){
+        const float* kt=cache+(size_t)cl[j]*kv_lora;float acc=0.0f;
+        for(int i=lane;i<kv_lora;i+=32)acc=fmaf(qs[i],kt[i],acc);
+        for(int o=16;o>0;o>>=1)acc+=__shfl_down_sync(0xffffffffu,acc,o);
+        if(lane==0){const float s=acc*scale;sc[j]=s;local_max=fmaxf(local_max,s);}
+    }
+    for(int o=16;o>0;o>>=1)local_max=fmaxf(local_max,__shfl_down_sync(0xffffffffu,local_max,o));
+    if(lane==0)red[warp]=local_max;
+    __syncthreads();
+    if(tid==0){float m=red[0];for(int w=1;w<8;++w)m=fmaxf(m,red[w]);bcast=m;}
+    __syncthreads();
+    const float max_score=bcast;
+    float local_sum=0.0f;
+    for(int j=tid;j<n;j+=blockDim.x){const float p=expf(sc[j]-max_score);sc[j]=p;local_sum+=p;}
+    for(int o=16;o>0;o>>=1)local_sum+=__shfl_down_sync(0xffffffffu,local_sum,o);
+    __syncthreads();
+    if(lane==0)red[warp]=local_sum;
+    __syncthreads();
+    if(tid==0){float s=0.0f;for(int w=0;w<8;++w)s+=red[w];bcast=s;}
+    __syncthreads();
+    const float denom=bcast;
+    float* oh=out+((size_t)t*gridDim.y+h)*kv_lora;
+    for(int i=tid;i<kv_lora;i+=blockDim.x){
+        float acc=0.0f;
+        for(int j=0;j<n;++j)acc=fmaf(sc[j],cache[(size_t)cl[j]*kv_lora+i],acc);
+        oh[i]=acc/denom;
+    }
+}
+
 struct BatchScratch{
-    float *q=nullptr,*qcur=nullptr,*attn=nullptr,*v=nullptr;
-    size_t q_cap=0,qcur_cap=0,attn_cap=0,v_cap=0;
+    float *q=nullptr,*qcur=nullptr,*attn=nullptr,*v=nullptr,*xin=nullptr,*qrin=nullptr;
+    size_t q_cap=0,qcur_cap=0,attn_cap=0,v_cap=0,xin_cap=0,qrin_cap=0;
+    cudaStream_t stream=nullptr;   // the indexer's native kernels need an explicit stream; a blocking-flag one orders with the default stream
     std::mutex mutex;
-    ~BatchScratch(){cudaFree(q);cudaFree(qcur);cudaFree(attn);cudaFree(v);}
+    ~BatchScratch(){cudaFree(q);cudaFree(qcur);cudaFree(attn);cudaFree(v);cudaFree(xin);cudaFree(qrin);if(stream)cudaStreamDestroy(stream);}
     bool reserve(float*& p,size_t& cap,size_t n){
         if(p&&n<=cap)return true;
         if(p)cudaFree(p);
@@ -234,11 +280,17 @@ float* resident_head_weights(const float* host,size_t n){
 }
 }  // namespace
 
-bool mla_attend_batch_cuda(const float* wk_b,const float* wv_b,const float* q,const float* cache,int c_base,int S,
-                           int n_head,int head_dim,int kv_lora,float* v_out,char* error,size_t error_capacity){
+// The one implementation behind both entry points.  With `iw` (and the layer's attn-normed `x` and normed q_a output `qr`,
+// [S][n_embd] / [S][q_lora] on the host) it also feeds the sparse indexer: the rows of these S tokens are written, and from
+// IDX_SPARSE_FROM positions on each token attends only the cells the indexer selects.  Without it the attention is dense,
+// which is the model's own behaviour only up to 2051 positions (and the device kernel's limit is 8192).
+static bool attend_batch_impl(const MlaWeights* iw,const MlaGeometry* ig,const float* x_host,const float* qr_host,
+                              const float* wk_b,const float* wv_b,const float* q,const float* cache,int c_base,int S,
+                              int n_head,int head_dim,int kv_lora,float* v_out,char* error,size_t error_capacity){
     auto fail=[&](const char* msg){if(error&&error_capacity)std::snprintf(error,error_capacity,"%s",msg);return false;};
     const int n_total=c_base+S;
-    if(!wk_b||!wv_b||!q||!cache||!v_out||S<1||c_base<0||n_total>8192||n_head<1||head_dim<1||kv_lora<1||kv_lora>512)
+    const bool use_idx=iw&&ig&&x_host&&qr_host&&idx_available(*iw);
+    if(!wk_b||!wv_b||!q||!cache||!v_out||S<1||c_base<0||(n_total>8192&&!use_idx)||n_head<1||head_dim<1||kv_lora<1||kv_lora>512)
         return fail("invalid batched MLA arguments");
     float* dk=resident_head_weights(wk_b,(size_t)n_head*kv_lora*head_dim);
     float* dv=resident_head_weights(wv_b,(size_t)n_head*head_dim*kv_lora);
@@ -275,13 +327,56 @@ bool mla_attend_batch_cuda(const float* wk_b,const float* wv_b,const float* q,co
     it->second.last_n=n_total;
     const size_t tot_k=(size_t)S*n_head*kv_lora,tot_v=(size_t)S*n_head*head_dim;
     mla_head_matvec_tokens<<<(unsigned)((tot_k+7)/8),256>>>(dk,b.q,b.qcur,kv_lora,head_dim,n_head,tot_k);
-    mla_latent_attention_batch<<<dim3((unsigned)S,(unsigned)n_head),256,(size_t)n_total*sizeof(float)>>>(
-        b.qcur,it->second.device,c_base,kv_lora,1.0f/std::sqrt((float)head_dim),b.attn);
+    const float scale=1.0f/std::sqrt((float)head_dim);
+    bool sparse=false;
+    if(use_idx){
+        char ie[160]="";
+        if(!b.stream&&cudaStreamCreate(&b.stream)!=cudaSuccess)return fail("indexer stream creation failed");
+        void* sv=(void*)b.stream;
+        const size_t xn=(size_t)S*ig->n_embd,qn=(size_t)S*ig->q_lora;
+        if(!b.reserve(b.xin,b.xin_cap,xn)||!b.reserve(b.qrin,b.qrin_cap,qn))return fail("indexer scratch allocation failed");
+        e=cudaMemcpyAsync(b.xin,x_host,xn*sizeof(float),cudaMemcpyHostToDevice,b.stream);
+        if(e==cudaSuccess)e=cudaMemcpyAsync(b.qrin,qr_host,qn*sizeof(float),cudaMemcpyHostToDevice,b.stream);
+        if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
+        const int wr=idx_write_device(*iw,*ig,cache,b.xin,S,c_base,sv,ie,sizeof(ie));
+        if(wr<0)return fail(ie);
+        if(n_total>=IDX_SPARSE_FROM){
+            sparse=wr==1;
+            const int cmax=idx_max_tokens();
+            for(int off=0;sparse&&off<S;off+=cmax){
+                const int tc=std::min(cmax,S-off);
+                int32_t *dc=nullptr,*dn=nullptr;
+                const int rd=idx_cells_device(*iw,*ig,cache,b.xin+(size_t)off*ig->n_embd,b.qrin+(size_t)off*ig->q_lora,tc,c_base+off,&dc,&dn,sv,ie,sizeof(ie));
+                if(rd<0)return fail(ie);
+                if(rd!=1){sparse=false;break;}
+                mla_latent_attention_cells<<<dim3((unsigned)tc,(unsigned)n_head),256,(size_t)IDX_CELL_STRIDE*sizeof(float),b.stream>>>(
+                    b.qcur+(size_t)off*n_head*kv_lora,it->second.device,dc,dn,kv_lora,scale,b.attn+(size_t)off*n_head*kv_lora);
+            }
+            if(!sparse){
+                static bool warned=false;
+                if(!warned){warned=true;std::fprintf(stderr,"[mla] sparse indexer unavailable at %d positions (%s): attending densely\n",n_total,ie);}
+                if(n_total>8192)return fail("no sparse indexer beyond 8192 positions");
+            }
+        }
+    }
+    if(!sparse)
+        mla_latent_attention_batch<<<dim3((unsigned)S,(unsigned)n_head),256,(size_t)n_total*sizeof(float)>>>(
+            b.qcur,it->second.device,c_base,kv_lora,scale,b.attn);
     mla_head_matvec_tokens<<<(unsigned)((tot_v+7)/8),256>>>(dv,b.attn,b.v,head_dim,kv_lora,n_head,tot_v);
     if((e=cudaGetLastError())!=cudaSuccess||(e=cudaDeviceSynchronize())!=cudaSuccess)return fail(cudaGetErrorString(e));
     if((e=cudaMemcpy(v_out,b.v,(size_t)S*q_dim*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)return fail(cudaGetErrorString(e));
     if(error&&error_capacity)error[0]='\0';
     return true;
+}
+
+bool mla_attend_batch_cuda(const float* wk_b,const float* wv_b,const float* q,const float* cache,int c_base,int S,
+                           int n_head,int head_dim,int kv_lora,float* v_out,char* error,size_t error_capacity){
+    return attend_batch_impl(nullptr,nullptr,nullptr,nullptr,wk_b,wv_b,q,cache,c_base,S,n_head,head_dim,kv_lora,v_out,error,error_capacity);
+}
+
+bool mla_attend_batch_idx_cuda(const MlaWeights& w,const MlaGeometry& g,const float* x,const float* qr,const float* q,const float* cache,
+                               int c_base,int S,float* v_out,char* error,size_t error_capacity){
+    return attend_batch_impl(&w,&g,x,qr,w.wk_b,w.wv_b,q,cache,c_base,S,g.n_head,g.head_dim,g.kv_lora,v_out,error,error_capacity);
 }
 
 // ---- the device-resident single-token MLA block (decode) ---------------------------------------------------------------
@@ -355,7 +450,7 @@ static int mla_block_impl(const MlaWeights& w,const MlaGeometry& g,const float* 
     using namespace strata::kernels;
     const bool host_io=x_host&&out_host;
     const bool dev_io=d_x_ext&&d_out_ext&&ext_stream;
-    if((!host_io&&!dev_io)||!cache_host||!kv_row_host||n_cache<1||n_cache>8192)return decline("arguments or context out of range");
+    if((!host_io&&!dev_io)||!cache_host||!kv_row_host||n_cache<1||(n_cache>8192&&!idx_available(w)))return decline("arguments or context out of range");
     if(!w.wq_a_type||!w.wq_b_type||!w.kv_a_type||!w.wo_type||!native_mmvq_supported(w.wq_a_type)||
        !native_mmvq_supported(w.wq_b_type)||!native_mmvq_supported(w.kv_a_type)||!native_mmvq_supported(w.wo_type))
         return decline("projection types not native");
@@ -410,8 +505,32 @@ static int mla_block_impl(const MlaWeights& w,const MlaGeometry& g,const float* 
     cudaMemcpyAsync(kv_row_host,d.kv,(size_t)kvl*sizeof(float),cudaMemcpyDeviceToHost,st);
     const size_t tot_k=(size_t)nh*kvl,tot_v=(size_t)nh*hdim;
     mla_head_matvec_tokens<<<(unsigned)((tot_k+7)/8),256,0,st>>>(dk,d.q,d.qcur,kvl,hdim,nh,tot_k);
-    mla_latent_attention_batch<<<dim3(1,(unsigned)nh),256,(size_t)n_cache*sizeof(float),st>>>(
-        d.qcur,cache_dev,n_cache-1,kvl,1.0f/std::sqrt((float)hdim),d.attn);
+    // The sparse indexer: its rows are written for EVERY position (they cannot be rebuilt later), and from IDX_SPARSE_FROM
+    // positions on the layer reads only the cells it selects.  Where it cannot (rows missing, scratch), the dense kernel
+    // below runs and says so once - beyond 8192 positions there is no dense fallback at all.
+    int32_t *d_cells=nullptr,*d_ncells=nullptr;
+    bool sparse=false;
+    if(idx_available(w)){
+        char ie[160]="";
+        const int wr=idx_write_device(w,g,cache_host,xin,1,n_cache-1,sv,ie,sizeof(ie));
+        if(wr<0)return fail(ie);
+        if(n_cache>=IDX_SPARSE_FROM){
+            const int rd=wr==1?idx_cells_device(w,g,cache_host,xin,d.qr,1,n_cache-1,&d_cells,&d_ncells,sv,ie,sizeof(ie)):0;
+            if(rd<0)return fail(ie);
+            sparse=rd==1;
+            if(!sparse){
+                static bool warned=false;
+                if(!warned){warned=true;std::fprintf(stderr,"[mla] sparse indexer unavailable at %d positions (%s): attending densely\n",n_cache,ie);}
+                if(n_cache>8192)return decline("no sparse indexer beyond 8192 positions");
+            }
+        }
+    }
+    if(sparse)
+        mla_latent_attention_cells<<<dim3(1,(unsigned)nh),256,(size_t)IDX_CELL_STRIDE*sizeof(float),st>>>(
+            d.qcur,cache_dev,d_cells,d_ncells,kvl,1.0f/std::sqrt((float)hdim),d.attn);
+    else
+        mla_latent_attention_batch<<<dim3(1,(unsigned)nh),256,(size_t)n_cache*sizeof(float),st>>>(
+            d.qcur,cache_dev,n_cache-1,kvl,1.0f/std::sqrt((float)hdim),d.attn);
     mla_head_matvec_tokens<<<(unsigned)((tot_v+7)/8),256,0,st>>>(dv,d.attn,d.v,hdim,kvl,nh,tot_v);
     native_quantize_q8_1(d.v,d.vq,qd,1,sv);
     native_mmvq(w.wo_type,w.wo,d.vq,outp,qd,ne,1,sv);

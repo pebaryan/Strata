@@ -45,6 +45,18 @@ struct MlaWeights {
     /// beside it has had wq_type/wk_type/wv_type/wo_type for a while.  A non-zero type means the pointer is the
     /// artifact's own quantized blocks on the device and the native projection hook reads it in place.
     int wq_a_type = 0, wq_b_type = 0, kv_a_type = 0, wo_type = 0;
+
+    /// The sparse indexer's tensors (null when the pack has none).  Beyond ~2051 positions the model reads only the best 512
+    /// four-cell pools plus the tail, chosen by this indexer; see glm_indexer.hpp.  The three projections are native (Q8_0)
+    /// device blocks like the weights above, the rest F32.
+    const float* idx_attn_k = nullptr;     ///< [128][n_embd]
+    const float* idx_attn_q_b = nullptr;   ///< [32*128][q_lora]
+    const float* idx_c_gate = nullptr;     ///< [128][n_embd]  (indexer_compressor_gate)
+    const float* idx_k_norm_w = nullptr;   ///< [128]
+    const float* idx_k_norm_b = nullptr;   ///< [128]
+    const float* idx_proj = nullptr;       ///< [32][n_embd]
+    const float* idx_ape = nullptr;        ///< [4][128]  (indexer_compressor_ape)
+    int idx_attn_k_type = 0, idx_attn_q_b_type = 0, idx_c_gate_type = 0;
 };
 
 /// Optional intermediate outputs, for a parity test to localize a mismatch.  Any pointer may be null.
@@ -88,10 +100,16 @@ void mla_set_parallel_for(MlaParallelFor fn);
 bool mla_attend_batch_cuda(const float* wk_b, const float* wv_b, const float* q, const float* cache, int c_base, int S,
                            int n_head, int head_dim, int kv_lora, float* v_out, char* error, size_t error_capacity);
 
+/// The same, plus the sparse indexer: `x` ([S][n_embd], the attn-normed input) and `qr` ([S][q_lora], the normed q_a output) feed it.
+/// The tokens' indexer rows are written, and once the context reaches 2052 positions each token attends only the cells the indexer
+/// selects.  `w` supplies wk_b/wv_b and the indexer weights; without indexer weights this is mla_attend_batch_cuda.
+bool mla_attend_batch_idx_cuda(const MlaWeights& w, const MlaGeometry& g, const float* x, const float* qr, const float* q,
+                               const float* cache, int c_base, int S, float* v_out, char* error, size_t error_capacity);
+
 /// Runs T prompt tokens through one MLA block, causally, appending their latents to `cache` at rows [c0, c0 + T).
 /// `x` is [T][n_embd] (already attn-normed), `out` is [T][n_embd].  Returns false, leaving the cache rows possibly
 /// written but harmless, when the batched path is not available (no hooks, a type without a native projection, a context
-/// beyond 8192 positions, a device failure) - the caller then runs mla_forward token by token.
+/// beyond 8192 positions without the device indexer, a device failure) - the caller then runs mla_forward token by token.
 bool mla_forward_batch(const MlaWeights& w, const MlaGeometry& g, const float* x, int T, int c0, float* cache, float* out);
 
 /// Serve-mode decode: one token through the whole MLA layer on the device - q_a, norm, q_b, absorb, kv_a, norm, append to the

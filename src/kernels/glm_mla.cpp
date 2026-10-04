@@ -2,6 +2,7 @@
 // reason as the mHC: the architecture has to be exactly right against a reference before any of it moves
 // onto the device.  The graph is quoted in the header; the oracle lives in tools/glm5_mla_reference.py.
 #include "strata/kernels/glm_mla.hpp"
+#include "strata/kernels/glm_indexer_device.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -50,6 +51,7 @@ void mla_set_native_project_batch(MlaNativeProjectBatchFn fn) { g_native_project
 void mla_set_parallel_for(MlaParallelFor fn) { g_parallel_for = fn; }
 
 #if !defined(STRATA_ENABLE_CUDA)
+bool idx_available(const MlaWeights&) { return false; }
 bool mla_attention_cuda(const float*,const float*,int,int,int,int,float*,char* error,size_t error_capacity) {
     if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
     return false;
@@ -60,6 +62,11 @@ bool mla_head_matvec_cuda(const float*,const float*,int,int,int,float*,char* err
 }
 bool mla_attend_batch_cuda(const float*,const float*,const float*,const float*,int,int,int,int,int,float*,
                            char* error,size_t error_capacity) {
+    if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return false;
+}
+bool mla_attend_batch_idx_cuda(const MlaWeights&,const MlaGeometry&,const float*,const float*,const float*,const float*,int,int,
+                               float*,char* error,size_t error_capacity) {
     if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
     return false;
 }
@@ -76,7 +83,8 @@ int mla_block_launch_cuda(const MlaWeights&,const MlaGeometry&,const float*,int,
 #endif
 
 bool mla_forward_batch(const MlaWeights& w, const MlaGeometry& g, const float* x, int T, int c0, float* cache, float* out) {
-    if (!g_native_project_batch || !g_device_attention || T < 1 || c0 < 0 || c0 + T > 8192) return false;
+    if (!g_native_project_batch || !g_device_attention || T < 1 || c0 < 0) return false;
+    if (c0 + T > 8192 && !kernels::glm::idx_available(w)) return false;   // dense device attention stops at 8192; the indexer lifts it
     if (!w.wq_a_type || !w.wq_b_type || !w.kv_a_type || !w.wo_type) return false;
     const int n_head = g.n_head, head_dim = g.head_dim, kv_lora = g.kv_lora, q_lora = g.q_lora, n_embd = g.n_embd;
     const int q_dim = n_head * head_dim;
@@ -113,8 +121,7 @@ bool mla_forward_batch(const MlaWeights& w, const MlaGeometry& g, const float* x
             if (!g_native_project_batch(1, nw, nt, S, qr.data(), q_lora, q_dim, no)) return false;
         }
         char cuda_err[256] = {};
-        if (!mla_attend_batch_cuda(w.wk_b, w.wv_b, q.data(), cache, c0 + t0, S, n_head, head_dim, kv_lora, v.data(),
-                                   cuda_err, sizeof(cuda_err))) {
+        if (!mla_attend_batch_idx_cuda(w, g, xs, qr.data(), q.data(), cache, c0 + t0, S, v.data(), cuda_err, sizeof(cuda_err))) {
             std::fprintf(stderr, "GLM MLA batched attention unavailable: %s; falling back to per-token\n", cuda_err);
             return false;
         }
@@ -249,6 +256,13 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
         }
     }
 
+    if (n_cache >= 2052) {   // IDX_SPARSE_FROM: the host path has no indexer, so it attends every cell
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            std::fprintf(stderr, "[mla] host attention at %d positions attends densely; the model's sparse indexer applies only on the device blocks\n", n_cache);
+        }
+    }
     // qr = rms_norm(wq_a @ x)
     std::vector<float> qr((size_t) q_lora, 0.0f);
     // NO CACHE CONDITION HERE, unlike the KDA's `tokens == 1`: these projections are per-token whatever the cache depth

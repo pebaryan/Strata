@@ -405,6 +405,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_sources(strata_kernels PRIVATE src/kernels/cuda/glm_kda_recurrence.cu)
     target_sources(strata_kernels PRIVATE src/kernels/cuda/glm_mla_attention.cu)
     target_sources(strata_kernels PRIVATE src/kernels/cuda/glm_decode_trunk.cu)
+    target_sources(strata_kernels PRIVATE src/kernels/cuda/glm_indexer_device.cu)
+    add_executable(glm_indexer_device_parity src/kernels/glm_indexer_device_parity.cpp src/kernels/glm_indexer.cpp)
+    target_link_libraries(glm_indexer_device_parity PRIVATE strata_kernels CUDA::cudart)
+    target_include_directories(glm_indexer_device_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_compile_options(glm_indexer_device_parity PRIVATE -O2 -mf16c)
     set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
       src/kernels/cuda/native_gr_norm.cu
       src/kernels/cuda/native_moe.cu
