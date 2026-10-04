@@ -49,7 +49,6 @@ static bool in_range(const std::string& name) {
 
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     if (g_glm5_only) return glm5_eligible_name(tensor.name);
-    if (glm5_eligible_name(tensor.name)) return true;
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
     // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0 (UD-Q4_K_XL). Other keys retain the packed BF16
