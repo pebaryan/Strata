@@ -404,6 +404,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   if(STRATA_ENABLE_CUDA)
     target_sources(strata_kernels PRIVATE src/kernels/cuda/glm_kda_recurrence.cu)
     target_sources(strata_kernels PRIVATE src/kernels/cuda/glm_mla_attention.cu)
+    target_sources(strata_kernels PRIVATE src/kernels/cuda/glm_decode_trunk.cu)
     set_source_files_properties(src/kernels/cuda/native_mmvq.cu src/kernels/cuda/native_bf16.cu
       src/kernels/cuda/native_gr_norm.cu
       src/kernels/cuda/native_moe.cu

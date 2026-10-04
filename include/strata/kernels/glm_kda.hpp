@@ -76,6 +76,9 @@ void kda_set_device_gates(bool enabled);
 /// Serve mode: keep the recurrence state on the device and skip the per-call host compare/readback.  The host state
 /// buffer is then stale; call kda_invalidate_state() after zeroing/restoring it so the next call re-uploads it.
 void kda_set_lazy_state(bool enabled);
+bool kda_lazy_state_enabled();
+/// Whether kda_forward would take the device block for a decoded token (serve mode, lazy state, device gates/recurrence).
+bool kda_device_block_enabled();
 void kda_invalidate_state();
 
 /// Optional worker pool for the host loops that are independent across tokens (the causal convs and the gated output norm).
@@ -95,6 +98,10 @@ void kda_set_device_block(bool enabled);
 /// 1 = done; 0 = declined with nothing touched (the host path must run); -1 = failed after work began.
 int kda_block_decode_cuda(const KdaWeights& w, const KdaGeometry& g, const float* x, float* out, float* state,
                           float* conv_state, char* error, size_t error_capacity);
+/// The same block with the input already on the device and the result left there, launched on `stream` with no copies and no
+/// synchronisation, so a caller can chain further device work (the decode trunk).  Same return codes.
+int kda_block_launch_cuda(const KdaWeights& w, const KdaGeometry& g, const float* d_x, float* d_out, float* state,
+                          float* conv_state, void* stream, char* error, size_t error_capacity);
 /// Coherence of the device-resident conv histories with the host copy: call sync before a host-side conv reads them, and
 /// modified after it rewrites them (which drops the stale device copy).
 void kda_conv_sync_host(float* conv_state, size_t count);

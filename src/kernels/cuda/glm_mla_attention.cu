@@ -343,12 +343,19 @@ DecodeScratch& decode_scratch(){static DecodeScratch d;return d;}
 }  // namespace
 
 // 1 done; 0 declined (nothing touched: the host path must run); -1 failed after work began.
-int mla_block_decode_cuda(const MlaWeights& w,const MlaGeometry& g,const float* x_host,int n_cache,const float* cache_host,
-                          float* kv_row_host,float* out_host,char* error,size_t error_capacity){
+// The one implementation behind both entry points: host-pointer mode (x_host/out_host: upload, run, download, synchronise) and
+// device-pointer mode (d_x_ext/d_out_ext + ext_stream: input already on the device, result left there, no copies of either and
+// no synchronisation, so further device work can be chained on the stream).  The new latent row is copied to the host cache in
+// both modes (asynchronously in device mode; it lands by the caller's next synchronisation).
+static int mla_block_impl(const MlaWeights& w,const MlaGeometry& g,const float* x_host,const float* d_x_ext,float* d_out_ext,
+                          void* ext_stream,int n_cache,const float* cache_host,float* kv_row_host,float* out_host,
+                          char* error,size_t error_capacity){
     auto decline=[&](const char* msg){if(error&&error_capacity)std::snprintf(error,error_capacity,"%s",msg);return 0;};
     auto fail=[&](const char* msg){if(error&&error_capacity)std::snprintf(error,error_capacity,"%s",msg);return -1;};
     using namespace strata::kernels;
-    if(!x_host||!cache_host||!kv_row_host||!out_host||n_cache<1||n_cache>8192)return decline("arguments or context out of range");
+    const bool host_io=x_host&&out_host;
+    const bool dev_io=d_x_ext&&d_out_ext&&ext_stream;
+    if((!host_io&&!dev_io)||!cache_host||!kv_row_host||n_cache<1||n_cache>8192)return decline("arguments or context out of range");
     if(!w.wq_a_type||!w.wq_b_type||!w.kv_a_type||!w.wo_type||!native_mmvq_supported(w.wq_a_type)||
        !native_mmvq_supported(w.wq_b_type)||!native_mmvq_supported(w.kv_a_type)||!native_mmvq_supported(w.wo_type))
         return decline("projection types not native");
@@ -387,10 +394,12 @@ int mla_block_decode_cuda(const MlaWeights& w,const MlaGeometry& g,const float* 
     it->second.last_n=n_cache;           // from here the device cache holds this position too
     float* cache_dev=it->second.device;
 
-    cudaStream_t st=d.stream;void* sv=(void*)st;
-    e=cudaMemcpyAsync(d.x,x_host,(size_t)ne*sizeof(float),cudaMemcpyHostToDevice,st);
+    cudaStream_t st=host_io?d.stream:(cudaStream_t)ext_stream;void* sv=(void*)st;
+    const float* xin=host_io?d.x:d_x_ext;
+    float* outp=host_io?d.out:d_out_ext;
+    if(host_io)e=cudaMemcpyAsync(d.x,x_host,(size_t)ne*sizeof(float),cudaMemcpyHostToDevice,st);
     if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
-    native_quantize_q8_1(d.x,d.xq,ne,1,sv);
+    native_quantize_q8_1(xin,d.xq,ne,1,sv);
     native_mmvq(w.wq_a_type,w.wq_a,d.xq,d.qr,ne,ql,1,sv);
     mla_rmsnorm1<<<1,512,0,st>>>(d.qr,dqn,d.qr,ql,MLA_RMS_EPS);
     native_quantize_q8_1(d.qr,d.qrq,ql,1,sv);
@@ -405,11 +414,23 @@ int mla_block_decode_cuda(const MlaWeights& w,const MlaGeometry& g,const float* 
         d.qcur,cache_dev,n_cache-1,kvl,1.0f/std::sqrt((float)hdim),d.attn);
     mla_head_matvec_tokens<<<(unsigned)((tot_v+7)/8),256,0,st>>>(dv,d.attn,d.v,hdim,kvl,nh,tot_v);
     native_quantize_q8_1(d.v,d.vq,qd,1,sv);
-    native_mmvq(w.wo_type,w.wo,d.vq,d.out,qd,ne,1,sv);
-    e=cudaMemcpyAsync(out_host,d.out,(size_t)ne*sizeof(float),cudaMemcpyDeviceToHost,st);
-    if(e==cudaSuccess)e=cudaStreamSynchronize(st);
+    native_mmvq(w.wo_type,w.wo,d.vq,outp,qd,ne,1,sv);
+    if(host_io){
+        e=cudaMemcpyAsync(out_host,d.out,(size_t)ne*sizeof(float),cudaMemcpyDeviceToHost,st);
+        if(e==cudaSuccess)e=cudaStreamSynchronize(st);
+    }
     if(e==cudaSuccess)e=cudaGetLastError();
     if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
     return 1;
+}
+
+int mla_block_decode_cuda(const MlaWeights& w,const MlaGeometry& g,const float* x_host,int n_cache,const float* cache_host,
+                          float* kv_row_host,float* out_host,char* error,size_t error_capacity){
+    return mla_block_impl(w,g,x_host,nullptr,nullptr,nullptr,n_cache,cache_host,kv_row_host,out_host,error,error_capacity);
+}
+
+int mla_block_launch_cuda(const MlaWeights& w,const MlaGeometry& g,const float* d_x,int n_cache,const float* cache_host,
+                          float* kv_row_host,float* d_out,void* stream,char* error,size_t error_capacity){
+    return mla_block_impl(w,g,nullptr,d_x,d_out,stream,n_cache,cache_host,kv_row_host,nullptr,error,error_capacity);
 }
 } // namespace strata::kernels::glm

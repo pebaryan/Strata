@@ -1631,6 +1631,10 @@ int main(int argc, char** argv) {
         K::kda_set_device_block(serve && (!kb || std::strcmp(kb, "0") != 0));
         const char* mb2 = std::getenv("STRATA_GLM_MLA_BLOCK");
         K::mla_set_device_block(serve && (!mb2 || std::strcmp(mb2, "0") != 0));
+        // Streams + hyper-connection sites on the device for decoded tokens (needs both blocks above; STRATA_GLM_DEVICE_TRUNK=0
+        // keeps the host-resident streams).
+        const char* dt = std::getenv("STRATA_GLM_DEVICE_TRUNK");
+        C::glm::glm_set_device_trunk(serve && (!dt || std::strcmp(dt, "0") != 0));
     }
     std::printf("KDA gates: %s\n",kda_gates_cuda?"CUDA":"host");
     const char* mla_cuda_env = std::getenv("STRATA_GLM_MLA_CUDA");

@@ -106,6 +106,7 @@ void kda_set_device_recurrence(bool enabled) { g_device_recurrence = enabled; }
 void kda_set_device_gates(bool enabled) { g_device_gates = enabled; }
 void kda_set_parallel_for(KdaParallelFor fn) { g_parallel_for = fn; }
 void kda_set_device_block(bool enabled) { g_device_block = enabled; }
+bool kda_device_block_enabled() { return g_device_block && g_device_recurrence && g_device_gates && kda_lazy_state_enabled(); }
 
 #if !defined(STRATA_ENABLE_CUDA)
 bool kda_recurrence_cuda(const float*, const float*, const float*, const float*, const float*, int, int, int,
@@ -114,8 +115,14 @@ bool kda_recurrence_cuda(const float*, const float*, const float*, const float*,
     return false;
 }
 void kda_set_lazy_state(bool) {}
+bool kda_lazy_state_enabled() { return false; }
 void kda_invalidate_state() {}
 int kda_block_decode_cuda(const KdaWeights&, const KdaGeometry&, const float*, float*, float*, float*, char* error,
+                          size_t error_capacity) {
+    if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return 0;
+}
+int kda_block_launch_cuda(const KdaWeights&, const KdaGeometry&, const float*, float*, float*, float*, void*, char* error,
                           size_t error_capacity) {
     if (error && error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
     return 0;

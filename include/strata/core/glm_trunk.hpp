@@ -119,6 +119,12 @@ void glm_parallel_for(int n, const std::function<void(int)>& job);
 using GlmPrefetchFn = void (*)(void* ctx, int layer);
 void glm_set_layer_prefetch(GlmPrefetchFn fn, void* ctx);
 
+/// Decode with the hyper-connection streams resident on the device (see kernels/glm_decode_trunk.hpp): per layer, hc_pre, the
+/// attention block and hc_post chain on one stream, and only the FFN site exchanges data with the host.  Used by
+/// glm_trunk_forward for single-token calls when every layer is eligible (native projection types, device KDA/MLA blocks on,
+/// context within 8192) and no stage callback is attached; otherwise the host loop runs.  Off by default; the runner enables it.
+void glm_set_device_trunk(bool enabled);
+
 /// Layer-major prompt path for a causal token chunk. Input/output rows are [tokens][HC][n_embd].
 /// KDA recurrence and MLA cache updates advance in token order within each layer; only independent
 /// projections are batched. State is left at the chunk's final position for the next chunk/decode call.

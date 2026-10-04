@@ -98,10 +98,15 @@ bool mla_forward_batch(const MlaWeights& w, const MlaGeometry& g, const float* x
 /// resident latent cache, causal attention, un-absorb, wo - with one upload and one download (plus the new latent row, so the
 /// host cache stays complete).  Needs native projection types.  STRATA_GLM_MLA_BLOCK=0 turns it off in the runner.
 void mla_set_device_block(bool enabled);
+bool mla_device_block_enabled();
 /// 1 = done; 0 = declined with nothing touched (the host path must run); -1 = failed after work began.
 /// `x` is the attn-normed input, `kv_row_host` receives the new latent row (cache row n_cache-1).
 int mla_block_decode_cuda(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
                           float* kv_row_host, float* out, char* error, size_t error_capacity);
+/// The same block with the (attn-normed) input already on the device and the result left there, launched on `stream` with no
+/// copies of either and no synchronisation, so a caller can chain further device work (the decode trunk).  Same return codes.
+int mla_block_launch_cuda(const MlaWeights& w, const MlaGeometry& g, const float* d_x, int n_cache, const float* cache,
+                          float* kv_row_host, float* d_out, void* stream, char* error, size_t error_capacity);
 
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
                  float* out, const MlaIntermediates& want = {});

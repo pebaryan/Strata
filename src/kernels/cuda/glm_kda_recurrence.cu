@@ -299,6 +299,7 @@ bool kda_rows_cuda(const float* weight,const float* x,int tokens,int rows,int co
 }
 
 void kda_set_lazy_state(bool enabled) { std::lock_guard<std::mutex> lock(scratch().mutex); g_lazy_state=enabled; }
+bool kda_lazy_state_enabled() { return g_lazy_state; }
 
 void kda_invalidate_state() {
     Scratch& s=scratch(); std::lock_guard<std::mutex> lock(s.mutex);
@@ -330,13 +331,18 @@ void kda_conv_host_modified(const float* conv_state) {
     b.conv.erase(it);
 }
 
+// The one implementation behind both entry points.  Host-pointer mode (x_host/out_host): upload the input, run, download and
+// synchronise.  Device-pointer mode (d_x_ext/d_out_ext + ext_stream): the input is already on the device and the result stays
+// there; nothing is copied and nothing is synchronised, so the caller can chain further device work on the same stream.
 // Returns 1 done, 0 declined (nothing touched: the caller runs the host path), -1 failed after work began.
-int kda_block_decode_cuda(const KdaWeights& w,const KdaGeometry& g,const float* x_host,float* out_host,float* state,
-                          float* conv_state,char* error,size_t error_capacity) {
+static int kda_block_impl(const KdaWeights& w,const KdaGeometry& g,const float* x_host,float* out_host,const float* d_x_ext,
+                          float* d_out_ext,void* ext_stream,float* state,float* conv_state,char* error,size_t error_capacity) {
     auto decline=[&](const char* msg){ if(error&&error_capacity) std::snprintf(error,error_capacity,"%s",msg); return 0; };
     auto fail=[&](const char* msg){ if(error&&error_capacity) std::snprintf(error,error_capacity,"%s",msg); return -1; };
     if (!g_lazy_state) return decline("device block needs lazy resident state (serve mode)");
-    if (!x_host||!out_host||!state||!conv_state) return decline("null argument");
+    const bool host_io = x_host && out_host;
+    const bool dev_io = d_x_ext && d_out_ext && ext_stream;
+    if ((!host_io && !dev_io) || !state || !conv_state) return decline("null argument");
     using namespace strata::kernels;
     if (!w.wq_type||!w.wk_type||!w.wv_type||!w.wo_type||!native_mmvq_supported(w.wq_type)||!native_mmvq_supported(w.wk_type)||
         !native_mmvq_supported(w.wv_type)||!native_mmvq_supported(w.wo_type)) return decline("projection types not native");
@@ -381,10 +387,13 @@ int kda_block_decode_cuda(const KdaWeights& w,const KdaGeometry& g,const float* 
     float* hist=cit->second.device;
     cit->second.ahead=true;        // from here the device copy is the live one
 
-    cudaStream_t st_=b.stream; void* sv=(void*)st_;
-    cudaError_t e=cudaMemcpyAsync(b.x,x_host,(size_t)ne*sizeof(float),cudaMemcpyHostToDevice,st_);
+    cudaStream_t st_=host_io ? b.stream : (cudaStream_t)ext_stream; void* sv=(void*)st_;
+    const float* xin = host_io ? b.x : d_x_ext;
+    float* outp = host_io ? b.out : d_out_ext;
+    cudaError_t e=cudaSuccess;
+    if (host_io) e=cudaMemcpyAsync(b.x,x_host,(size_t)ne*sizeof(float),cudaMemcpyHostToDevice,st_);
     if (e!=cudaSuccess) return fail(cudaGetErrorString(e));
-    kda_rmsnorm1<<<1,1024,0,st_>>>(b.x,d_an,b.xn,ne,KDA_RMS_EPS);
+    kda_rmsnorm1<<<1,1024,0,st_>>>(xin,d_an,b.xn,ne,KDA_RMS_EPS);
     native_quantize_q8_1(b.xn,b.xq,ne,1,sv);
     native_mmvq(w.wq_type,w.wq,b.xq,b.rq,ne,di,1,sv);
     native_mmvq(w.wk_type,w.wk,b.xq,b.rk,ne,di,1,sv);
@@ -402,12 +411,24 @@ int kda_block_decode_cuda(const KdaWeights& w,const KdaGeometry& g,const float* 
     kda_rows<<<(di+7)/8,256,0,st_>>>(d_gb,b.ga,b.gb,1,di,hd);
     kda_outgate<<<nh,128,0,st_>>>(b.attn,b.gb,d_on,b.o,hd,KDA_RMS_EPS);
     native_quantize_q8_1(b.o,b.oq,di,1,sv);
-    native_mmvq(w.wo_type,w.wo,b.oq,b.out,di,ne,1,sv);
-    e=cudaMemcpyAsync(out_host,b.out,(size_t)ne*sizeof(float),cudaMemcpyDeviceToHost,st_);
-    if (e==cudaSuccess) e=cudaStreamSynchronize(st_);
+    native_mmvq(w.wo_type,w.wo,b.oq,outp,di,ne,1,sv);
+    if (host_io) {
+        e=cudaMemcpyAsync(out_host,b.out,(size_t)ne*sizeof(float),cudaMemcpyDeviceToHost,st_);
+        if (e==cudaSuccess) e=cudaStreamSynchronize(st_);
+    }
     if (e==cudaSuccess) e=cudaGetLastError();
     if (e!=cudaSuccess) return fail(cudaGetErrorString(e));
     return 1;
+}
+
+int kda_block_decode_cuda(const KdaWeights& w,const KdaGeometry& g,const float* x_host,float* out_host,float* state,
+                          float* conv_state,char* error,size_t error_capacity) {
+    return kda_block_impl(w,g,x_host,out_host,nullptr,nullptr,nullptr,state,conv_state,error,error_capacity);
+}
+
+int kda_block_launch_cuda(const KdaWeights& w,const KdaGeometry& g,const float* d_x,float* d_out,float* state,
+                          float* conv_state,void* stream,char* error,size_t error_capacity) {
+    return kda_block_impl(w,g,nullptr,nullptr,d_x,d_out,stream,state,conv_state,error,error_capacity);
 }
 
 bool kda_gates_cuda(const float* xn,const float* ssm_f_a,const float* ssm_f_b,const float* ssm_beta,

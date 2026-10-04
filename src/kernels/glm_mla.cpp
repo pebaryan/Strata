@@ -43,6 +43,7 @@ MlaParallelFor g_parallel_for = nullptr;
 bool g_device_block = false;
 
 void mla_set_device_block(bool enabled) { g_device_block = enabled; }
+bool mla_device_block_enabled() { return g_device_block && g_device_attention; }
 void mla_set_native_project(MlaNativeProjectFn fn) { g_native_project = fn; }
 void mla_set_device_attention(bool enabled) { g_device_attention = enabled; }
 void mla_set_native_project_batch(MlaNativeProjectBatchFn fn) { g_native_project_batch = fn; }
@@ -63,6 +64,11 @@ bool mla_attend_batch_cuda(const float*,const float*,const float*,const float*,i
     return false;
 }
 int mla_block_decode_cuda(const MlaWeights&,const MlaGeometry&,const float*,int,const float*,float*,float*,
+                          char* error,size_t error_capacity) {
+    if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
+    return 0;
+}
+int mla_block_launch_cuda(const MlaWeights&,const MlaGeometry&,const float*,int,const float*,float*,float*,void*,
                           char* error,size_t error_capacity) {
     if(error&&error_capacity) std::snprintf(error,error_capacity,"CUDA support was not compiled");
     return 0;

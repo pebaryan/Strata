@@ -20,6 +20,8 @@
 
 #include "strata/core/glm_layer.hpp"
 #include "strata/core/glm_moe_native.hpp"
+#include "strata/kernels/glm_decode_trunk.hpp"
+#include "strata/kernels/native_mmvq.hpp"
 
 namespace strata::core::glm {
 namespace {
@@ -64,6 +66,206 @@ void* g_layer_prefetch_ctx = nullptr;
 }  // namespace
 void glm_set_layer_prefetch(GlmPrefetchFn fn, void* ctx) { g_layer_prefetch = fn; g_layer_prefetch_ctx = ctx; }
 
+namespace {
+bool g_device_trunk = false;
+
+/// Whether this token can run on the device trunk.  A token cannot switch paths half-way (the attention blocks mutate the
+/// recurrent state), so everything it needs is established up front: every layer's weights are native (checked once - they
+/// never change), the KDA/MLA device blocks are enabled, the state arrays exist, and no MLA cache is about to pass the
+/// 8192-position limit of the device attention.
+bool device_trunk_eligible(GlmTrunkProvider provider, void* provider_ctx, int first_layer, int layers,
+                           const GlmTrunkState& state) {
+    if (!kernels::glm::kda_device_block_enabled() || !kernels::glm::mla_device_block_enabled()) return false;
+    if (!state.kda_state || !state.kda_conv || !state.kda_index || !state.mla_cache || !state.mla_len || !state.mla_index)
+        return false;
+    static int weights_ok = -1;   // -1 unknown, 0 no, 1 yes
+    if (weights_ok < 0) {
+        weights_ok = 1;
+        for (int i = 0; i < layers && weights_ok; ++i) {
+            const int layer = first_layer + i;
+            GlmTrunkLayerWeights w;
+            std::string e;
+            if (!provider(provider_ctx, layer, w, e)) { weights_ok = 0; break; }
+            if (!w.hc_attn_fn || !w.hc_attn_base || !w.hc_attn_scale || !w.hc_ffn_fn || !w.hc_ffn_base || !w.hc_ffn_scale ||
+                !w.ffn_norm) { weights_ok = 0; break; }
+            using kernels::native_mmvq_supported;
+            if (glm_attention_is_mla(layer) == 1) {
+                if (!w.mla || !w.attn_norm || !w.mla->wq_a_type || !w.mla->wq_b_type || !w.mla->kv_a_type || !w.mla->wo_type ||
+                    !native_mmvq_supported(w.mla->wq_a_type) || !native_mmvq_supported(w.mla->wq_b_type) ||
+                    !native_mmvq_supported(w.mla->kv_a_type) || !native_mmvq_supported(w.mla->wo_type)) weights_ok = 0;
+            } else {
+                if (!w.kda || !w.kda->wq_type || !w.kda->wk_type || !w.kda->wv_type || !w.kda->wo_type ||
+                    !native_mmvq_supported(w.kda->wq_type) || !native_mmvq_supported(w.kda->wk_type) ||
+                    !native_mmvq_supported(w.kda->wv_type) || !native_mmvq_supported(w.kda->wo_type)) weights_ok = 0;
+            }
+        }
+    }
+    if (weights_ok != 1) return false;
+    for (int i = 0; i < layers; ++i) {
+        const int layer = first_layer + i;
+        if (glm_attention_is_mla(layer) != 1) continue;
+        const int slot = state.mla_index[layer];
+        if (slot < 0 || state.mla_len[slot] + 1 > 8192) return false;
+    }
+    return true;
+}
+
+bool dtrunk_fail(std::string& err, const char* what, const char* detail) {
+    err = std::string("glm_trunk_forward (device trunk): ") + what + ": " + detail;
+    return false;
+}
+
+/// The device-trunk token loop: the same layer sequence as the host loop in glm_trunk_forward, with the streams, the
+/// hyper-connection sites and the attention blocks on the device.
+bool glm_trunk_forward_device(const float* x, int layers, GlmTrunkProvider provider, void* provider_ctx,
+                              const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
+                              float hc_rms_eps, GlmTrunkState& state, float* l_out, std::string& err, int first_layer) {
+    using namespace kernels::glm;
+    using Clock = std::chrono::steady_clock;
+    const bool timing = std::getenv("STRATA_GLM_TIMING") != nullptr;
+    const int ne = kda_g.n_embd;
+    char cerr[256] = {};
+    std::vector<float> ffn_in((size_t) ne), ffn_out((size_t) ne);
+    double tm_provider = 0, tm_launch = 0, tm_wait = 0, tm_ffn = 0;
+    auto elapsed = [](Clock::time_point a) { return std::chrono::duration<double, std::milli>(Clock::now() - a).count(); };
+    const auto t_start = Clock::now();
+
+    if (!dtrunk_begin(x, ne, cerr, sizeof cerr)) return dtrunk_fail(err, "begin", cerr);
+    void* stream = dtrunk_stream();
+
+    // STRATA_GLM_DT_VERIFY: after each device hyper-connection op, fetch its buffers and compare against the host glm_stage_hc_*
+    // on the same data (stateless, so it cannot disturb the run).  Prints the max |difference| per op for early layers, and the
+    // worst over the token.
+    const bool verify = std::getenv("STRATA_GLM_DT_VERIFY") != nullptr;
+    std::vector<float> v_cur, v_ao, v_mid, v_li, v_ref, v_nxt;
+    HcMix v_mx_a, v_mx_f;
+    double v_worst[4] = {0, 0, 0, 0}, v_cur_diff[4] = {0, 0, 0, 0}, v_cur_ref[4] = {0, 0, 0, 0};
+    auto vdiff = [](const float* a, const float* b, size_t n, double& dmax, double& rmax) {
+        dmax = 0; rmax = 0;
+        for (size_t k = 0; k < n; ++k) { dmax = std::max(dmax, (double) std::fabs(a[k] - b[k])); rmax = std::max(rmax, (double) std::fabs(b[k])); }
+    };
+    auto vrecord = [&](int op, const float* dev, const float* ref, size_t n) {
+        double d, r;
+        vdiff(dev, ref, n, d, r);
+        v_cur_diff[op] = d; v_cur_ref[op] = r;
+        v_worst[op] = std::max(v_worst[op], r > 0 ? d / r : d);
+    };
+
+    for (int i = 0; i < layers; ++i) {
+        const int layer = first_layer + i;
+        const bool is_mla = glm_attention_is_mla(layer) == 1;
+        const bool is_dense = glm_ffn_is_dense(layer);
+        GlmTrunkLayerWeights w;
+        auto tick = Clock::now();
+        if (!provider(provider_ctx, layer, w, err)) {
+            err = "glm_trunk_forward: layer " + std::to_string(layer) + ": " + err;
+            return false;
+        }
+        tm_provider += elapsed(tick);
+        const bool ffn_ok = is_dense ? (w.ffn_gate && w.ffn_up && w.ffn_down && w.moe_g)
+                                     : (w.moe_router && w.moe_g && w.moe_fmt && w.blob_fn);
+        if (!ffn_ok) return dtrunk_fail(err, "a required FFN weight is null at layer", std::to_string(layer).c_str());
+
+        // ---- attention site, entirely on the device ----
+        tick = Clock::now();
+        if (verify) { v_cur.resize((size_t) HC_STREAMS * ne); dtrunk_debug_fetch(0, v_cur.data(), ne); }
+        if (!dtrunk_hc_pre(0, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, is_mla ? w.attn_norm : nullptr, hc_rms_eps, ne,
+                           cerr, sizeof cerr)) return dtrunk_fail(err, "attention hc_pre", cerr);
+        if (verify) {
+            v_li.resize((size_t) ne); v_ref.resize((size_t) ne);
+            dtrunk_debug_fetch(2, v_li.data(), ne);
+            std::string e2;
+            glm_stage_hc_norm(v_cur.data(), ne, w.hc_attn_fn, w.hc_attn_base, w.hc_attn_scale, is_mla ? w.attn_norm : nullptr,
+                              v_ref.data(), &v_mx_a, hc_rms_eps, nullptr, e2);
+            vrecord(0, v_li.data(), v_ref.data(), (size_t) ne);
+        }
+        int r = 0;
+        if (is_mla) {
+            const int slot = state.mla_index[layer];
+            float* cache = state.mla_cache[slot];
+            const int cells = state.mla_len[slot];
+            float* kv_row = cache + (size_t) cells * (size_t) mla_g.kv_lora;
+            r = mla_block_launch_cuda(*w.mla, mla_g, dtrunk_layer_in(), cells + 1, cache, kv_row, dtrunk_attn_out(), stream, cerr,
+                                      sizeof cerr);
+            if (r == 1) state.mla_len[slot] = cells + 1;
+        } else {
+            const int slot = state.kda_index[layer];
+            r = kda_block_launch_cuda(*w.kda, kda_g, dtrunk_layer_in(), dtrunk_attn_out(), state.kda_state[slot],
+                                      state.kda_conv[slot], stream, cerr, sizeof cerr);
+        }
+        if (r != 1) return dtrunk_fail(err, is_mla ? "MLA block" : "KDA block", cerr);
+        if (!dtrunk_hc_post(0, ne, cerr, sizeof cerr)) return dtrunk_fail(err, "attention hc_post", cerr);
+        if (verify) {
+            v_ao.resize((size_t) ne); v_mid.resize((size_t) HC_STREAMS * ne); v_nxt.resize((size_t) HC_STREAMS * ne);
+            dtrunk_debug_fetch(3, v_ao.data(), ne);
+            dtrunk_debug_fetch(1, v_mid.data(), ne);
+            std::string e2;
+            glm_stage_hc_post(v_ao.data(), v_cur.data(), v_mx_a, ne, v_nxt.data(), e2);
+            vrecord(1, v_mid.data(), v_nxt.data(), (size_t) HC_STREAMS * ne);
+        }
+        if (!dtrunk_hc_pre(1, w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm, hc_rms_eps, ne, cerr, sizeof cerr))
+            return dtrunk_fail(err, "FFN hc_pre", cerr);
+        if (verify) {
+            dtrunk_debug_fetch(2, v_li.data(), ne);
+            std::string e2;
+            glm_stage_hc_norm(v_mid.data(), ne, w.hc_ffn_fn, w.hc_ffn_base, w.hc_ffn_scale, w.ffn_norm, v_ref.data(), &v_mx_f,
+                              hc_rms_eps, nullptr, e2);
+            vrecord(2, v_li.data(), v_ref.data(), (size_t) ne);
+        }
+        tm_launch += elapsed(tick);
+
+        // ---- FFN site: the only per-layer host exchange ----
+        tick = Clock::now();
+        if (!dtrunk_fetch_ffn_in(ffn_in.data(), ne, cerr, sizeof cerr)) return dtrunk_fail(err, "fetch ffn_in", cerr);
+        tm_wait += elapsed(tick);
+        tick = Clock::now();
+        if (is_dense) {
+            if (!glm_stage_ffn(ffn_in.data(), w.ffn_gate, w.ffn_up, w.ffn_down, *w.moe_g, ffn_out.data(), w.clamp_limit, err,
+                               w.ffn_types)) {
+                err = "glm_trunk_forward: layer " + std::to_string(layer) + " dense FFN: " + err;
+                return false;
+            }
+        } else {
+            if (!glm_stage_moe_native(ffn_in.data(), w.moe_router, w.moe_probs_b, *w.moe_g, layer, *w.moe_fmt, w.blob_fn,
+                                      w.blob_ctx, w.shexp_g, w.shexp, w.shexp_types, w.shexp_clamp, ffn_out.data(), err,
+                                      nullptr)) {
+                err = "glm_trunk_forward: layer " + std::to_string(layer) + " routed FFN: " + err;
+                return false;
+            }
+        }
+        tm_ffn += elapsed(tick);
+        tick = Clock::now();
+        if (!dtrunk_put_ffn_out(ffn_out.data(), ne, cerr, sizeof cerr)) return dtrunk_fail(err, "put ffn_out", cerr);
+        if (!dtrunk_hc_post(1, ne, cerr, sizeof cerr)) return dtrunk_fail(err, "FFN hc_post", cerr);
+        if (verify) {
+            std::vector<float> dev_next((size_t) HC_STREAMS * ne);
+            dtrunk_debug_fetch(0, dev_next.data(), ne);
+            std::string e2;
+            glm_stage_hc_post(ffn_out.data(), v_mid.data(), v_mx_f, ne, v_nxt.data(), e2);
+            vrecord(3, dev_next.data(), v_nxt.data(), (size_t) HC_STREAMS * ne);
+            if (layer < 3 || layer == 44)
+                std::fprintf(stderr,
+                             "DT_VERIFY layer %d: attn hc_pre %.2e/%.2e  hc_post %.2e/%.2e | ffn hc_pre %.2e/%.2e  hc_post %.2e/%.2e"
+                             " (max|diff| / max|ref|)\n", layer, v_cur_diff[0], v_cur_ref[0], v_cur_diff[1], v_cur_ref[1],
+                             v_cur_diff[2], v_cur_ref[2], v_cur_diff[3], v_cur_ref[3]);
+        }
+        tm_launch += elapsed(tick);
+    }
+    if (verify)
+        std::fprintf(stderr, "DT_VERIFY token worst relative diff: attn hc_pre %.2e  attn hc_post %.2e  ffn hc_pre %.2e  ffn hc_post %.2e\n",
+                     v_worst[0], v_worst[1], v_worst[2], v_worst[3]);
+    if (!dtrunk_fetch_streams(l_out, ne, cerr, sizeof cerr)) return dtrunk_fail(err, "fetch streams", cerr);
+    if (timing)
+        std::fprintf(stderr,
+                     "GLM_TIMING provider=%.3f hca=%.3f attn=%.3f hcap=0.000 hcf=0.000 ffn=%.3f hcfp=0.000 total=%.3f ms"
+                     " (device trunk: launch=%.1f wait-for-gpu=%.1f)\n",
+                     tm_provider, tm_launch, tm_wait, tm_ffn, elapsed(t_start), tm_launch, tm_wait);
+    return true;
+}
+}  // namespace
+
+void glm_set_device_trunk(bool enabled) { g_device_trunk = enabled; }
+
 bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, void* provider_ctx,
                        const kernels::glm::KdaGeometry& kda_g, const kernels::glm::MlaGeometry& mla_g,
                        float hc_rms_eps, GlmTrunkState& state, float* l_out, void* stream, std::string& err,
@@ -81,6 +283,11 @@ bool glm_trunk_forward(const float* x, int layers, GlmTrunkProvider provider, vo
         err = "glm_trunk_forward: the two attention geometries disagree on n_embd";
         return false;
     }
+    // The device trunk keeps the streams and the hyper-connection sites on the GPU (no stage callback can observe them there).
+    if (stage_fn == nullptr && g_device_trunk && device_trunk_eligible(provider, provider_ctx, first_layer, layers, state))
+        return glm_trunk_forward_device(x, layers, provider, provider_ctx, kda_g, mla_g, hc_rms_eps, state, l_out, err,
+                                        first_layer);
+
     const size_t hc = (size_t) HC_STREAMS;
 
     // one token at a time: `cur` is this layer's input streams, `nxt` its output, and they swap each layer
