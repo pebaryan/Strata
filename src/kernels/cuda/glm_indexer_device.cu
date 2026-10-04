@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <unordered_map>
 
@@ -224,6 +225,8 @@ bool vram_malloc(void** p, size_t bytes) {
 
 bool idx_available(const MlaWeights& w) {
     using strata::kernels::native_mmvq_supported;
+    static const bool off = [] { const char* e = std::getenv("STRATA_GLM_INDEXER"); return e && e[0] == '0'; }();   // A/B switch
+    if (off) return false;
     return w.idx_attn_k && w.idx_attn_q_b && w.idx_c_gate && w.idx_k_norm_w && w.idx_k_norm_b && w.idx_proj && w.idx_ape &&
            w.idx_attn_k_type && w.idx_attn_q_b_type && w.idx_c_gate_type && native_mmvq_supported(w.idx_attn_k_type) &&
            native_mmvq_supported(w.idx_attn_q_b_type) && native_mmvq_supported(w.idx_c_gate_type);
