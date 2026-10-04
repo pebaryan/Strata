@@ -98,10 +98,10 @@ if(STRATA_ENABLE_CUDA)
     # Upstream's floor is 7.5 (Turing: below sm_80 the QSA scorer takes its portable fp32-FMA fallback and the
     # tensor-core prompt kernels refuse).  LOCAL VOLTA PORT (peb): this fork also serves sm_70, so the port's
     # escape hatch is kept and reused rather than the floor deleted - configure the port's builds with
-    # -DSTRATA_EXPERIMENTAL_SM75=ON together with -DCMAKE_CUDA_ARCHITECTURES=70.  A normal build of this fork
+    # -DSTRATA_EXPERIMENTAL_SM60=ON (or the legacy SM75 opt-in) together with -DCMAKE_CUDA_ARCHITECTURES=70.  A normal build of this fork
     # still refuses anything below 7.5.  The V100 numbers are a port's, not the validated sm_80+ path's; they are
     # labelled as such everywhere they are reported.
-    if(_base LESS 75 AND NOT STRATA_EXPERIMENTAL_SM75)
+    if(_base LESS 75 AND NOT STRATA_EXPERIMENTAL_SM75 AND NOT STRATA_EXPERIMENTAL_SM60)
       message(FATAL_ERROR
         "Strata needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
