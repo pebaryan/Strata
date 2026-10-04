@@ -1,6 +1,7 @@
 #include <filesystem>
 #include <cstdio>
 #include "strata/core/native_dense.hpp"
+#include <cstdlib>
 #include "strata/core/weights.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/native_mmvq.hpp"
@@ -8,6 +9,7 @@
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <climits>
+#include <cstdlib>
 #include <exception>
 #include <limits>
 #include <memory>
@@ -93,6 +95,7 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
     }
 }
 
+void NativeDense::set_layer_range(int lb, int le) { g_layer_lb = lb; g_layer_le = le; }
 bool NativeDense::keep_unquantized_ple_key(const std::string& pack_dir, std::set<std::string>& skip,
                                            std::string& err) {
     const std::string key = "blk.1.ple_key.weight";
