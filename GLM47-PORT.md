@@ -107,6 +107,14 @@ gate below, exactly as llama.cpp's GLM5-Next graph was for phases 8-9 of the GLM
   layer 1.
 - **F32 routers** — refuse unless the F32 values are exactly BF16, or narrow with `--compat-bf16` (the
   same policy as qwen4exp/glm5next); check id-identity, not just weight tolerance.
+- **The selection bias must NOT be narrowed to BF16** — measured, and the sharpest new risk of this
+  port. The pack's router path stores routers BF16 (`glm_bind.cpp:113-117` expands BF16→F32), which is
+  lossless here: `ffn_gate_inp.weight` is exactly BF16-representable (131072/131072 values). But
+  `exp_probs_b.bias` is F32 and is **not** (0/64 values; BF16 truncation error up to 5.7e-2 on values
+  ≈9.03). The bias spread that orders the 64 experts is ≈2e-2, so a BF16 bias flips the top-4. The
+  packer (phase 5/6) must keep `exp_probs_b` in F32, and the trunk gate must check id-identity, not just
+  output tolerance — a BF16-narrowed bias can leave the outputs looking plausible while routing to the
+  wrong experts.
 - **Mixed down-quant** — down mixes Q4_K and Q6_K per layer; the table supports it but the CUDA grouped
   path may want one format per call (fall back to per-layer grouping and measure if so).
 
