@@ -221,8 +221,8 @@ endif()
 # EACH LAYER ITS OWN MLA cache - plus the head (output_norm -> project -> argmax), against
 # tools/glm47_trunk_reference.py.  It composes exactly the kernels glm47_block_parity does, so it links
 # the same sources and, for glm_mla.cpp's CUDA entry points, the kernel library and cudart.
-add_executable(glm47_trunk_parity src/kernels/glm47_trunk_parity.cpp src/kernels/glm_mla.cpp
-               src/kernels/glm_moe.cpp src/kernels/glm_norm.cpp)
+add_executable(glm47_trunk_parity src/kernels/glm47_trunk_parity.cpp src/core/glm47_trunk.cpp
+               src/kernels/glm_mla.cpp src/kernels/glm_moe.cpp src/kernels/glm_norm.cpp)
 target_include_directories(glm47_trunk_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm47_trunk_parity PRIVATE -O2)
 if(STRATA_ENABLE_CUDA)
