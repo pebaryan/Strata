@@ -24,6 +24,11 @@ void moe_route(const float* router, const float* probs_b, const MoeGeometry& g, 
                int32_t* ids_out, float* weights_out, float* probs_out) {
     const int E = g.n_expert, ne = g.n_embd;
     std::vector<float> probs((size_t) E);
+    const bool logit_add = g.gating == MoeGeometry::Gating::SIGMOID_LOGIT_ADD;
+    // For SIGMOID_LOGIT_ADD the raw logits are needed too (selection is on logits + bias), so they
+    // are kept in `logits` and `probs` holds the sigmoid of each.  The dot-product loop is shared.
+    std::vector<float> logits;
+    if (logit_add) logits.resize((size_t) E);
     // The expert rows are independent dot products (each reduced serially in the same order as ever), so blocks of them
     // run on the pool when one is installed - a single token's routing is ~1.6 ms of dependent float adds otherwise.
     constexpr int kBlock = 16;
@@ -33,21 +38,27 @@ void moe_route(const float* router, const float* probs_b, const MoeGeometry& g, 
             const float* row = router + (size_t) e * ne;
             float acc = 0.0f;
             for (int i = 0; i < ne; ++i) acc += row[i] * x[i];
-            probs[(size_t) e] = sigmoidf(acc);
+            if (logit_add) { logits[(size_t) e] = acc; probs[(size_t) e] = sigmoidf(acc); }
+            else probs[(size_t) e] = sigmoidf(acc);
         }
     };
+
     const int n_blocks = (E + kBlock - 1) / kBlock;
     if (g_parallel_for != nullptr) g_parallel_for(n_blocks, rows);
     else for (int b = 0; b < n_blocks; ++b) rows(b);
-    if (probs_out)
+    if (probs_out) {
         for (int e = 0; e < E; ++e) probs_out[e] = probs[(size_t) e];
+        if (logit_add)  // the caller asked for probs: sigmoid them as the reference's probs tensor holds
+            for (int e = 0; e < E; ++e) probs_out[e] = sigmoidf(probs_out[e]);
+    }
 
-    // selection is on the biased probs, weights come from the unbiased ones
+    // Selection.  GLM/DeepSeek: descending on probs + bias (probs are the sigmoids).  Kolibri:
+    // descending on the raw logits + bias, weights stay the unbiased sigmoid(logits).
     std::vector<int> order((size_t) E);
     for (int e = 0; e < E; ++e) order[(size_t) e] = e;
     std::stable_sort(order.begin(), order.end(), [&](int a, int b) {
-        const float sa = probs[(size_t) a] + (probs_b ? probs_b[a] : 0.0f);
-        const float sb = probs[(size_t) b] + (probs_b ? probs_b[b] : 0.0f);
+        const float sa = (logit_add ? logits[(size_t) a] : probs[(size_t) a]) + (probs_b ? probs_b[a] : 0.0f);
+        const float sb = (logit_add ? logits[(size_t) b] : probs[(size_t) b]) + (probs_b ? probs_b[b] : 0.0f);
         return sa > sb;
     });
 
@@ -55,7 +66,7 @@ void moe_route(const float* router, const float* probs_b, const MoeGeometry& g, 
     double sum = 0.0;
     for (int i = 0; i < k; ++i) {
         ids_out[i] = order[(size_t) i];
-        weights_out[i] = probs[(size_t) order[(size_t) i]];
+        weights_out[i] = logit_add ? sigmoidf(logits[(size_t) order[(size_t) i]]) : probs[(size_t) order[(size_t) i]];
         sum += (double) weights_out[i];
     }
     if (g.norm_w) {

@@ -1122,6 +1122,12 @@ add_executable(block3_gate tools/block3_gate.cpp src/core/glm_trunk.cpp src/core
 target_include_directories(block3_gate PRIVATE /include)
 target_link_libraries(block3_gate PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
 
+# kolibri_router_gate (branch kolibri-port): parity for the SIGMOID_LOGIT_ADD router mode - selection
+# on the biased raw logits, weights the unbiased sigmoid, no renorm (Kolibri 1's rule; GLM picks on
+# sigmoid(logits) + bias, which is a different expert set whenever the bias reorders).
+add_executable(kolibri_router_gate tools/kolibri_router_gate.cpp src/kernels/glm_moe.cpp)
+target_include_directories(kolibri_router_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 # glm45_run (branch glm5next-port): THE PORT'S LAST STEP.  The engine's own 45-block trunk, from the pack,
 # ending in a token.  The acceptance test is argmax == 12089, not a per-layer float match, because the
 # engine accumulates the quantization of 43 routed blocks (~5% of rms worst element, measured).

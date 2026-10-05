@@ -29,12 +29,23 @@ using MoeParallelFor = void (*)(int n, const std::function<void(int)>& job);
 void moe_set_parallel_for(MoeParallelFor fn);
 
 struct MoeGeometry {
+    /// The gating rule.  SIGMOID_BIASED is DeepSeek-V3/GLM: probs are sigmoid(logits), top-k is
+    /// selected on probs + bias, weights come from the unbiased probs.  SIGMOID_LOGIT_ADD is
+    /// Kolibri 1 (torchtitan sigmoid_logit_add router): top-k is selected on the BIASED RAW LOGITS
+    /// (logits + bias) and the weights stay the unbiased sigmoid(logits) - different experts are
+    /// picked whenever the bias is non-zero (llama.cpp's LLAMA_EXPERT_GATING_FUNC_TYPE_..._LOGIT_ADD,
+    /// patch 1/4 of kolibri1-llama.cpp.patch: "select top-k on logits + bias, weight by unbiased
+    /// sigmoid").  Both renormalise only when `norm_w` is set (Kolibri sets expert_weights_norm false).
+    enum class Gating : uint8_t { SIGMOID_BIASED, SIGMOID_LOGIT_ADD };
+
     int n_embd = 4096;
     int n_expert = 288;
     int n_used = 8;      ///< expert_used_count
     int ff = 2048;       ///< expert_feed_forward_length
     float w_scale = 2.5f;   ///< expert_weights_scale
     bool norm_w = true;     ///< expert_weights_norm
+    Gating gating = Gating::SIGMOID_BIASED;
+
 
     /// ggml_swiglu_clamp's limit, from the artifact: swiglu_clamp_exp for the routed experts and
     /// swiglu_clamp_shexp for the shared expert AND the leading dense FFN (the reference reaches the
