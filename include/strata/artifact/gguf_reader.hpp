@@ -750,4 +750,108 @@ inline std::string check_glm5next_architecture(const GgufFile& g, Glm5NextGeomet
     return {};   // empty == ok
 }
 
+// ---- GLM-4.7-Flash (branch glm47-port).  `general.architecture == "deepseek2"`: a plain MLA MoE,
+// much smaller than glm5next and with none of its extras.  Every block is MLA, block 0 is a dense
+// stem, blocks 1.. are MoE.  There is no KDA, no indexer, no MTP, no hyper-connections, and
+// head_count_kv is a SCALAR (1, the MLA latent) rather than an array.  The field glm5next's noPE MLA
+// does not carry is the 64-dim decoupled RoPE (`rope.dimension_count`).
+struct Deepseek2Geometry {
+    uint32_t block_count = 47, hidden = 2048, head_count = 20, head_count_kv = 1,
+             experts = 64, experts_used = 4, shared_experts = 1, expert_ffn = 1536,
+             leading_dense = 1, q_lora_rank = 768, kv_lora_rank = 512, key_length = 576,
+             value_length = 512, key_length_mla = 256, value_length_mla = 256,
+             rope_dimension_count = 64;
+    double rope_freq_base = 1e6, rms_eps = 1e-5, weights_scale = 1.8;
+    bool weights_norm = true;
+    uint32_t first_moe = 1;              // the expert layout starts at block 1, not 0
+    std::vector<AttnKind> attn;          // all Mla here; kept for symmetry with glm5next
+};
+
+inline std::string check_deepseek2_architecture(const GgufFile& g, Deepseek2Geometry& out,
+                                                const std::set<std::string>* other_shards = nullptr) {
+    const MetaValue* arch = g.get("general.architecture");
+    if (!arch) return "missing general.architecture";
+    if (arch->s != "deepseek2") return "architecture is '" + arch->s + "', expected 'deepseek2'";
+
+    struct Req { const char* key; uint64_t want; };
+    const Req reqs[] = {
+        {"deepseek2.block_count", 47},
+        {"deepseek2.embedding_length", 2048},
+        {"deepseek2.attention.head_count", 20},
+        {"deepseek2.attention.head_count_kv", 1},
+        {"deepseek2.attention.key_length", 576},          // kv_lora 512 + rope 64
+        {"deepseek2.attention.value_length", 512},
+        {"deepseek2.attention.q_lora_rank", 768},
+        {"deepseek2.attention.kv_lora_rank", 512},
+        {"deepseek2.attention.key_length_mla", 256},
+        {"deepseek2.attention.value_length_mla", 256},
+        {"deepseek2.expert_count", 64},
+        {"deepseek2.expert_used_count", 4},
+        {"deepseek2.expert_shared_count", 1},
+        {"deepseek2.expert_group_count", 1},
+        {"deepseek2.expert_feed_forward_length", 1536},
+        {"deepseek2.leading_dense_block_count", 1},
+        {"deepseek2.rope.dimension_count", 64},
+    };
+    for (const auto& r : reqs) {
+        const MetaValue* v = g.get(r.key);
+        if (!v) return std::string("missing ") + r.key;
+        if (v->type == MetaType::ARRAY) return std::string(r.key) + " is an array, expected a scalar";
+        if (v->u != r.want)
+            return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
+    }
+    // the float / bool fields glm5next has no analogue for: presence and type only (their values are
+    // carried through, not asserted, since a fine-tune may legitimately shift them)
+    for (const char* k : {"deepseek2.rope.freq_base", "deepseek2.attention.layer_norm_rms_epsilon",
+                          "deepseek2.expert_weights_scale"}) {
+        const MetaValue* v = g.get(k);
+        if (!v) return std::string("missing ") + k;
+        if (!v->is_num()) return std::string(k) + " is not numeric";
+    }
+    const MetaValue* wn = g.get("deepseek2.expert_weights_norm");
+    if (!wn) return "missing deepseek2.expert_weights_norm";
+    if (wn->type != MetaType::BOOL) return "deepseek2.expert_weights_norm is not a bool";
+
+    out.block_count = 47;      out.hidden = 2048;
+    out.head_count = 20;       out.head_count_kv = 1;
+    out.experts = 64;          out.experts_used = 4;    out.shared_experts = 1;  out.expert_ffn = 1536;
+    out.leading_dense = 1;     out.first_moe = 1;
+    out.q_lora_rank = 768;     out.kv_lora_rank = 512;
+    out.key_length = 576;      out.value_length = 512;
+    out.key_length_mla = 256;  out.value_length_mla = 256;
+    out.rope_dimension_count = 64;
+    out.rope_freq_base = g.get("deepseek2.rope.freq_base")->f;
+    out.rms_eps = g.get("deepseek2.attention.layer_norm_rms_epsilon")->f;
+    out.weights_scale = g.get("deepseek2.expert_weights_scale")->f;
+    out.weights_norm = wn->u != 0;
+
+    // Derive the block table from the tensors and cross-check the header.  Only one attention kind
+    // here (MLA) and one dense stem block, so the checks are narrower than glm5next's; a block that is
+    // neither MLA nor the stem is a file whose tensors disagree with its metadata.
+    out.attn.assign(out.block_count, AttnKind::None);
+    auto has = [&](uint32_t b, const char* suffix) {
+        char name[128];
+        std::snprintf(name, sizeof name, "blk.%u.%s", b, suffix);
+        return g.find(name) != nullptr || (other_shards && other_shards->count(name) != 0);
+    };
+    uint32_t moe_seen = 0;
+    for (uint32_t b = 0; b < out.block_count; ++b) {
+        const bool mla = has(b, "attn_kv_a_mqa.weight");
+        const bool experts = has(b, "ffn_gate_exps.weight");
+        const bool dense = has(b, "ffn_gate.weight");
+        if (!mla) return "blk." + std::to_string(b) + " has no attn_kv_a_mqa.weight (every block is MLA)";
+        if (b < out.leading_dense) {
+            if (experts) return "blk." + std::to_string(b) + " is in the dense stem but carries experts";
+            if (!dense) return "blk." + std::to_string(b) + " is a stem block with no ffn_gate.weight";
+        } else {
+            if (!experts) return "blk." + std::to_string(b) + " is not a stem block but has no experts";
+            ++moe_seen;
+        }
+        out.attn[b] = AttnKind::Mla;
+    }
+    if (moe_seen != out.block_count - out.leading_dense)
+        return "MoE block count disagrees with leading_dense_block_count";
+    return {};   // empty == ok
+}
+
 } // namespace strata

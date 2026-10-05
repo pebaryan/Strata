@@ -81,7 +81,7 @@ gate below, exactly as llama.cpp's GLM5-Next graph was for phases 8-9 of the GLM
 |---|---|---|
 | 0 | this inventory | tensor set + metadata match the header |
 | 1 ✅ | packer (`tools/glm47_pack.py`) | **PASSED** — `strata-load --layout --layout-layers 47`: 47 layers, 64 experts/layer, first expert block 1, 16.77 GB, dense stem block 0, Q4_K/Q6_K down mix |
-| 2 | arch guard + geometry (`deepseek2`) | reader loads the pack and reports the geometry; wrong-arch packs refuse |
+| 2 ✅ | arch guard + geometry (`deepseek2`) | **PASSED** — `strata-gguf <gguf> --glm47` reports 47 blocks / 47 MLA / 64 experts / rope 64 and accepts the artifact; a non-deepseek2 file refuses (`architecture is 'gpt-oss', expected 'deepseek2'`) |
 | 3 | MLA parity (incl. the new rope) | one MLA layer's intermediates logits-compared to the oracle |
 | 4 | router/MoE parity | routing ids+weights for random hidden states match the oracle (ids exact) |
 | 5 | trunk + end-to-end | 64/64 greedy tokens identical to the oracle on a fixed prompt |

@@ -79,18 +79,67 @@ int report_glm5next(const std::string& path) {
     return 0;
 }
 
+// ---- GLM-4.7-Flash (branch glm47-port): the phase-2 gate for the deepseek2 guard - open the
+// artifact and report its geometry instead of refusing it.
+int report_glm47(const std::string& path) {
+    strata::GgufFile g(path);
+    std::set<std::string> others;
+    const size_t slash = path.find_last_of('/');
+    const std::string dir = (slash == std::string::npos) ? std::string() : path.substr(0, slash + 1);
+    const std::string name = (slash == std::string::npos) ? path : path.substr(slash + 1);
+    const size_t of = name.rfind("-of-");
+    if (of != std::string::npos && of >= 6) {
+        const std::string total = name.substr(of + 4);
+        const std::string stem = name.substr(0, of - 6);
+        const int n_shards = std::atoi(total.c_str());
+        for (int i = 2; i <= n_shards; ++i) {
+            char sib[4096];
+            std::snprintf(sib, sizeof sib, "%s%s-%05d-of-%s", dir.c_str(), stem.c_str(), i, total.c_str());
+            try {
+                strata::GgufFile s(sib);
+                for (const auto& t : s.tensors()) others.insert(t.name);
+            } catch (const std::exception& e) {
+                std::printf("  shard %s: %s\n", sib, e.what());
+            }
+        }
+    }
+    strata::Deepseek2Geometry geo;
+    const std::string err = strata::check_deepseek2_architecture(g, geo, &others);
+    if (!err.empty()) {
+        std::printf("  deepseek2 guard: FAIL - %s\n", err.c_str());
+        return 1;
+    }
+    uint32_t n_mla = 0;
+    for (auto k : geo.attn) n_mla += (k == strata::AttnKind::Mla);
+    std::printf("  deepseek2 guard: PASS (metadata and tensors agree)\n");
+    std::printf("  blocks          %u (dense stem %u, MoE %u)\n", geo.block_count, geo.leading_dense,
+                geo.block_count - geo.leading_dense);
+    std::printf("  attention       %u MLA blocks (head_count %u, kv_heads %u, q_lora_rank %u, "
+                "kv_lora_rank %u, key_length_mla %u)\n", n_mla, geo.head_count, geo.head_count_kv,
+                geo.q_lora_rank, geo.kv_lora_rank, geo.key_length_mla);
+    std::printf("  rope            %u dims, freq_base %.0f (decoupled - glm5next's MLA carries none)\n",
+                geo.rope_dimension_count, geo.rope_freq_base);
+    std::printf("  experts         %u routed (%u used) + %u shared, ffn %u, scale %.2f, norm %s\n",
+                geo.experts, geo.experts_used, geo.shared_experts, geo.expert_ffn, geo.weights_scale,
+                geo.weights_norm ? "true" : "false");
+    std::printf("  expert layout   first MoE block %u: blocks 0-%u carry no experts, so the pack's "
+                "expert table starts there\n", geo.first_moe, geo.first_moe ? geo.first_moe - 1 : 0);
+    return 0;
+}
+
 }  // namespace
 
 #ifndef STRATA_GGUF_MAIN_DISABLED
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: gguf_reader <file.gguf> [--check | --glm5next]\n");
+        std::printf("usage: gguf_reader <file.gguf> [--check | --glm5next | --glm47]\n");
         return 2;
     }
     const std::string mode = (argc > 2) ? std::string(argv[2]) : std::string();
     const bool check = mode == "--check";
     try {
         if (mode == "--glm5next") return report_glm5next(argv[1]);
+        if (mode == "--glm47") return report_glm47(argv[1]);
         strata::GgufFile g(argv[1]);
         std::printf("%s\n", argv[1]);
         std::printf("  version %u   tensors %zu   metadata %zu   data_start %llu   size %llu\n", g.version(),
