@@ -25,6 +25,9 @@
 
 #include <cuda_runtime.h>
 
+#include <atomic>
+#include <functional>
+#include <thread>
 #include <unordered_map>
 
 #include <algorithm>
