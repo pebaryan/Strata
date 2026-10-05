@@ -391,6 +391,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
                           src/kernels/cuda/native_flash_attn.cu
                           src/kernels/cuda/native_qsa_indexer.cu
                           src/kernels/cuda/native_qsa_score.cu
+                          src/kernels/cuda/kolibri_cuda.cu
                           src/kernels/cuda/ple.cu
                           src/kernels/cuda/kv_q8.cu
                           src/kernels/cuda/kv_stream.cu
@@ -1151,10 +1152,18 @@ target_include_directories(kolibri_trunk_gate PRIVATE ${CMAKE_SOURCE_DIR}/includ
 add_executable(kolibri_multitoken_gate tools/kolibri_multitoken_gate.cpp src/kernels/glm_moe.cpp)
 target_include_directories(kolibri_multitoken_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
-# Kolibri serving entrypoint: the parity-gated standard-attention trunk with persistent KV state,
-# exposed through Strata's READY/GEN/T/DONE engine protocol.
-add_executable(strata-kolibri tools/kolibri_serve.cpp src/kernels/glm_moe.cpp)
+# Kolibri serving entrypoint (branch kolibri-port): the sigmoid_logit_add router, the SSSSF-SWA
+# trunk and the resident expert-row cache on the V100, exposed through Strata's READY/GEN/T/DONE
+# engine protocol.  `--gate` runs one prefill through THIS path and compares every position's
+# logits with the patched llama.cpp oracle's per-position dumps (parity before speed).
+add_executable(strata-kolibri tools/kolibri_cuda_serve.cpp
+               src/core/weights.cpp src/core/native_dense.cpp src/core/native_head.cpp
+               src/core/expert_source.cpp src/core/expert_cache.cpp src/core/expert_row_cache.cpp
+               src/core/remote_experts.cpp src/core/remote_expert_opt.cu src/core/peer_experts.cpp
+               src/core/glm_expert_device.cpp
+               src/kernels/cpu/expert_layout.cpp src/kernels/glm_moe.cpp)
 target_include_directories(strata-kolibri PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(strata-kolibri PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
 
 # glm45_run (branch glm5next-port): THE PORT'S LAST STEP.  The engine's own 45-block trunk, from the pack,
 # ending in a token.  The acceptance test is argmax == 12089, not a per-layer float match, because the

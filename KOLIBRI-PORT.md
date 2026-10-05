@@ -198,3 +198,58 @@ The GLM port took phases 0-9 over five days because of KDA, MLA, the indexer, hy
 MTP. Kolibri has none of those; the new work is SWA, the router mode, sandwich norms and the packer
 cut. Roughly a third of the GLM effort: about two focused days to phase 6 on this box, with the
 V100 free and `iq_pack` finished (the packer and gates read the same disk).
+
+## The CUDA path on the V100 (branch `kolibri-port`)
+
+`tools/kolibri_cuda_serve.cpp` plus `src/kernels/cuda/kolibri_cuda.cu` (and `kolibri_cuda.hpp`) are
+the V100 serving path.  Dense work and attention stay on device.  Each layer is split at its DYNAMIC
+expert selection into two CUDA graphs: `pre` = rms_norm -> QKV -> QK-norm/RoPE/KV cache ->
+attention -> output projection -> post-attention norm -> ffn norm -> router; `post` = shared expert
+-> post-FFW norm -> residual add.  The split exists because which expert rows are needed is decided
+by the router at run time, so one graph over the whole layer is impossible without freezing the
+routing inside the capture.  Expert rows come from Strata's resident row cache
+(`ExpertRowCache`, budget from `STRATA_KOLIBRI_EXPERT_CACHE_GB`, default 8).
+
+### Parity before speed: `--gate`
+
+    build-kolibri-gate/strata-kolibri --pack /home/peb/moredata/strata-pack-kolibri \
+      --native /home/peb/moredata/models/Kolibri-1-GGUF/Kolibri-1-Q4_K_M.gguf \
+      --max-context 96 --gate /home/peb/moredata/kolibri-oracle/cap5b.pref \
+      325,9255,279,18462,735 --gen 32
+
+`--gate` runs one prefill through THIS code path and compares EVERY position's logits against the
+patched llama.cpp oracle's per-position dumps.  Argmax equality is the hard criterion, cosine >= 0.98
+the numeric one (the same pair the CPU trunk/multitoken gates use).  It then prints the expert-row
+cache report (hits/misses/evictions/refusals), which phase 7 asks for, and `--gen N` decodes N tokens
+greedily through the same path so the rate is comparable run to run.
+
+Measured on this V100, 8 GB expert cache, with the HTTP server also resident:
+
+    PASS position 0: argmax 1646 vs oracle 1646, cos 1.0000, max |logit err| 0.037 (307 ms)
+    PASS position 1: argmax 279  vs oracle 279,  cos 0.9996, max |logit err| 1.243 (217 ms)
+    PASS position 2: argmax 6619 vs oracle 6619, cos 0.9999, max |logit err| 0.496 (202 ms)
+    PASS position 3: argmax 735  vs oracle 735,  cos 0.9998, max |logit err| 0.792 (192 ms)
+    PASS position 4: argmax 29116 vs oracle 29116, cos 0.9998, max |logit err| 0.870 (182 ms)
+    prefill: 5 tokens in 1.1 s (4.54 tok/s)
+    greedy decode: 32 tokens in 37068 ms (0.86 tok/s, 1158 ms/token)
+    cache: expert rows: 3600 resident, 8.00 of 8.00 GB used, hits 7463 misses 3637 evictions 37
+    CUDA KOLIBRI GATE: PASS
+
+The CUDA path is CLOSER to the oracle than the CPU reference path (cos 0.9996-1.0000, worst |err|
+1.24, against the CPU gate's cos 0.9922 / err 4.9): it runs llama.cpp's native integer quant dots
+and the BF16 router rather than f32 dequant-gemv.
+
+### Throughput, and what it is not
+
+The 0.86 tok/s above is a cold-cache decode rate and it is NOT the number to quote: the wrapper's
+HTTP path measured 3.7-3.8 tok/s on a 219-token prompt in the same configuration, because a long
+prefill fills the row cache before decoding starts.  Both are far from "Qwen-like" for a 3.46B-active
+model on a V100, and the reason is measurable, not mysterious: at 8 GB the cache holds 3,600 of the
+pack's 19,200 expert rows against 45.7 GB of blobs, so a token whose 300 selections miss ~80 times
+moves ~200 MB of expert data.  A controlled tok/s benchmark (warm prefill, no competing server,
+several cache budgets) is the next measurement, not a claim.
+
+Also fixed in this pass: `attn_k` computed every score and the whole softmax in ONE thread per head
+(~65k serial FMAs per head for a 513-key window); scores and both reductions now run across the
+block, and parity is unchanged.  Per-token prefill time at 5 tokens is 182-307 ms, dominated by the
+expert uploads, not attention.

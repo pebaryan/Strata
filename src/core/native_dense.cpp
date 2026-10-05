@@ -40,6 +40,7 @@ static bool glm5_eligible_name(const std::string& name) {
 /// different and which belong to the expert cache reading the pack's experts.bin, and their block-geometry
 /// check rejects them outright.
 static bool g_glm5_only = false;
+static bool g_kolibri_only = false;
 static int g_layer_lb = -1, g_layer_le = -1;   // set_layer_range; -1 means every layer
 static bool in_range(const std::string& name) {
     if (g_layer_lb < 0 || name.rfind("blk.", 0) != 0) return true;
@@ -49,6 +50,10 @@ static bool in_range(const std::string& name) {
 
 bool eligible(const strata::TensorInfo& tensor, bool include_ple_key) {
     if (g_glm5_only) return glm5_eligible_name(tensor.name);
+    if (g_kolibri_only) {
+        if (tensor.name.find("_exps.") != std::string::npos) return false;
+        return tensor.name.rfind("blk.", 0) == 0;
+    }
     const auto& name = tensor.name;
     if (name.rfind("blk.", 0) != 0) return false;
     // Match the native PLE kernel: Q2_0, IQ3_XXS, IQ4_XS and Q8_0 (UD-Q4_K_XL). Other keys retain the packed BF16
@@ -80,7 +85,8 @@ bool NativeDense::served_names(const std::vector<std::string>& shards, bool incl
         strata::GgufFile first(shards.empty() ? std::string() : shards.front());
         const strata::MetaValue* a = first.get("general.architecture");
         g_glm5_only = (a && a->s == "glm5next");
-    } catch (const std::exception&) { g_glm5_only = false; }
+        g_kolibri_only = (a && a->s == "kolibri1");
+    } catch (const std::exception&) { g_glm5_only = g_kolibri_only = false; }
     try {
         for (const auto& path : shards) {
             strata::GgufFile gguf(path);
@@ -130,7 +136,8 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
         strata::GgufFile first(shards.empty() ? std::string() : shards.front());
         const strata::MetaValue* a = first.get("general.architecture");
         g_glm5_only = (a && a->s == "glm5next");
-    } catch (const std::exception&) { g_glm5_only = false; }
+        g_kolibri_only = (a && a->s == "kolibri1");
+    } catch (const std::exception&) { g_glm5_only = g_kolibri_only = false; }
     if (scratch_ || !weights_.empty()) { err = "native dense: already loaded"; return false; }
     if (shards.empty()) { err = "native dense: at least one GGUF shard is required"; return false; }
     try {
@@ -180,6 +187,9 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                     }
                     strata::Glm5NextGeometry geo;
                     err = strata::check_glm5next_architecture(gguf, geo, &others);
+                } else if (arch && arch->s == "kolibri1") {
+                    strata::Kolibri1Geometry geo;
+                    err = strata::check_kolibri1_architecture(gguf, geo, nullptr);
                 } else {
                     err = strata::check_architecture(gguf);
                 }
