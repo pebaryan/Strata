@@ -28,6 +28,11 @@ struct MlaGeometry {
     int head_dim = 256;   ///< attention.key_length_mla
     int kv_lora = 512;    ///< attention.kv_lora_rank: the latent, and K and V both live here
     int q_lora = 1536;    ///< attention.q_lora_rank
+    /// GLM-4.7-Flash (deepseek2) decoupled RoPE: the head split is head_dim = (head_dim - n_rot) nope dims
+    /// followed by n_rot rope dims, and the query/key rope halves carry their own projection.  DEFAULT 0 keeps
+    /// the GLM-5.3 nope-only graph bit for bit (skip the whole rope branch).  When it is non-zero, `cache` rows
+    /// are (kv_lora + n_rot) wide: kv_lora latent dims then n_rot roped k_pe dims.
+    int n_rot = 0;        ///< attention.rope.dimension_count
 };
 
 /// Every weight as the engine reads it: C rows, ggml index order, ne0 contiguous.
@@ -36,10 +41,12 @@ struct MlaWeights {
     const float* q_a_norm = nullptr;   ///< [q_lora]
     const float* wq_b = nullptr;       ///< [n_head*head_dim][q_lora]
     const float* wk_b = nullptr;       ///< [n_head][kv_lora][head_dim]
-    const float* kv_a = nullptr;       ///< [kv_lora][n_embd]
+    const float* kv_a = nullptr;       ///< [kv_lora + n_rot][n_embd]: the MQA projection; the tail n_rot rows are wkv_a_mqa's k_pe
     const float* kv_a_norm = nullptr;  ///< [kv_lora]
     const float* wv_b = nullptr;       ///< [n_head][head_dim][kv_lora]
     const float* wo = nullptr;         ///< [n_embd][n_head*head_dim]
+    /// Decoupled-RoPE base (deepseek2.rope.freq_base = 1e6 for GLM-4.7-Flash).  Read only when g.n_rot != 0.
+    float rope_freq_base = 1000000.0f;
     /// Native device-block GGML types, or zero when the pointer above is host floats.  The MLA carried NO types at all
     /// until now, which is precisely why it had no device path: the kernel had nothing to dispatch on, while the KDA
     /// beside it has had wq_type/wk_type/wv_type/wo_type for a while.  A non-zero type means the pointer is the
@@ -62,9 +69,14 @@ struct MlaWeights {
 /// Optional intermediate outputs, for a parity test to localize a mismatch.  Any pointer may be null.
 struct MlaIntermediates {
     float* qr = nullptr;     ///< [q_lora]
-    float* qcur = nullptr;   ///< [n_head][kv_lora]
+    float* qcur = nullptr;   ///< [n_head][kv_lora]   the absorbed q_nope (n_rot>0) or the absorbed q (n_rot==0)
     float* kv = nullptr;     ///< [kv_lora]
     float* attn = nullptr;   ///< [n_head][kv_lora]
+    float* v = nullptr;      ///< [n_head][head_dim]  the per-head un-absorbed values (before wo)
+    /// Decoupled-RoPE intermediates, filled only when g.n_rot != 0.
+    float* q_nope = nullptr; ///< [n_head][head_dim - n_rot]  q split before absorption
+    float* q_pe = nullptr;   ///< [n_head][n_rot]             q rope half, AFTER RoPE
+    float* k_pe = nullptr;   ///< [n_rot]                     k_pe, AFTER RoPE
 };
 
 /// The model's rms norm epsilon (glm5next.attention.layer_norm_rms_epsilon = 1e-5).
@@ -126,7 +138,9 @@ int mla_block_decode_cuda(const MlaWeights& w, const MlaGeometry& g, const float
 int mla_block_launch_cuda(const MlaWeights& w, const MlaGeometry& g, const float* d_x, int n_cache, const float* cache,
                           float* kv_row_host, float* d_out, void* stream, char* error, size_t error_capacity);
 
+/// `pos` is the current token's position (for the decoupled RoPE); a negative value means n_cache - 1, the row the
+/// caller is expected to have appended.  It is ignored when g.n_rot == 0.
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
-                 float* out, const MlaIntermediates& want = {});
+                 float* out, const MlaIntermediates& want = {}, int pos = -1);
 
 }  // namespace strata::kernels::glm

@@ -187,6 +187,16 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(glm_mla_parity PRIVATE strata_kernels CUDA::cudart)
 endif()
 
+# GLM-4.7-Flash MLA parity (branch glm47-port): the decoupled-RoPE (deepseek2) MLA path, against
+# tools/glm47_mla_reference.py.  Same host-only, hand-run reasoning as the nope-only gate above; the
+# n_rot==0 path in the shared glm_mla.cpp is unchanged, so this target also guards against regressing it.
+add_executable(glm47_mla_parity src/kernels/glm47_mla_parity.cpp src/kernels/glm_mla.cpp)
+target_include_directories(glm47_mla_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm47_mla_parity PRIVATE -O2)
+if(STRATA_ENABLE_CUDA)
+  target_link_libraries(glm47_mla_parity PRIVATE strata_kernels CUDA::cudart)
+endif()
+
 # Indexer parity (branch glm5next-port): the 4:1 key pool and the whole-pool selection, against
 # tools/glm5_indexer_reference.py.
 add_executable(glm_indexer_parity src/kernels/glm_indexer_parity.cpp src/kernels/glm_indexer.cpp)

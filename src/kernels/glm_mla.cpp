@@ -37,6 +37,172 @@ void rms_norm_inplace(float* x, int n, const float* weight) {
     for (int i = 0; i < n; ++i) x[i] = x[i] * inv * (weight ? weight[i] : 1.0f);
 }
 
+/// ggml GGML_ROPE_TYPE_NEOX over `n_rot` dims: rotate the pair (i, i + n_rot/2) by theta_i = pos * freq_base^(-2i/n_rot).
+/// The deepseek2 rope carries no YaRN (freq_scale 1, ext_factor 0), so n_ctx_orig/attn_factor do not enter; GLM-4.7-Flash
+/// sets rope.dimension_count 64 and deepseek2.rope.freq_base 1e6.  The angle is evaluated in DOUBLE: at these bases and
+/// positions theta reaches thousands of radians, where a float pow() angle is off by ~1e-4 rad - enough to move the rope
+/// half by ~1e-4, i.e. right at the gate.  Only the coefficients, not the activations, go through double.
+void rope_neox_inplace(float* v, int n_rot, int pos, float freq_base) {
+    const int half = n_rot / 2;
+    for (int i = 0; i < half; ++i) {
+        const double theta = (double) pos * std::pow((double) freq_base, -2.0 * (double) i / (double) n_rot);
+        const float c = (float) std::cos(theta), s = (float) std::sin(theta);
+        const float x0 = v[i], x1 = v[i + half];
+        v[i]        = x0 * c - x1 * s;
+        v[i + half] = x0 * s + x1 * c;
+    }
+}
+
+/// GLM-4.7-Flash (deepseek2) MLA: decoupled RoPE.  q is split per head into nope (absorbed by wk_b) and a roped
+/// n_rot-half that is carried alongside; K is the normed latent concatenated with the roped k_pe; V is the latent.
+void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
+                      float* out, const MlaIntermediates& want, int pos) {
+    const int n_head = g.n_head, head_dim = g.head_dim, kv_lora = g.kv_lora, q_lora = g.q_lora;
+    const int n_rot = g.n_rot, nope = head_dim - n_rot;
+    const int q_dim = n_head * head_dim;
+    const int kv_dim = kv_lora + n_rot;
+    const int stride = kv_lora + n_rot;   // one cache row: latent then roped k_pe
+    if (pos < 0) pos = n_cache - 1;
+
+    std::vector<float> qr((size_t) q_lora, 0.0f);
+    bool qr_done = false;
+    if (g_native_project != nullptr && w.wq_a_type != 0) {
+        const void* nw[1] = {w.wq_a};
+        const int nt[1] = {w.wq_a_type};
+        float* no[1] = {qr.data()};
+        qr_done = g_native_project(1, nw, nt, x, g.n_embd, q_lora, no);
+    }
+    for (int j = 0; !qr_done && j < q_lora; ++j) {
+        const float* row = w.wq_a + (size_t) j * g.n_embd;
+        float acc = 0.0f;
+        for (int i = 0; i < g.n_embd; ++i) acc += row[i] * x[i];
+        qr[(size_t) j] = acc;
+    }
+    rms_norm_inplace(qr.data(), q_lora, w.q_a_norm);
+    if (want.qr) std::copy(qr.begin(), qr.end(), want.qr);
+
+    // q = wq_b @ qr -> [n_head][head_dim], split into nope / rope halves per head
+    std::vector<float> q((size_t) q_dim, 0.0f);
+    bool q_done = false;
+    if (g_native_project != nullptr && w.wq_b_type != 0) {
+        const void* nw[1] = {w.wq_b};
+        const int nt[1] = {w.wq_b_type};
+        float* no[1] = {q.data()};
+        q_done = g_native_project(1, nw, nt, qr.data(), q_lora, q_dim, no);
+    }
+    for (int i = 0; !q_done && i < q_dim; ++i) {
+        const float* row = w.wq_b + (size_t) i * q_lora;
+        float acc = 0.0f;
+        for (int j = 0; j < q_lora; ++j) acc += row[j] * qr[(size_t) j];
+        q[(size_t) i] = acc;
+    }
+    std::vector<float> q_nope((size_t) n_head * nope, 0.0f), q_pe((size_t) n_head * n_rot, 0.0f);
+    for (int h = 0; h < n_head; ++h) {
+        const float* qh = q.data() + (size_t) h * head_dim;
+        std::copy(qh, qh + nope, q_nope.data() + (size_t) h * nope);
+        std::copy(qh + nope, qh + head_dim, q_pe.data() + (size_t) h * n_rot);
+        rope_neox_inplace(q_pe.data() + (size_t) h * n_rot, n_rot, pos, w.rope_freq_base);
+    }
+    if (want.q_nope) std::copy(q_nope.begin(), q_nope.end(), want.q_nope);
+    if (want.q_pe) std::copy(q_pe.begin(), q_pe.end(), want.q_pe);
+
+    // kv_mqa = wkv_a_mqa @ x -> [kv_lora + n_rot]; kv = rms_norm(first kv_lora); k_pe roped from the tail rows
+    std::vector<float> kv_mqa((size_t) kv_dim, 0.0f);
+    bool kv_done = false;
+    if (g_native_project != nullptr && w.kv_a_type != 0) {
+        const void* nw[1] = {w.kv_a};
+        const int nt[1] = {w.kv_a_type};
+        float* no[1] = {kv_mqa.data()};
+        kv_done = g_native_project(1, nw, nt, x, g.n_embd, kv_dim, no);
+    }
+    for (int i = 0; !kv_done && i < kv_dim; ++i) {
+        const float* row = w.kv_a + (size_t) i * g.n_embd;
+        float acc = 0.0f;
+        for (int e = 0; e < g.n_embd; ++e) acc += row[e] * x[e];
+        kv_mqa[(size_t) i] = acc;
+    }
+    std::vector<float> kv(kv_mqa.begin(), kv_mqa.begin() + kv_lora);
+    rms_norm_inplace(kv.data(), kv_lora, w.kv_a_norm);
+    std::vector<float> k_pe(kv_mqa.begin() + kv_lora, kv_mqa.end());
+    rope_neox_inplace(k_pe.data(), n_rot, pos, w.rope_freq_base);
+    if (want.kv) std::copy(kv.begin(), kv.end(), want.kv);
+    if (want.k_pe) std::copy(k_pe.begin(), k_pe.end(), want.k_pe);
+
+    // Qcur[h] = wk_b[h] (kv_lora x nope) @ q_nope[h]
+    std::vector<float> qcur((size_t) n_head * kv_lora, 0.0f);
+    for (int h = 0; h < n_head; ++h) {
+        const float* m = w.wk_b + (size_t) h * kv_lora * nope;
+        const float* qh = q_nope.data() + (size_t) h * nope;
+        float* Qh = qcur.data() + (size_t) h * kv_lora;
+        for (int i = 0; i < kv_lora; ++i) {
+            const float* row = m + (size_t) i * nope;
+            float acc = 0.0f;
+            for (int j = 0; j < nope; ++j) acc += row[j] * qh[j];
+            Qh[i] = acc;
+        }
+    }
+    if (want.qcur) std::copy(qcur.begin(), qcur.end(), want.qcur);
+
+    // decoupled attention: score[h][t] = (Qcur[h] . latent_t + q_pe[h] . kpe_t) * kq_scale, V = latent
+    const float kq_scale = 1.0f / std::sqrt((float) head_dim);
+    std::vector<float> attn((size_t) n_head * kv_lora, 0.0f);
+    std::vector<float> scores((size_t) (n_cache > 0 ? n_cache : 1), 0.0f);
+    for (int h = 0; h < n_head; ++h) {
+        const float* Qh = qcur.data() + (size_t) h * kv_lora;
+        const float* pe = q_pe.data() + (size_t) h * n_rot;
+        float best = -INFINITY;
+        for (int t = 0; t < n_cache; ++t) {
+            const float* kt = cache + (size_t) t * stride;
+            const float* pt = kt + kv_lora;
+            float acc = 0.0f;
+            for (int i = 0; i < kv_lora; ++i) acc += Qh[i] * kt[i];
+            for (int i = 0; i < n_rot; ++i) acc += pe[i] * pt[i];
+            scores[(size_t) t] = acc * kq_scale;
+            if (scores[(size_t) t] > best) best = scores[(size_t) t];
+        }
+        double sum = 0.0;
+        for (int t = 0; t < n_cache; ++t) {
+            scores[(size_t) t] = std::exp(scores[(size_t) t] - best);
+            sum += scores[(size_t) t];
+        }
+        float* Ah = attn.data() + (size_t) h * kv_lora;
+        for (int t = 0; t < n_cache; ++t) {
+            const float p = (float) (scores[(size_t) t] / sum);
+            const float* kt = cache + (size_t) t * stride;
+            for (int i = 0; i < kv_lora; ++i) Ah[i] += p * kt[i];
+        }
+    }
+    if (want.attn) std::copy(attn.begin(), attn.end(), want.attn);
+
+    // v[h] = wv_b[h] @ attn[h]; out = wo @ concat(v)
+    std::vector<float> v((size_t) q_dim, 0.0f);
+    for (int h = 0; h < n_head; ++h) {
+        const float* Ah = attn.data() + (size_t) h * kv_lora;
+        const float* m = w.wv_b + (size_t) h * head_dim * kv_lora;
+        float* vh = v.data() + (size_t) h * head_dim;
+        for (int i = 0; i < head_dim; ++i) {
+            const float* row = m + (size_t) i * kv_lora;
+            float acc = 0.0f;
+            for (int j = 0; j < kv_lora; ++j) acc += row[j] * Ah[j];
+            vh[i] = acc;
+        }
+    }
+    if (want.v) std::copy(v.begin(), v.end(), want.v);
+    bool wo_done = false;
+    if (g_native_project != nullptr && w.wo_type != 0) {
+        const void* nw[1] = {w.wo};
+        const int nt[1] = {w.wo_type};
+        float* no[1] = {out};
+        wo_done = g_native_project(1, nw, nt, v.data(), q_dim, g.n_embd, no);
+    }
+    for (int e = 0; !wo_done && e < g.n_embd; ++e) {
+        const float* row = w.wo + (size_t) e * q_dim;
+        float acc = 0.0f;
+        for (int i = 0; i < q_dim; ++i) acc += row[i] * v[(size_t) i];
+        out[e] = acc;
+    }
+}
+
 }  // namespace
 
 MlaNativeProjectBatchFn g_native_project_batch = nullptr;
@@ -83,6 +249,7 @@ int mla_block_launch_cuda(const MlaWeights&,const MlaGeometry&,const float*,int,
 #endif
 
 bool mla_forward_batch(const MlaWeights& w, const MlaGeometry& g, const float* x, int T, int c0, float* cache, float* out) {
+    if (g.n_rot != 0) return false;   // the device batch path has no decoupled RoPE; fall back to mla_forward per token
     if (!g_native_project_batch || !g_device_attention || T < 1 || c0 < 0) return false;
     if (c0 + T > 8192 && !kernels::glm::idx_available(w)) return false;   // dense device attention stops at 8192; the indexer lifts it
     if (!w.wq_a_type || !w.wq_b_type || !w.kv_a_type || !w.wo_type) return false;
@@ -219,9 +386,18 @@ bool mla_forward_batch(const MlaWeights& w, const MlaGeometry& g, const float* x
 }
 
 void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int n_cache, const float* cache,
-                 float* out, const MlaIntermediates& want) {
+                 float* out, const MlaIntermediates& want, int pos) {
     const int n_head = g.n_head, head_dim = g.head_dim, kv_lora = g.kv_lora, q_lora = g.q_lora;
     const int q_dim = n_head * head_dim;
+
+    // GLM-4.7-Flash (deepseek2): the decoupled-RoPE graph, host-only for now.  Kept as its own function so the
+    // nope-only path below is byte-identical to the GLM-5.3 port (n_rot defaults to 0 and never reaches here).
+    if (g.n_rot > 0) {
+        if (g_device_attention || g_device_block)
+            std::fprintf(stderr, "[mla] decoupled-RoPE MLA has no device path yet; using the host kernel\n");
+        mla_forward_rope(w, g, x, n_cache, cache, out, want, pos);
+        return;
+    }
 
     // A decoded token on the device-resident block: it receives the new latent through want.kv (the cache row this call
     // appends) and declines, touching nothing, whenever a precondition is not met - then the host path below runs.
@@ -396,6 +572,8 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
     }
     if (want.attn)
         std::copy(attn.begin(), attn.end(), want.attn);
+    if (want.v)
+        std::copy(v.begin(), v.end(), want.v);
 
     // out = wo @ concat_heads(v)
     bool wo_done = false;
