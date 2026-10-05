@@ -245,14 +245,17 @@ int main() {
         }
         if (swa) {
             auto rope = [&](std::vector<D>& vec, int heads) {
+                // rotate-half (ggml's ROPE_TYPE_NEOX: pairs (i, i + head_dim/2)), matching
+                // kolibri_swa.hpp - interleaved (2i, 2i+1) is GPT-J style and WRONG for this arch
+                const int half = HEAD_DIM / 2;
                 for (int h = 0; h < heads; ++h)
-                    for (int i = 0; i < HEAD_DIM / 2; ++i) {
+                    for (int i = 0; i < half; ++i) {
                         const D freq = std::pow((D) THETA, (D) (-2.0 * i) / HEAD_DIM);
                         const D angle = (D) t * freq;
                         const D c = std::cos(angle), s = std::sin(angle);
-                        const D x0v = vec[(size_t) h * HEAD_DIM + 2 * i], x1v = vec[(size_t) h * HEAD_DIM + 2 * i + 1];
-                        vec[(size_t) h * HEAD_DIM + 2 * i] = x0v * c - x1v * s;
-                        vec[(size_t) h * HEAD_DIM + 2 * i + 1] = x0v * s + x1v * c;
+                        const D x0v = vec[(size_t) h * HEAD_DIM + i], x1v = vec[(size_t) h * HEAD_DIM + i + half];
+                        vec[(size_t) h * HEAD_DIM + i] = x0v * c - x1v * s;
+                        vec[(size_t) h * HEAD_DIM + i + half] = x0v * s + x1v * c;
                     }
             };
             rope(q, N_HEAD); rope(k, N_KV);
