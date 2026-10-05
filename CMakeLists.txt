@@ -1128,6 +1128,12 @@ target_link_libraries(block3_gate PRIVATE strata_kernels strata_kernels_cpu CUDA
 add_executable(kolibri_router_gate tools/kolibri_router_gate.cpp src/kernels/glm_moe.cpp)
 target_include_directories(kolibri_router_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+# kolibri_layer_gate (branch kolibri-port): the layer graph semantics - sandwich norms inside the
+# residuals, QK-norm before RoPE, NoPE on full layers, the 513-token SWA mask - float engine path
+# against a double reference, over a 600-position sequence with probes at the window boundary.
+add_executable(kolibri_layer_gate tools/kolibri_layer_gate.cpp)
+target_include_directories(kolibri_layer_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 # glm45_run (branch glm5next-port): THE PORT'S LAST STEP.  The engine's own 45-block trunk, from the pack,
 # ending in a token.  The acceptance test is argmax == 12089, not a per-layer float match, because the
 # engine accumulates the quantization of 43 routed blocks (~5% of rms worst element, measured).
