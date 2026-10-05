@@ -88,8 +88,13 @@ greedy `29116 46 1914 262 3515 735` = "Vienna. So the answer is"; logits dumps a
 `/home/peb/moredata/kolibri-oracle/`. NOTE: the oracle's n_vocab is 128,000, not the header's
 131,072 - phase-6 logit comparisons must use the oracle's size.
 
-Remaining: trunk wiring (drive the gated pieces through an engine path against the oracle
-logits), then the tricks (expert row cache + mmap) and the measured tok/s comparison.
+- `62872a6` trunk gate: `tools/kolibri_trunk_gate.cpp` - one token through the engine's own
+  50-layer trunk (straight from the GGUF; pack index semantics deferred to serving), compared
+  with the oracle's position-0 logits for token 325: max |err| 0.34 over 128k vocab, greedy
+  argmax identical (1646), 3.9 s single-thread CPU.
+
+Remaining: a multi-token run (exercises RoPE/SWA/KV through the window), then the serving
+integration (pack index path, expert row cache + mmap) and the measured tok/s comparison.
 
 ### Phase 0 - inventory (done, this document)
 Tensor names, quants, shapes and metadata read from the artifact with gguf-py. Regenerate with
