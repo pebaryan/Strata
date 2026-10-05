@@ -217,6 +217,18 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(glm47_block_parity PRIVATE strata_kernels CUDA::cudart)
 endif()
 
+# GLM-4.7-Flash trunk parity (branch glm47-port): the 47-block loop - block 0 dense, the rest MoE, and
+# EACH LAYER ITS OWN MLA cache - plus the head (output_norm -> project -> argmax), against
+# tools/glm47_trunk_reference.py.  It composes exactly the kernels glm47_block_parity does, so it links
+# the same sources and, for glm_mla.cpp's CUDA entry points, the kernel library and cudart.
+add_executable(glm47_trunk_parity src/kernels/glm47_trunk_parity.cpp src/kernels/glm_mla.cpp
+               src/kernels/glm_moe.cpp src/kernels/glm_norm.cpp)
+target_include_directories(glm47_trunk_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm47_trunk_parity PRIVATE -O2)
+if(STRATA_ENABLE_CUDA)
+  target_link_libraries(glm47_trunk_parity PRIVATE strata_kernels CUDA::cudart)
+endif()
+
 # Indexer parity (branch glm5next-port): the 4:1 key pool and the whole-pool selection, against
 # tools/glm5_indexer_reference.py.
 add_executable(glm_indexer_parity src/kernels/glm_indexer_parity.cpp src/kernels/glm_indexer.cpp)
