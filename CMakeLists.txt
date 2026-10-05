@@ -1140,6 +1140,12 @@ target_include_directories(kolibri_layer_gate PRIVATE ${CMAKE_SOURCE_DIR}/includ
 add_executable(kolibri_guard_gate tools/kolibri_guard_gate.cpp)
 target_include_directories(kolibri_guard_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+# kolibri_trunk_gate (branch kolibri-port): phase 6 - one token through the engine's own 50-layer
+# trunk (sandwich norms, QK-norm, LOGIT_ADD routing, native-quant expert rows, shared expert,
+# untied head), logits compared against the patched llama.cpp oracle's dump.
+add_executable(kolibri_trunk_gate tools/kolibri_trunk_gate.cpp src/kernels/glm_moe.cpp)
+target_include_directories(kolibri_trunk_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 # glm45_run (branch glm5next-port): THE PORT'S LAST STEP.  The engine's own 45-block trunk, from the pack,
 # ending in a token.  The acceptance test is argmax == 12089, not a per-layer float match, because the
 # engine accumulates the quantization of 43 routed blocks (~5% of rms worst element, measured).
