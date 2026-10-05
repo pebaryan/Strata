@@ -369,6 +369,12 @@ int main(int argc, char** argv) {
     }
     if (verbosity) std::printf("  binding the embedding (154880 rows, this is the slow part)\n");
     if (!load(g, "token_embd.weight", tok_emb, "token_embd")) return 1;
+    if (std::getenv("STRATA_GLM47_DUMP_EMB")) {
+        const int dt = 785;  // "The"
+        const float* r = tok_emb.data() + (size_t) dt * N_EMBD;
+        std::printf("  EMB dump tok %d:", dt); for (int i = 0; i < 8; ++i) std::printf(" %.6f", (double) r[i]);
+        std::printf("\n");
+    }
 
     // install the MLA native-projection hook: the four projections now run on the device
     if (use_device && n_dev_proj > 0) glm::mla_set_native_project(glm::glm47_native_project);
@@ -479,6 +485,15 @@ int main(int argc, char** argv) {
         for (int v = 0; v < V; ++v) order[(size_t) v] = v;
         std::partial_sort(order.begin(), order.begin() + 5, order.end(),
                           [&](int a, int b) { return logits[(size_t) a] > logits[(size_t) b]; });
+        static bool dumped = false;
+        if (!dumped && std::getenv("STRATA_GLM47_DUMP_HEAD")) {
+            dumped = true;
+            if (std::FILE* fhn = std::fopen("D:/tmp/port_hn.bin", "wb")) { std::fwrite(hn.data(), sizeof(float), (size_t) N_EMBD, fhn); std::fclose(fhn); }
+            std::printf("  HN dump:"); for (int i = 0; i < 8; ++i) std::printf(" %.6f", (double) hn[(size_t) i]);
+            std::printf("\n  LOGIT dump:"); for (int i = 0; i < 8; ++i) std::printf(" %.6f", (double) logits[(size_t) i]);
+            std::printf("\n  TOP5:"); for (int i = 0; i < 5; ++i) std::printf(" %d:%.6f", order[(size_t) i], (double) logits[(size_t) order[(size_t) i]]);
+            std::printf("\n");
+        }
         return order[0];
     };
 
