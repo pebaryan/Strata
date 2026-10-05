@@ -2,6 +2,10 @@
 // split at its dynamic expert selection so Strata's resident expert-row cache can service it.
 #include <cuda_runtime.h>
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -9,7 +13,9 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <functional>
 #include <limits>
+#include <map>
 #include <random>
 #include <set>
 #include <sstream>
@@ -44,6 +50,8 @@ struct Layer {
     float *kc{}, *vc{};
     cudaGraphExec_t pre{}, post{};
     KCPU::NativeFmt fmt{};
+    std::function<bool()> pre_fn, post_fn;   // the same op sequence the graphs encode, runnable
+                                             // directly for the per-op attribution mode
 };
 
 struct CacheRuntime {
@@ -51,6 +59,7 @@ struct CacheRuntime {
     cudaStream_t stream{};
     float *x{}, *gate{}, *up{}, *out{}, *accum{};
     void *xq{}, *hq{};
+    uint8_t* row_stage[N_USED]{};   // pinned, one per selected expert: the async H2D reads from these
     explicit CacheRuntime(size_t bytes) : cache([&] {
         C::ExpertRowCacheConfig c; c.budget_bytes=bytes; c.evict_ctx=this;
         c.on_evict=[](void*,const C::ExpertRowKey&,const C::ExpertRowEntry& e){ if(e.dev) cudaFree(e.dev); };
@@ -60,6 +69,7 @@ struct CacheRuntime {
         cudaMalloc((void**)&x,N_EMBD*4); cudaMalloc((void**)&gate,FF*4); cudaMalloc((void**)&up,FF*4);
         cudaMalloc((void**)&out,N_EMBD*4); cudaMalloc((void**)&accum,N_EMBD*4);
         cudaMalloc(&xq,K::native_q8_1_bytes(N_EMBD)); cudaMalloc(&hq,K::native_q8_1_bytes(FF));
+        for(int i=0;i<N_USED;++i) cudaHostAlloc((void**)&row_stage[i],4u<<20,cudaHostAllocDefault);
     }
     ~CacheRuntime(){ cache.clear(); cudaFree(x);cudaFree(gate);cudaFree(up);cudaFree(out);cudaFree(accum);cudaFree(xq);cudaFree(hq);cudaStreamDestroy(stream); }
 };
@@ -67,6 +77,35 @@ struct CacheRuntime {
 bool check(cudaError_t e, const char* where, std::string& err) {
     if (e == cudaSuccess) return true;
     err = std::string(where) + ": " + cudaGetErrorString(e); return false;
+}
+
+// ---- per-op attribution (STRATA_KOLIBRI_PROFILE=1).  Events cannot be read back from inside a
+// capture, so ops are timed only when the graph path is off (STRATA_KOLIBRI_NO_GRAPH=1); in capture
+// mode op_run() is a pass-through and the op is recorded into the graph as usual.
+bool g_prof = false, g_capturing = false;
+cudaEvent_t g_ev0 = nullptr, g_ev1 = nullptr;
+struct OpStat { double ms = 0; long n = 0; };
+std::map<std::string, OpStat> g_ops;
+
+template <typename F>
+void op_run(const char* name, F&& f) {
+    if (!g_prof || g_capturing) { f(); return; }
+    cudaEventRecord(g_ev0, 0);
+    f();
+    cudaEventRecord(g_ev1, 0);
+    cudaEventSynchronize(g_ev1);
+    float t = 0;
+    cudaEventElapsedTime(&t, g_ev0, g_ev1);
+    auto& s = g_ops[name]; s.ms += t; ++s.n;
+}
+
+void op_report(const char* phase, int tokens) {
+    if (!g_prof || tokens <= 0) return;
+    std::printf("  %s ops per token:", phase);
+    for (const auto& kv : g_ops)
+        std::printf(" %s %.2f", kv.first.c_str(), kv.second.ms / tokens);
+    std::printf(" ms\n");
+    g_ops.clear();
 }
 
 const C::WeightRef* need(const C::WeightTable& t, const std::string& n, std::string& err) {
@@ -95,7 +134,58 @@ bool load_types(const std::string& pack, std::vector<std::pair<int,int>>& type, 
     return true;
 }
 
-bool run_experts(CacheRuntime& rt, C::FileExpertSource& src, int layer, const Layer& l,
+// ---- assembling an expert row from the GGUF, ourselves.
+//
+// native_experts.txt gives, per layer, the file offsets of the three source tensors.  A row is
+// [gate 512x2560 | up 512x2560 | down 2560x512] and the three slices are NOT adjacent in the GGUF,
+// so a row has to be assembled.  FileExpertSource does that in gguf mode through its staging pool,
+// but that pool is sized from layer_blob_bytes_ which a pack with no experts.bin never fills:
+// stage_blob_ stays 0, the pool allocates zero-byte buffers, and copy_from_files writes 2.55 MB into
+// them.  It also runs on every blob() call, cache hit or miss, so a warm token copied ~765 MB per
+// token for rows already resident.  This assembler reads the three ranges straight from a read-only
+// mmap, only when a row is actually missing.
+struct RowGeom { size_t gate_off = 0, up_off = 0, down_off = 0, blob_bytes = 0; };
+std::vector<RowGeom> g_row;
+const uint8_t* g_gguf = nullptr;
+
+bool load_row_geom(const std::string& pack, const std::string& model, int n_layers, std::string& err) {
+    const int fd = ::open(model.c_str(), O_RDONLY);
+    if (fd < 0) { err = "open " + model; return false; }
+    struct stat st{};
+    if (fstat(fd, &st) != 0 || st.st_size <= 0) { err = "stat " + model; ::close(fd); return false; }
+    void* view = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
+    ::close(fd);
+    if (view == MAP_FAILED) { err = "mmap " + model; return false; }
+    g_gguf = (const uint8_t*) view;
+
+    std::FILE* f = std::fopen((pack + "/native_experts.txt").c_str(), "rb");
+    if (f == nullptr) { err = "cannot open native_experts.txt"; return false; }
+    g_row.assign((size_t) n_layers, RowGeom{});
+    char line[1024];
+    while (std::fgets(line, sizeof line, f)) {
+        if (line[0] == '#') continue;
+        long l = -1; int gt = 0, dt = 0;
+        unsigned long long off = 0, blob = 0, go = 0, uo = 0, dow = 0;
+        if (std::sscanf(line, "%ld %d %d %llu %llu %llu %llu %llu", &l, &gt, &dt, &off, &blob, &go, &uo, &dow) != 8) continue;
+        if (l < 0 || l >= n_layers) continue;
+        RowGeom& g = g_row[(size_t) l];
+        g.gate_off = (size_t) go; g.up_off = (size_t) uo; g.down_off = (size_t) dow; g.blob_bytes = (size_t) blob;
+    }
+    std::fclose(f);
+    for (int i = 0; i < n_layers; ++i)
+        if (g_row[(size_t) i].blob_bytes == 0) { err = "native_experts.txt: no row for layer " + std::to_string(i); return false; }
+    return true;
+}
+
+// Assemble row `e` of `layer` into `dst` (three slices out of the mmap).
+inline void assemble_row(int layer, int e, size_t gu, size_t down, uint8_t* dst) {
+    const RowGeom& g = g_row[(size_t) layer];
+    std::memcpy(dst, g_gguf + g.gate_off + (size_t) e * gu, gu);
+    std::memcpy(dst + gu, g_gguf + g.up_off + (size_t) e * gu, gu);
+    std::memcpy(dst + 2 * gu, g_gguf + g.down_off + (size_t) e * down, down);
+}
+
+bool run_experts(CacheRuntime& rt, int layer, const Layer& l,
                  const int32_t* ids, const float* weights, const float* x, float* out, std::string& err) {
     size_t gu=K::native_mmvq_weight_bytes(l.fmt.gu_type,N_EMBD,FF);
     size_t down=K::native_mmvq_weight_bytes(l.fmt.d_type,FF,N_EMBD);
@@ -103,27 +193,32 @@ bool run_experts(CacheRuntime& rt, C::FileExpertSource& src, int layer, const La
     if(bytes!=l.fmt.bytes){ err="expert native layout mismatch"; return false; }
     std::vector<const uint8_t*> rows(N_USED);
     std::vector<void*> temporary;
+    bool rows_ok=true;
+    op_run("expert_rows", [&]{
     for(int i=0;i<N_USED;++i) {
-        const uint8_t* blob=src.blob(layer,ids[i]);
-        if(!blob){ err="expert source miss"; return false; }
         C::ExpertRowKey key{layer,ids[i]};
-        auto state=rt.cache.lookup(key,bytes);
+        auto state=rt.cache.lookup(key,bytes);          // cache first: a hit needs no host bytes at all
         void* dev=nullptr;
         if(state==C::ExpertRowState::resident) dev=rt.cache.find(key)->dev;
         else {
-            if(!check(cudaMalloc(&dev,bytes),"expert allocation",err)) return false;
-            // Async on rt.stream: the mmvq kernels below run on the same stream, so ordering is the
-            // stream's job.  A blocking copy per row serialised 300 uploads per token against the GPU.
-            if(!check(cudaMemcpyAsync(dev,blob,bytes,cudaMemcpyHostToDevice,rt.stream),"expert upload",err)){ cudaFree(dev); return false; }
+            assemble_row(layer,ids[i],gu,down,rt.row_stage[i]);   // 3 memcpys from the mmap, hit-free path only
+            if(!check(cudaMalloc(&dev,bytes),"expert allocation",err)){ rows_ok=false; return; }
+            if(!check(cudaMemcpyAsync(dev,rt.row_stage[i],bytes,cudaMemcpyHostToDevice,rt.stream),"expert upload",err)){ cudaFree(dev); rows_ok=false; return; }
             if(state==C::ExpertRowState::needs_upload){ rt.cache.insert(key,{dev,bytes}); dev=rt.cache.find(key)->dev; }
             else temporary.push_back(dev);
         }
         rows[i]=(const uint8_t*)dev;
     }
+    });
+    if(!rows_ok)return false;
     bool ok=check(cudaMemcpyAsync(rt.x,x,N_EMBD*4,cudaMemcpyHostToDevice,rt.stream),"expert activation upload",err) &&
             check(cudaMemsetAsync(rt.accum,0,N_EMBD*4,rt.stream),"expert accumulator",err);
-    if(ok) {
-        K::native_quantize_q8_1(rt.x,rt.xq,N_EMBD,1,rt.stream);
+    // STRATA_KOLIBRI_SKIP_KERNELS=1 keeps the row lookups/uploads and the final sync but drops the
+    // mmvq chain, so the two runs differ only by the kernels' cost (wrong logits, timing only).
+    static const bool skip_kernels=std::getenv("STRATA_KOLIBRI_SKIP_KERNELS")!=nullptr;
+    if(ok && !skip_kernels) {
+        op_run("x_quant", [&]{ K::native_quantize_q8_1(rt.x,rt.xq,N_EMBD,1,rt.stream); });
+        op_run("x_mmvq", [&]{
         for(int i=0;i<N_USED;++i) {
             K::native_mmvq(l.fmt.gu_type,rows[i],rt.xq,rt.gate,N_EMBD,FF,1,rt.stream);
             K::native_mmvq(l.fmt.gu_type,rows[i]+up_off,rt.xq,rt.up,N_EMBD,FF,1,rt.stream);
@@ -131,8 +226,11 @@ bool run_experts(CacheRuntime& rt, C::FileExpertSource& src, int layer, const La
             K::native_mmvq(l.fmt.d_type,rows[i]+down_off,rt.hq,rt.out,FF,N_EMBD,1,rt.stream);
             K::scaled_add_inplace(rt.accum,rt.out,N_EMBD,weights[i],rt.stream);
         }
+        });
+        op_run("x_d2h", [&]{
         ok=check(cudaMemcpyAsync(out,rt.accum,N_EMBD*4,cudaMemcpyDeviceToHost,rt.stream),"expert result copy",err) &&
            check(cudaStreamSynchronize(rt.stream),"expert synchronize",err);
+        });
     }
     for(void* p:temporary) cudaFree(p);
     return ok;
@@ -159,8 +257,8 @@ int sample_logits(std::vector<float>& logits, const std::vector<int>& history, f
 }
 
 int main(int argc,char** argv){
-    std::string pack,model,gate_prefix,gate_tokens; int max_context=4096,gate_gen=0; bool serve=false;
-    for(int i=1;i<argc;++i){std::string a=argv[i]; if(a=="--serve")serve=true; else if(a=="--pack"&&i+1<argc)pack=argv[++i]; else if((a=="--native"||a=="--model")&&i+1<argc)model=argv[++i]; else if(a=="--max-context"&&i+1<argc)max_context=std::atoi(argv[++i]); else if(a=="--gate"&&i+2<argc){gate_prefix=argv[++i];gate_tokens=argv[++i];} else if(a=="--gen"&&i+1<argc)gate_gen=std::atoi(argv[++i]);}
+    std::string pack,model,gate_prefix,gate_tokens,prefill_tokens; int max_context=4096,gate_gen=0; bool serve=false;
+    for(int i=1;i<argc;++i){std::string a=argv[i]; if(a=="--serve")serve=true; else if(a=="--pack"&&i+1<argc)pack=argv[++i]; else if((a=="--native"||a=="--model")&&i+1<argc)model=argv[++i]; else if(a=="--max-context"&&i+1<argc)max_context=std::atoi(argv[++i]); else if(a=="--gate"&&i+2<argc){gate_prefix=argv[++i];gate_tokens=argv[++i];} else if(a=="--gen"&&i+1<argc)gate_gen=std::atoi(argv[++i]); else if(a=="--prefill"&&i+1<argc)prefill_tokens=argv[++i];}
     if(pack.empty()||model.empty()){std::fprintf(stderr,"usage: strata-kolibri --pack DIR --native MODEL [--serve] [--max-context N]\n       strata-kolibri --pack DIR --native MODEL --gate ORACLE-PREFIX t1,t2,... [--gen N]\n");return 2;}
     std::string err;
     strata::GgufModel gm=strata::GgufModel::open(model); strata::Kolibri1Geometry geo;
@@ -183,17 +281,21 @@ int main(int argc,char** argv){
     C::NativeEmbed embed; if(!embed.load(shards,N_EMBD,vocab,err)){std::fprintf(stderr,"embedding: %s\n",err.c_str());return 1;}
     C::NativeHead head; if(!head.load(shards,N_EMBD,vocab,err)){std::fprintf(stderr,"head: %s\n",err.c_str());return 1;}
     if(!KCPU::expert_layout_load(pack,n_layers,N_EXPERT,err,N_EMBD,FF)){std::fprintf(stderr,"expert layout: %s\n",err.c_str());return 1;}
+    if(!load_row_geom(pack,model,n_layers,err)){std::fprintf(stderr,"row geometry: %s\n",err.c_str());return 1;}
     C::FileExpertSource src; src.set_gguf(model); if(!src.open(pack,n_layers,N_EXPERT,err)){std::fprintf(stderr,"experts: %s\n",err.c_str());return 1;}
     std::vector<std::pair<int,int>> types(n_layers); if(!load_types(pack,types,err)){std::fprintf(stderr,"types: %s\n",err.c_str());return 1;}
 
     cudaStream_t stream{}; check(cudaStreamCreate(&stream),"stream",err);
     float *x{},*norm{},*q{},*k{},*v{},*att{},*proj{},*gate{},*up{},*shared{},*routed{},*logits_dev{};
-    int *pos_dev{}; int32_t *ids_dev{},*ids_host{}; float *weights_dev{},*weights_host{},*x_host{},*routed_host{};
+    int *pos_dev{}; int32_t *ids_dev{},*ids_host{}; float *weights_dev{},*weights_host{},*x_host{},*routed_host{},*raw_dev{};
     void *q8a{},*q8b{};
     auto alloc=[&](void**p,size_t n,const char*w){if(!check(cudaMalloc(p,n),w,err)){std::fprintf(stderr,"%s\n",err.c_str());std::exit(1);}};
-    alloc((void**)&x,N_EMBD*4,"x");alloc((void**)&norm,N_EMBD*4,"norm");alloc((void**)&q,N_HEAD*HD*4,"q");alloc((void**)&k,N_KV*HD*4,"k");alloc((void**)&v,N_KV*HD*4,"v");alloc((void**)&att,N_HEAD*HD*4,"attention");alloc((void**)&proj,N_EMBD*4,"projection");alloc((void**)&gate,FF*4,"shared gate");alloc((void**)&up,FF*4,"shared up");alloc((void**)&shared,N_EMBD*4,"shared out");alloc((void**)&routed,N_EMBD*4,"routed out");alloc((void**)&logits_dev,(size_t)vocab*4,"logits");alloc((void**)&pos_dev,4,"position");alloc((void**)&ids_dev,N_USED*4,"route ids");alloc((void**)&weights_dev,N_USED*4,"route weights");alloc(&q8a,K::native_q8_1_bytes(N_HEAD*HD),"q8 scratch a");alloc(&q8b,K::native_q8_1_bytes(N_EMBD),"q8 scratch b");
+    alloc((void**)&x,N_EMBD*4,"x");alloc((void**)&norm,N_EMBD*4,"norm");alloc((void**)&q,N_HEAD*HD*4,"q");alloc((void**)&k,N_KV*HD*4,"k");alloc((void**)&v,N_KV*HD*4,"v");alloc((void**)&att,N_HEAD*HD*4,"attention");alloc((void**)&proj,N_EMBD*4,"projection");alloc((void**)&gate,FF*4,"shared gate");alloc((void**)&up,FF*4,"shared up");alloc((void**)&shared,N_EMBD*4,"shared out");alloc((void**)&routed,N_EMBD*4,"routed out");alloc((void**)&logits_dev,(size_t)vocab*4,"logits");alloc((void**)&pos_dev,4,"position");alloc((void**)&ids_dev,N_USED*4,"route ids");alloc((void**)&weights_dev,N_USED*4,"route weights");alloc((void**)&raw_dev,N_EXPERT*4,"router logits");alloc(&q8a,K::native_q8_1_bytes(N_HEAD*HD),"q8 scratch a");alloc(&q8b,K::native_q8_1_bytes(N_EMBD),"q8 scratch b");
     cudaHostAlloc(&ids_host,N_USED*4,cudaHostAllocDefault);cudaHostAlloc(&weights_host,N_USED*4,cudaHostAllocDefault);cudaHostAlloc(&x_host,N_EMBD*4,cudaHostAllocDefault);cudaHostAlloc(&routed_host,N_EMBD*4,cudaHostAllocDefault);
 
+    const bool prof=std::getenv("STRATA_KOLIBRI_PROFILE")!=nullptr;
+    const bool no_graph=std::getenv("STRATA_KOLIBRI_NO_GRAPH")!=nullptr;
+    g_prof=prof;if(prof){cudaEventCreate(&g_ev0);cudaEventCreate(&g_ev1);}
     std::vector<Layer> layers(n_layers);
     for(int b=0;b<n_layers;++b){auto& l=layers[b];std::string p="blk."+std::to_string(b)+".";
         l.q=need(table,p+"attn_q.weight",err);l.k=need(table,p+"attn_k.weight",err);l.v=need(table,p+"attn_v.weight",err);l.o=need(table,p+"attn_output.weight",err);l.sg=need(table,p+"ffn_gate_shexp.weight",err);l.su=need(table,p+"ffn_up_shexp.weight",err);l.sd=need(table,p+"ffn_down_shexp.weight",err);
@@ -201,36 +303,106 @@ int main(int argc,char** argv){
         if(!err.empty()){std::fprintf(stderr,"bind: %s\n",err.c_str());return 1;}
         alloc((void**)&l.kc,(size_t)max_context*N_KV*HD*4,"K cache");alloc((void**)&l.vc,(size_t)max_context*N_KV*HD*4,"V cache");
         if(!KCPU::native_fmt(types[b].first,types[b].second,N_EMBD,FF,l.fmt,err)){std::fprintf(stderr,"expert fmt: %s\n",err.c_str());return 1;}
+        l.pre_fn=[&,b]()->bool{
+            const Layer& L=layers[b];
+            op_run("p_rms",[&]{ KC::rms_norm(x,L.an,norm,N_EMBD,geo.rms_eps,stream); });
+            op_run("p_q8",[&]{ K::native_quantize_q8_1(norm,q8b,N_EMBD,1,stream); });
+            bool okq=true;
+            op_run("p_qkv",[&]{ okq=mmvq(L.q,q8b,q,stream,err)&&mmvq(L.k,q8b,k,stream,err)&&mmvq(L.v,q8b,v,stream,err); });
+            if(!okq)return false;
+            op_run("p_qkn",[&]{ KC::qk_norm_rope_cache(q,k,v,L.qn,L.kn,L.kc,L.vc,pos_dev,geo.swa_pattern[b]!=0,geo.rope_freq_base,stream); });
+            op_run("p_attn",[&]{ KC::attention(q,L.kc,L.vc,att,pos_dev,geo.swa_pattern[b]!=0,(int)geo.swa_window,max_context,stream); });
+            op_run("p_o",[&]{ K::native_quantize_q8_1(att,q8a,N_HEAD*HD,1,stream);okq=mmvq(L.o,q8a,proj,stream,err); });
+            if(!okq)return false;
+            op_run("p_norms",[&]{ KC::rms_norm_residual(proj,L.pan,x,N_EMBD,geo.rms_eps,stream);KC::rms_norm(x,L.fn,norm,N_EMBD,geo.rms_eps,stream); });
+            op_run("p_route",[&]{ KC::route(norm,L.router,L.bias,ids_dev,weights_dev,raw_dev,stream); });
+            op_run("p_d2h",[&]{ cudaMemcpyAsync(ids_host,ids_dev,N_USED*4,cudaMemcpyDeviceToHost,stream);cudaMemcpyAsync(weights_host,weights_dev,N_USED*4,cudaMemcpyDeviceToHost,stream);cudaMemcpyAsync(x_host,norm,N_EMBD*4,cudaMemcpyDeviceToHost,stream); });
+            return true;
+        };
+        l.post_fn=[&,b]()->bool{
+            const Layer& L=layers[b];
+            bool okq=true;
+            op_run("q_h2d",[&]{ cudaMemcpyAsync(routed,routed_host,N_EMBD*4,cudaMemcpyHostToDevice,stream);K::native_quantize_q8_1(norm,q8b,N_EMBD,1,stream); });
+            op_run("q_shexp",[&]{ okq=mmvq(L.sg,q8b,gate,stream,err)&&mmvq(L.su,q8b,up,stream,err); });
+            if(!okq)return false;
+            op_run("q_swiglu",[&]{ K::native_swiglu_quantize_q8_1(gate,up,q8a,FF,1,stream);okq=mmvq(L.sd,q8a,shared,stream,err); });
+            if(!okq)return false;
+            op_run("q_normres",[&]{ KC::add_norm_residual(routed,shared,L.pfn,x,N_EMBD,geo.rms_eps,stream); });
+            return true;
+        };
         auto capture=[&](bool post,cudaGraphExec_t* exec)->bool{
+            g_capturing=true;
             cudaStreamBeginCapture(stream,cudaStreamCaptureModeThreadLocal);
-            if(!post){
-                KC::rms_norm(x,l.an,norm,N_EMBD,geo.rms_eps,stream);K::native_quantize_q8_1(norm,q8b,N_EMBD,1,stream);
-                if(!mmvq(l.q,q8b,q,stream,err)||!mmvq(l.k,q8b,k,stream,err)||!mmvq(l.v,q8b,v,stream,err))return false;
-                KC::qk_norm_rope_cache(q,k,v,l.qn,l.kn,l.kc,l.vc,pos_dev,geo.swa_pattern[b]!=0,geo.rope_freq_base,stream);
-                KC::attention(q,l.kc,l.vc,att,pos_dev,geo.swa_pattern[b]!=0,(int)geo.swa_window,max_context,stream);
-                K::native_quantize_q8_1(att,q8a,N_HEAD*HD,1,stream);if(!mmvq(l.o,q8a,proj,stream,err))return false;
-                KC::rms_norm_residual(proj,l.pan,x,N_EMBD,geo.rms_eps,stream);KC::rms_norm(x,l.fn,norm,N_EMBD,geo.rms_eps,stream);
-                KC::route(norm,l.router,l.bias,ids_dev,weights_dev,stream);
-                cudaMemcpyAsync(ids_host,ids_dev,N_USED*4,cudaMemcpyDeviceToHost,stream);cudaMemcpyAsync(weights_host,weights_dev,N_USED*4,cudaMemcpyDeviceToHost,stream);cudaMemcpyAsync(x_host,norm,N_EMBD*4,cudaMemcpyDeviceToHost,stream);
-            }else{
-                cudaMemcpyAsync(routed,routed_host,N_EMBD*4,cudaMemcpyHostToDevice,stream);K::native_quantize_q8_1(norm,q8b,N_EMBD,1,stream);
-                if(!mmvq(l.sg,q8b,gate,stream,err)||!mmvq(l.su,q8b,up,stream,err))return false;
-                K::native_swiglu_quantize_q8_1(gate,up,q8a,FF,1,stream);if(!mmvq(l.sd,q8a,shared,stream,err))return false;
-                KC::add_norm_residual(routed,shared,l.pfn,x,N_EMBD,geo.rms_eps,stream);
-            }
+            const bool ok=post?l.post_fn():l.pre_fn();
+            g_capturing=false;
+            if(!ok)return false;
             cudaGraph_t g{};cudaError_t ce=cudaStreamEndCapture(stream,&g);if(ce!=cudaSuccess){err=cudaGetErrorString(ce);return false;}ce=cudaGraphInstantiate(exec,g,0);cudaGraphDestroy(g);return check(ce,"graph instantiate",err);
         };
-        if(!capture(false,&l.pre)||!capture(true,&l.post)){std::fprintf(stderr,"capture layer %d: %s\n",b,err.c_str());return 1;}
+        if(no_graph){ /* ops run directly per token; nothing to capture */ }
+        else if(!capture(false,&l.pre)||!capture(true,&l.post)){std::fprintf(stderr,"capture layer %d: %s\n",b,err.c_str());return 1;}
     }
     const C::WeightRef* outnorm=need(table,"output_norm.weight",err); if(!outnorm){std::fprintf(stderr,"%s\n",err.c_str());return 1;}
     double cache_gb=8.0;if(const char* e=std::getenv("STRATA_KOLIBRI_EXPERT_CACHE_GB"))cache_gb=std::atof(e);CacheRuntime cache((size_t)(cache_gb*1073741824.0));
     std::vector<float> logits(vocab); int pos=0;
+    // Per-phase attribution (STRATA_KOLIBRI_PROFILE=1): which phase actually owns the per-token time.
+    // `pre` includes waiting on the PREVIOUS layer's post graph, because the sync that ends a layer
+    // is what the next one blocks on; the totals are what matter.
+    double ms_pre=0,ms_ex=0,ms_post=0,ms_head=0;int prof_tokens=0;
     auto run_token=[&](int token)->bool{
         if(token<0||token>=vocab||pos>=max_context)return false;cudaMemcpyAsync(pos_dev,&pos,4,cudaMemcpyHostToDevice,stream);embed.gather_one(token,x,stream);
-        for(int b=0;b<n_layers;++b){if(!check(cudaGraphLaunch(layers[b].pre,stream),"pre graph",err)||!check(cudaStreamSynchronize(stream),"pre sync",err))return false;if(!run_experts(cache,src,b,layers[b],ids_host,weights_host,x_host,routed_host,err))return false;if(!check(cudaGraphLaunch(layers[b].post,stream),"post graph",err))return false;}
-        KC::rms_norm(x,(const float*)outnorm->data,norm,N_EMBD,geo.rms_eps,stream);if(!head.run(norm,logits_dev,stream,err))return false;cudaMemcpyAsync(logits.data(),logits_dev,(size_t)vocab*4,cudaMemcpyDeviceToHost,stream);if(!check(cudaStreamSynchronize(stream),"token sync",err))return false;++pos;return true;
+        for(int b=0;b<n_layers;++b){
+            const auto t0=std::chrono::steady_clock::now();
+            if(no_graph){
+                if(!layers[b].pre_fn())return false;
+                if(!check(cudaStreamSynchronize(stream),"pre sync",err))return false;
+            } else if(!check(cudaGraphLaunch(layers[b].pre,stream),"pre graph",err)||!check(cudaStreamSynchronize(stream),"pre sync",err))return false;
+            const auto t1=std::chrono::steady_clock::now();
+            if(!run_experts(cache,b,layers[b],ids_host,weights_host,x_host,routed_host,err))return false;
+            const auto t2=std::chrono::steady_clock::now();
+            if(no_graph){ if(!layers[b].post_fn())return false; }
+            else if(!check(cudaGraphLaunch(layers[b].post,stream),"post graph",err))return false;
+            const auto t3=std::chrono::steady_clock::now();
+            if(prof){ms_pre+=std::chrono::duration<double,std::milli>(t1-t0).count();ms_ex+=std::chrono::duration<double,std::milli>(t2-t1).count();ms_post+=std::chrono::duration<double,std::milli>(t3-t2).count();}
+        }
+        const auto h0=std::chrono::steady_clock::now();
+        KC::rms_norm(x,(const float*)outnorm->data,norm,N_EMBD,geo.rms_eps,stream);if(!head.run(norm,logits_dev,stream,err))return false;cudaMemcpyAsync(logits.data(),logits_dev,(size_t)vocab*4,cudaMemcpyDeviceToHost,stream);if(!check(cudaStreamSynchronize(stream),"token sync",err))return false;++pos;
+        if(prof){ms_head+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-h0).count();++prof_tokens;}
+        return true;
     };
     std::printf("INFO architecture=kolibri1 execution=cuda_graph expert_cache=gpu_lru cache_gb=%.2f vocab=%d layers=%d\n",cache_gb,vocab,n_layers);std::printf("READY %d\n",max_context);std::fflush(stdout);
+
+    // ---- --prefill: warm the row cache with a long prompt, no oracle comparison needed.  This is
+    // the apples-to-apples setup against a llama-benchy/llama.cpp tg run, which always measures
+    // decode AFTER a long pp: with the working set resident, decode reads nothing from the SSD.
+    if(!prefill_tokens.empty()){
+        std::vector<int> ids;{std::stringstream csv(prefill_tokens);std::string w;while(std::getline(csv,w,','))if(!w.empty())ids.push_back(std::stoi(w));}
+        const auto w0=std::chrono::steady_clock::now();int ran=0;
+        for(int t:ids){ if(t<0||t>=vocab||pos>=max_context){std::printf("FAIL prefill token %d out of range\n",t);return 1;} if(!run_token(t)){std::printf("FAIL prefill: %s\n",err.c_str());return 1;} ++ran; }
+        const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-w0).count();
+        std::printf("  warm prefill: %d tokens in %.1f s (%.2f tok/s)\n",ran,ms/1000.0,ran/(ms/1000.0));
+        // Report the prefill's own attribution, then zero the counters so the decode print below is
+        // decode-only.  Averaging the two phases together is what made an earlier read wrong.
+        if(prof&&prof_tokens>0){
+            std::printf("  profile/prefill token: pre+sync %.1f ms, experts %.1f ms, post %.1f ms, head %.1f ms\n",
+                        ms_pre/prof_tokens,ms_ex/prof_tokens,ms_post/prof_tokens,ms_head/prof_tokens);
+            op_report("prefill",prof_tokens);
+            ms_pre=ms_ex=ms_post=ms_head=0;prof_tokens=0;
+        }
+    }
+    if(gate_prefix.empty()&&gate_gen>0){
+        const auto g0=std::chrono::steady_clock::now();int made=0;
+        for(int g=0;g<gate_gen;++g){
+            const int nx=(int)(std::max_element(logits.begin(),logits.end())-logits.begin());
+            if(nx==eos||pos>=max_context)break;
+            if(!run_token(nx)){std::printf("FAIL generation: %s\n",err.c_str());return 1;}
+            ++made;
+        }
+        const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-g0).count();
+        if(made>0)std::printf("  greedy decode: %d tokens in %.0f ms (%.2f tok/s, %.0f ms/token)\n",made,ms,made/(ms/1000.0),ms/made);
+        if(prof&&prof_tokens>0){std::printf("  profile/token: pre+sync %.1f ms, experts %.1f ms, post launch %.1f ms, head %.1f ms (sum %.1f) over %d tokens\n",ms_pre/prof_tokens,ms_ex/prof_tokens,ms_post/prof_tokens,ms_head/prof_tokens,(ms_pre+ms_ex+ms_post+ms_head)/prof_tokens,prof_tokens);op_report("decode",prof_tokens);}
+        std::printf("  cache: %s\n",cache.cache.report().c_str());std::fflush(stdout);
+        if(gate_prefix.empty())return 0;
+    }
 
     // ---- the gate: one prefill through THIS code path, every position compared with the patched
     // llama.cpp oracle's per-position dumps (<prefix><t>, 128000 f32 each, in the oracle's vocab).

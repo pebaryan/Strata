@@ -88,22 +88,43 @@ __global__ void attn_k(const float* q, const float* kc, const float* vc, float* 
     out[h*D+i] = a / denom;
 }
 
-__global__ void route_k(const float* x, const __nv_bfloat16* router, const float* bias, int32_t* ids, float* weights) {
-    __shared__ float raw[X], ranked[X];
-    const int e = threadIdx.x;
-    float v = 0.f;
-    for (int i = 0; i < E; ++i) v += __bfloat162float(router[(size_t)e * E + i]) * x[i];
-    raw[e] = v; ranked[e] = v + bias[e];
+// The router was ONE block of X threads: each thread reduced a whole 2560-element bf16 row serially
+// and thread 0 ran the top-k as a serial scan, 0.86 ms per layer and 68% of a decode token.  Now the
+// dot products are one block per expert (384 blocks, a real GEMV) and the top-k is a parallel
+// reduction.  The selection rule is unchanged and is a total order - ranked descending, lower expert
+// index on a tie - so a tree reduction gives the same ids as the serial scan did.
+__device__ __forceinline__ void better(float v, int i, float& bv, int& bi) {
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+}
+
+__global__ void route_dots_k(const float* x, const __nv_bfloat16* router, const float* bias, float* raw) {
+    const int e = blockIdx.x;
+    float s = 0.f;
+    for (int i = threadIdx.x; i < E; i += blockDim.x) s += __bfloat162float(router[(size_t)e * E + i]) * x[i];
+    __shared__ float red[128];
+    red[threadIdx.x] = s;
     __syncthreads();
-    if (e == 0) {
-        for (int j = 0; j < K; ++j) {
-            int best = -1;
-            for (int i = 0; i < X; ++i)
-                if (best < 0 || ranked[i] > ranked[best] || (ranked[i] == ranked[best] && i < best)) best = i;
-            ids[j] = best;
-            weights[j] = 1.f / (1.f + expf(-raw[best]));
-            ranked[best] = -1.0e30f;
+    for (int d = blockDim.x >> 1; d; d >>= 1) { if (threadIdx.x < d) red[threadIdx.x] += red[threadIdx.x + d]; __syncthreads(); }
+    if (threadIdx.x == 0) raw[e] = red[0];
+}
+
+__global__ void route_topk_k(const float* raw, const float* bias, int32_t* ids, float* weights) {
+    __shared__ float sv[512];
+    __shared__ int si[512];
+    const int e = threadIdx.x;
+    float r = raw[e] + bias[e];
+    for (int j = 0; j < K; ++j) {
+        sv[e] = r; si[e] = e;
+        __syncthreads();
+        for (int d = 256; d; d >>= 1) {
+            if (e < d && e + d < X) better(sv[e + d], si[e + d], sv[e], si[e]);
+            __syncthreads();
         }
+        if (e == 0) { ids[j] = si[0]; weights[j] = 1.f / (1.f + expf(-raw[si[0]])); }
+        __syncthreads();
+        const int w = si[0];
+        if (e == w) r = -1.0e30f;      // the winner sits out the next round
+        __syncthreads();
     }
 }
 
@@ -124,7 +145,10 @@ void rms_norm(const float* x, const float* w, float* y, int n, float eps, void* 
 void rms_norm_residual(const float* x, const float* w, float* r, int n, float eps, void* s) { norm_res_k<<<1,256,0,(cudaStream_t)s>>>(x,w,r,n,eps); }
 void qk_norm_rope_cache(float* q,float* k,const float* v,const float* qw,const float* kw,float* kc,float* vc,const int* p,bool rope,float theta,void* s) { qkn_k<<<H+HK,D,0,(cudaStream_t)s>>>(q,k,v,qw,kw,kc,vc,p,rope,theta); }
 void attention(const float* q,const float* kc,const float* vc,float* out,const int* p,bool sliding,int window,int max_context,void* s) { attn_k<<<H,D,(size_t)(max_context + D)*sizeof(float),(cudaStream_t)s>>>(q,kc,vc,out,p,sliding,window,max_context); }
-void route(const float* x,const void* router,const float* bias,int32_t* ids,float* weights,void* s) { route_k<<<1,X,0,(cudaStream_t)s>>>(x,(const __nv_bfloat16*)router,bias,ids,weights); }
+void route(const float* x,const void* router,const float* bias,int32_t* ids,float* weights,float* raw,void* s) {
+    route_dots_k<<<X,128,0,(cudaStream_t)s>>>(x,(const __nv_bfloat16*)router,bias,raw);
+    route_topk_k<<<1,X,0,(cudaStream_t)s>>>(raw,bias,ids,weights);
+}
 void add_norm_residual(const float* routed,const float* shared,const float* w,float* residual,int n,float eps,void* s) { add_norm_res_k<<<1,256,0,(cudaStream_t)s>>>(routed,shared,w,residual,n,eps); }
 
 } // namespace strata::kernels::kolibri_cuda

@@ -239,15 +239,30 @@ The CUDA path is CLOSER to the oracle than the CPU reference path (cos 0.9996-1.
 1.24, against the CPU gate's cos 0.9922 / err 4.9): it runs llama.cpp's native integer quant dots
 and the BF16 router rather than f32 dequant-gemv.
 
-### Throughput, and what it is not
+### Throughput, measured, and what it is not
 
-The 0.86 tok/s above is a cold-cache decode rate and it is NOT the number to quote: the wrapper's
-HTTP path measured 3.7-3.8 tok/s on a 219-token prompt in the same configuration, because a long
-prefill fills the row cache before decoding starts.  Both are far from "Qwen-like" for a 3.46B-active
-model on a V100, and the reason is measurable, not mysterious: at 8 GB the cache holds 3,600 of the
-pack's 19,200 expert rows against 45.7 GB of blobs, so a token whose 300 selections miss ~80 times
-moves ~200 MB of expert data.  A controlled tok/s benchmark (warm prefill, no competing server,
-several cache budgets) is the next measurement, not a claim.
+Four regimes for the same binary, same file, V100, `--prefill` + `--gen` on the greedy path:
+
+| regime | decode | disk per token |
+|---|---|---|
+| 24 GB cache, cold | 2.91 tok/s (343 ms) | ~179 MB |
+| 24 GB cache, warm (>=91% hits) | 8.0 tok/s (125 ms) | ~0 |
+| warm, expert mmvq chain skipped | 7.9 tok/s (127 ms) | ~0 |
+| llama.cpp `-ngl 99 -ncmoe 18`, same file | 46.6 tok/s | 0.0 MB measured |
+
+`STRATA_KOLIBRI_PROFILE=1` per token, warm: pre+sync 49.8 ms, expert phase 71 ms, post launch 0.6 ms,
+head 0.5 ms. `STRATA_KOLIBRI_SKIP_KERNELS=1` removes the expert mmvq chain and changes the total from 125
+to 127 ms, so the kernels and the dequant are not the bottleneck: the PER-LAYER HOST ROUND TRIP is. The
+loop launches a pre graph, synchronizes, sends the routing to the host, resolves six rows on the host,
+then launches the post graph, twice per layer, 100 GPU pipeline drains per token at 50 layers.
+
+Residency is the second, independent axis. llama.cpp's `-ncmoe 18` keeps 32 layers' experts in VRAM and
+18 layers' experts in host RAM while computing those on the CPU, and a request reads 0.0 MB from the
+block device. This path's LRU over all 50 layers with a 24 GB budget streams ~179 MB per token instead,
+and the blobs live on a 0.5 GB/s SATA SSD (`sdc`, SanDisk SSD PLUS), which alone is a 343 ms/token floor.
+
+Fix order: (1) resolve expert rows on device so a token is a few graph launches rather than 100 drains,
+(2) pin whole layers in VRAM plus a host-RAM tier for the rest, (3) kernels last.
 
 Also fixed in this pass: `attn_k` computed every score and the whole softmax in ONE thread per head
 (~65k serial FMAs per head for a 513-key window); scores and both reductions now run across the
