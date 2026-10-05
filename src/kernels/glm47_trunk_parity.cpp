@@ -283,13 +283,16 @@ int main(int argc, char** argv) {
     std::vector<int> one_index((size_t) L, 0);
     int teeth_ids = 0, teeth_tot = 0;
     const double teeth_h = run(one_cache, one_index.data(), false, true, teeth_ids, teeth_tot);
-    const bool has_teeth = teeth_h > 1e-2;
 
     bool ok = true;
     int ids_exact = 0, ids_total = 0;
     std::vector<std::vector<float>> caches((size_t) L);
     const double worst_h = run(caches, nullptr, true, false, ids_exact, ids_total);
     ok = ok && (ids_total > 0) && (ids_exact == ids_total);
+    // teeth = the bug moves the hidden state FAR ABOVE the parity noise.  Not an absolute threshold: the
+    // artifact's own weights put a small share of the signal in attention (the residuals dominate), so at
+    // only a couple of tokens the cache bug perturbs the hidden by ~1e-3 - still ~1e5 x the ~1e-8 noise.
+    const bool has_teeth = teeth_h > 100.0 * std::max(worst_h, 1e-7);
 
     // The head: (hc_streams == 1, so no mean) an rms_norm through output_norm, then the projection and
     // argmax.  The norm is the engine's rms_norm_gain; the projection stays inline so its vector is checked.

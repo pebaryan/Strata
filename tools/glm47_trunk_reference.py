@@ -76,6 +76,27 @@ def make_layers(rng, n_layer):
     return layers
 
 
+def make_layers_real(gguf, n_layer):
+    """The artifact's own block weights (dequantized), for the loop-with-real-weights check."""
+    gg = pathlib.Path(gguf)
+    rd = BR.gguf_tensor_reader(gg)
+    layers = []
+    for l in range(n_layer):
+        mla = MLA.load_real_weights(gg, l)
+        attn_norm = rd(f"blk.{l}.attn_norm.weight")
+        ffn_norm = rd(f"blk.{l}.ffn_norm.weight")
+        if l == 0:
+            wg = rd("blk.0.ffn_gate.weight")
+            wu = rd("blk.0.ffn_up.weight")
+            wd = rd("blk.0.ffn_down.weight")
+            layers.append({"kind": "dense", "mla": mla, "attn_norm": attn_norm, "ffn_norm": ffn_norm,
+                           "wg": wg, "wu": wu, "wd": wd, "dff": int(wg.shape[0]), "kept": {}})
+        else:
+            layers.append({"kind": "moe", "mla": mla, "attn_norm": attn_norm, "ffn_norm": ffn_norm,
+                           "moe": MOE.GGUFModel(gg, l), "kept": {}})
+    return layers, rd
+
+
 def trunk_forward(layers, xs, pos_list, output_norm, W):
     """Run the loop.  xs[t] is token t's hidden state; pos_list[t] its position.  Returns the per-token
     per-layer hidden states, the final head pieces, and the per-layer caches (for the gate to re-derive)."""
@@ -161,6 +182,7 @@ def write_fixture(path, layers, xs, pos_list, output_norm, W, hiddens, hn, logit
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw-fixture")
+    ap.add_argument("--gguf")
     ap.add_argument("--layers", type=int, default=2)
     ap.add_argument("--tokens", type=int, default=2)
     ap.add_argument("--vocab", type=int, default=512)
@@ -169,15 +191,22 @@ def main() -> int:
     a = ap.parse_args()
 
     rng = np.random.default_rng(a.seed)
-    layers = make_layers(rng, a.layers)
+    if a.gguf:
+        layers, rd = make_layers_real(a.gguf, a.layers)
+        output_norm = rd("output_norm.weight")
+        W = rd("output.weight")
+        src = f"REAL weights (layers 0..{a.layers-1} of {a.gguf}), vocab {W.shape[0]}"
+    else:
+        layers = make_layers(rng, a.layers)
+        output_norm = (1.0 + 0.1 * rng.standard_normal(N_EMBD)).astype(np.float32)
+        W = (rng.standard_normal((a.vocab, N_EMBD)) / np.sqrt(N_EMBD)).astype(np.float32)
+        src = f"seeded random weights, vocab {a.vocab} (seed {a.seed})"
     xs = [rng.standard_normal(N_EMBD).astype(np.float32) for _ in range(a.tokens)]
     pos_list = list(range(a.tokens))
-    output_norm = (1.0 + 0.1 * rng.standard_normal(N_EMBD)).astype(np.float32)
-    W = (rng.standard_normal((a.vocab, N_EMBD)) / np.sqrt(N_EMBD)).astype(np.float32)
 
     hiddens, hn, logits, argmax, _, sel = trunk_forward(layers, xs, pos_list, output_norm, W)
 
-    print(f"glm47 trunk reference: {a.layers} layers (0 dense, rest MoE), {a.tokens} tokens, vocab {a.vocab} (seed {a.seed})")
+    print(f"glm47 trunk reference: {a.layers} layers (0 dense, rest MoE), {a.tokens} tokens - {src}")
     print(f"  loop = per layer: attn_norm -> MLA(cache_l) -> +x -> ffn_norm -> {'dense' if a.layers == 1 else 'MoE'} -> +x ; then head")
     if a.selftest:
         for l, ly in enumerate(layers):
