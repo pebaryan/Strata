@@ -62,6 +62,7 @@ double glm47_project_ms();
 double glm47_ffn_ms();
 void glm47_install_device_experts(size_t budget_bytes);
 void glm47_device_expert_stats(uint64_t* hits, uint64_t* misses, uint64_t* evicted, size_t* bytes);
+size_t glm47_device_free_vram();
 }  // namespace strata::kernels::glm
 
 namespace {
@@ -224,7 +225,7 @@ int main(int argc, char** argv) {
     int n_layer = N_LAYER, verbosity = 1, gen = 1;
     bool bind_only = false, use_device = true, warm = false, dev_experts = true, serve = false;
     int selftest_attn = 0, serve_ctx = 4096;
-    size_t exp_budget = 6ull << 30;   // device bytes for resident expert rows (sized to the free VRAM)
+    size_t exp_budget = 0;            // device bytes for resident expert rows; 0 = size to the free VRAM (GPU-first)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--gguf") && i + 1 < argc) gguf = argv[++i];
         else if (!std::strcmp(argv[i], "--pack") && i + 1 < argc) pack = argv[++i];
@@ -381,7 +382,18 @@ int main(int argc, char** argv) {
     if (use_device && n_dev_shexp > 0) cglm::glm_set_native_ffn(glm::glm47_native_ffn);
     // install the routed-expert device path (native_mmvq over resident rows - the engine's own expert guard
     // only admits the IQ types, which this model's k-quant experts are not)
-    if (use_device && dev_experts) glm::glm47_install_device_experts(exp_budget);
+    if (use_device && dev_experts) {
+        // GPU-first: with no explicit byte budget, take the whole card (less a headroom for scratch), and let the
+        // host row cache (RAM) and the pack (disk) carry whatever does not fit - the GPU -> RAM -> disk order.
+        size_t budget = exp_budget;
+        if (budget == 0) {
+            const size_t freeb = glm::glm47_device_free_vram();
+            budget = freeb > (512ull << 20) ? freeb - (512ull << 20) : freeb;
+            if (verbosity) std::printf("  expert cache budget: %.2f GiB (auto; %.2f GiB free on the device)\n",
+                                       (double) budget / 1073741824.0, (double) freeb / 1073741824.0);
+        }
+        glm::glm47_install_device_experts(budget);
+    }
 
     // the engine's per-layer views
     std::vector<cglm::Glm47TrunkLayer> arr((size_t) n_layer);

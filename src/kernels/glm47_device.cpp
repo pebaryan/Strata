@@ -282,6 +282,14 @@ void glm47_device_expert_stats(uint64_t* hits, uint64_t* misses, uint64_t* evict
     if (bytes) *bytes = c.bytes;
 }
 
+// Free VRAM on the current device, so a caller can size its expert cache to the whole card (the GPU-first
+// tier of a GPU -> RAM -> disk layout).  0 when the query fails.
+size_t glm47_device_free_vram() {
+    size_t free_b = 0, total_b = 0;
+    if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return 0;
+    return free_b;
+}
+
 // A one-shot quantized GEMV for the sites that are not MLA projections (the head, the dense stem, the
 // shared expert).  `w_dev` is the artifact's quantized block on the device; x and y are host.  Returns
 // false if the type has no native kernel, leaving the caller's float path in charge.
