@@ -219,7 +219,23 @@ bool run_experts(CacheRuntime& rt, int layer, const Layer& l,
         if(state==C::ExpertRowState::resident) dev=rt.cache.find(key)->dev;
         else {
             if(!read_row(layer,ids[i],gu,down,rt.row_stage[i],err)){ rows_ok=false; return; }   // miss only
-            if(!check(cudaMalloc(&dev,bytes),"expert allocation",err)){ rows_ok=false; return; }
+            // Reclaim before failing: a miss that cannot be allocated used to end the request AND the
+            // engine ("expert allocation: out of memory" mid-prefill) once the LRU budget outgrew the
+            // VRAM left after the pinned layers, the KV cache and the trunk.  Evict first, and only
+            // report failure if the device is genuinely full.
+            if(cudaMalloc(&dev,bytes)!=cudaSuccess){
+                cudaGetLastError();
+                // Give the cache's device memory back to this row: a miss that could not be allocated
+                // used to end the request AND the engine ("expert allocation: out of memory" during a
+                // prefill) as soon as the LRU outgrew the VRAM left after the pinned layers, the KV
+                // cache and the trunk.  trim_one() exists for exactly this caller.
+                size_t free_b=0,total_b=0;int trimmed=0;
+                const size_t want=bytes+(size_t)(256u<<20);
+                while(cudaMemGetInfo(&free_b,&total_b)==cudaSuccess&&free_b<want&&rt.cache.trim_one())++trimmed;
+                cudaMalloc(&dev,bytes);
+                if(dev==nullptr){ std::fprintf(stderr,"expert allocation: out of memory (%.0f MiB free after trimming %d cached rows)\n",(double)free_b/1048576.0,trimmed); err="expert allocation: out of memory"; rows_ok=false; return; }
+                if(trimmed>0)std::fprintf(stderr,"expert allocation: trimmed %d cached rows to make room\n",trimmed);
+            }
             if(!check(cudaMemcpyAsync(dev,rt.row_stage[i],bytes,cudaMemcpyHostToDevice,rt.stream),"expert upload",err)){ cudaFree(dev); rows_ok=false; return; }
             if(state==C::ExpertRowState::needs_upload){ rt.cache.insert(key,{dev,bytes}); dev=rt.cache.find(key)->dev; }
             else temporary.push_back(dev);
@@ -362,7 +378,23 @@ int main(int argc,char** argv){
     double cache_gb=8.0;if(const char* e=std::getenv("STRATA_KOLIBRI_EXPERT_CACHE_GB"))cache_gb=std::atof(e);
     if(pin_layers>(int)n_layers)pin_layers=(int)n_layers;
     size_t pinned_bytes=0;for(int b=0;b<pin_layers;++b)pinned_bytes+=g_row[(size_t)b].blob_bytes*(size_t)N_EXPERT;
-    const size_t total_bytes=(size_t)(cache_gb*1073741824.0);
+    size_t total_bytes=(size_t)(cache_gb*1073741824.0);
+    // The budget must fit the DEVICE, not just the expert cache: the KV cache (1.7 GB at a 4096
+    // context), the trunk, the head and allocator slack live in the same VRAM.  Without this, a
+    // 30 GB cache plus 24 pinned layers looked fine on paper and died mid-generation with
+    // "expert allocation: out of memory" once the LRU grew into its budget.
+    {
+        size_t free_b=0,total_vram=0;
+        if(cudaMemGetInfo(&free_b,&total_vram)==cudaSuccess){
+            const size_t reserve=(size_t)2*1073741824;
+            if(total_bytes+reserve>free_b){
+                const size_t capped=(free_b>reserve)?free_b-reserve:free_b/2;
+                std::printf("  budget %.1f GB needs %.1f GB free plus %.1f GB reserve; capping to %.1f GB\n",
+                            (double)total_bytes/1073741824.0,(double)free_b/1073741824.0,(double)reserve/1073741824.0,(double)capped/1073741824.0);
+                total_bytes=capped;
+            }
+        }
+    }
     if(pinned_bytes>=total_bytes){std::fprintf(stderr,"pin-layers %d needs %.1f GB, budget is %.1f GB\n",pin_layers,(double)pinned_bytes/1073741824.0,cache_gb);return 1;}
     CacheRuntime cache(total_bytes-pinned_bytes);
     cache.pinned.assign(n_layers,nullptr);cache.pinned_stride.assign(n_layers,0);
