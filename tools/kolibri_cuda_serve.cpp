@@ -397,7 +397,12 @@ int main(int argc,char** argv){
     {
         size_t free_b=0,total_vram=0;
         if(cudaMemGetInfo(&free_b,&total_vram)==cudaSuccess){
-            const size_t reserve=(size_t)2*1073741824;
+            // 5 GiB, not 2: the cache fills to its budget, and if that budget reaches the device
+            // limit every miss has to evict before it can allocate.  Measured: with 3 MiB free a
+            // 67-token request took 176.9 s with 58 MB of disk traffic, i.e. the cost was the
+            // allocation churn, not I/O or compute.  The fixed part (trunk, embedding, head, KV,
+            // graphs, allocator slack) is larger than it looks.
+            const size_t reserve=(size_t)5*1073741824;
             if(total_bytes+reserve>free_b){
                 const size_t capped=(free_b>reserve)?free_b-reserve:free_b/2;
                 std::printf("  budget %.1f GB needs %.1f GB free plus %.1f GB reserve; capping to %.1f GB\n",
