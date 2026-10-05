@@ -12,6 +12,9 @@
 #include <vector>
 
 namespace strata::kernels::glm {
+// The MLA's parallel_for hook, declared before the anonymous namespace so mla_forward_rope (inside it) can
+// see it.  The worker pool the runner installs fans the independent head loop out across threads.
+MlaParallelFor g_parallel_for = nullptr;
 namespace {
 
 MlaNativeProjectFn g_native_project = nullptr;
@@ -173,7 +176,10 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
     const double ts0 = mnow_ms();
     const float kq_scale = 1.0f / std::sqrt((float) head_dim);
     std::vector<float> attn((size_t) n_head * kv_lora, 0.0f);
-    std::vector<float> scores((size_t) (n_cache > 0 ? n_cache : 1), 0.0f);
+    // Per-head score staging: the loop below is over heads and the heads are independent, so this is where a
+    // parallel_for goes.  Each head's scores/softmax/PV stays a serial pass, so the result is bit-for-bit the
+    // serial loop's - unlike the device kernel's tree reduction, which reorders the sum.
+    std::vector<float> scores((size_t) n_head * (size_t) (n_cache > 0 ? n_cache : 1), 0.0f);
     // On the device when it is worth a launch: the same gate the nope path uses, so a short cache stays on
     // the host loop where the work is smaller than the copy.  Falls back to the host loop on any decline.
     bool scores_done = false;
@@ -183,7 +189,9 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
                                               kq_scale, attn.data(), cuda_err, sizeof(cuda_err));
         if (!scores_done) std::fprintf(stderr, "GLM MLA rope attention unavailable: %s; using host\n", cuda_err);
     }
-    for (int h = 0; !scores_done && h < n_head; ++h) {
+    const size_t scol = (size_t) (n_cache > 0 ? n_cache : 1);
+    auto head_job = [&](int h) {
+        float* sc = scores.data() + (size_t) h * scol;
         const float* Qh = qcur.data() + (size_t) h * kv_lora;
         const float* pe = q_pe.data() + (size_t) h * n_rot;
         float best = -INFINITY;
@@ -193,20 +201,27 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
             float acc = 0.0f;
             for (int i = 0; i < kv_lora; ++i) acc += Qh[i] * kt[i];
             for (int i = 0; i < n_rot; ++i) acc += pe[i] * pt[i];
-            scores[(size_t) t] = acc * kq_scale;
-            if (scores[(size_t) t] > best) best = scores[(size_t) t];
+            sc[t] = acc * kq_scale;
+            if (sc[t] > best) best = sc[t];
         }
         double sum = 0.0;
         for (int t = 0; t < n_cache; ++t) {
-            scores[(size_t) t] = std::exp(scores[(size_t) t] - best);
-            sum += scores[(size_t) t];
+            sc[t] = std::exp(sc[t] - best);
+            sum += sc[t];
         }
         float* Ah = attn.data() + (size_t) h * kv_lora;
         for (int t = 0; t < n_cache; ++t) {
-            const float p = (float) (scores[(size_t) t] / sum);
+            const float p = (float) (sc[t] / sum);
             const float* kt = cache + (size_t) t * stride;
             for (int i = 0; i < kv_lora; ++i) Ah[i] += p * kt[i];
         }
+    };
+    if (scores_done) {
+        // the device kernel already filled attn
+    } else if (g_parallel_for != nullptr && n_head > 1) {
+        g_parallel_for(n_head, head_job);
+    } else {
+        for (int h = 0; h < n_head; ++h) head_job(h);
     }
     if (want.attn) std::copy(attn.begin(), attn.end(), want.attn);
     g_mla_scores_ms += mnow_ms() - ts0;
@@ -254,7 +269,6 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
 }  // namespace
 
 MlaNativeProjectBatchFn g_native_project_batch = nullptr;
-MlaParallelFor g_parallel_for = nullptr;
 bool g_device_block = false;
 
 void mla_set_device_block(bool enabled) { g_device_block = enabled; }

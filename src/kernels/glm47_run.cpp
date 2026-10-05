@@ -26,7 +26,9 @@
 #include <cuda_runtime.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
+#include <mutex>
 #include <thread>
 #include <unordered_map>
 
@@ -144,6 +146,64 @@ const uint8_t* blob_adapter(void* ctx, int layer, int expert) {
     c->rows.emplace(key, std::move(row));
     ++c->misses; c->bytes += nb;
     return p;
+}
+
+// A tiny persistent worker pool for the engine's parallel_for sites.  A per-call std::thread fan-out costs
+// more than the work at these sizes - measured the losing way with the router - so the workers stay alive and
+// only the loop body is handed over.  The MLA's head loop fans out here: each head is an independent serial
+// pass, so the result is bit-for-bit the serial loop's.
+class HeadPool {
+public:
+    static HeadPool& instance() { static HeadPool p; return p; }
+    void run(int n, const std::function<void(int)>& job) {
+        if (n <= 0) return;
+        if (n == 1) { job(0); return; }
+        std::unique_lock<std::mutex> lk(m_);
+        job_ = &job; n_ = n; next_ = 0; pending_ = workers_.size(); ++gen_;
+        cv_.notify_all();
+        done_.wait(lk, [this] { return pending_ == 0; });
+        job_ = nullptr;
+    }
+private:
+    HeadPool() {
+        unsigned hw = std::thread::hardware_concurrency();
+        size_t w = hw ? hw : 4;
+        if (w > 32) w = 32;
+        for (size_t i = 0; i < w; ++i) workers_.emplace_back([this] { worker(); });
+    }
+    ~HeadPool() {
+        { std::lock_guard<std::mutex> lk(m_); stop_ = true; ++gen_; }
+        cv_.notify_all();
+        for (auto& t : workers_) t.join();
+    }
+    void worker() {
+        uint64_t seen = 0;
+        for (;;) {
+            std::unique_lock<std::mutex> lk(m_);
+            cv_.wait(lk, [this, &seen] { return stop_ || gen_ != seen; });
+            if (stop_) return;
+            seen = gen_;
+            const std::function<void(int)>* j = job_;
+            const int n = n_;
+            lk.unlock();
+            for (;;) {
+                int i;
+                { std::lock_guard<std::mutex> g(m_); if (next_ >= n) break; i = next_++; }
+                (*j)(i);
+            }
+            { std::lock_guard<std::mutex> g(m_); if (--pending_ == 0) done_.notify_one(); }
+        }
+    }
+    std::vector<std::thread> workers_;
+    std::mutex m_; std::condition_variable cv_, done_;
+    const std::function<void(int)>* job_ = nullptr;
+    int n_ = 0, next_ = 0;
+    size_t pending_ = 0;
+    uint64_t gen_ = 0; bool stop_ = false;
+};
+
+static void glm_parallel_for_heads(int n, const std::function<void(int)>& job) {
+    HeadPool::instance().run(n, job);
 }
 
 bool load(strata::GgufFile& g, const char* name, std::vector<float>& out, const char* what) {
@@ -307,6 +367,9 @@ int main(int argc, char** argv) {
     // and the decoupled-RoPE attention's K-absorb / V-un-absorb head-matvecs on the device
     if (use_device && n_dev_proj > 0) glm::mla_set_rope_head_cuda(true);
     if (use_device) glm::mla_set_rope_attention_cuda(true);
+    // fan the MLA's head loop out across the worker pool (bit-exact: each head is an independent serial pass).
+    // STRATA_GLM_MLA_SERIAL=1 keeps the serial loop, for an A/B on a noisy machine.
+    if (std::getenv("STRATA_GLM_MLA_SERIAL") == nullptr) glm::mla_set_parallel_for(glm_parallel_for_heads);
     // install the native GLU: the shared expert runs on the device too
     if (use_device && n_dev_shexp > 0) cglm::glm_set_native_ffn(glm::glm47_native_ffn);
     // install the routed-expert device path (native_mmvq over resident rows - the engine's own expert guard
