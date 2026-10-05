@@ -243,8 +243,8 @@ endif()
 # directly (glm47_read.hpp), runs the 47-block trunk with the pack's quantized experts, and prints the
 # head's argmax - the phase-5 end-to-end unit (diffed against the oracle's first generated token).
 add_executable(glm47_run src/kernels/glm47_run.cpp src/core/glm47_trunk.cpp src/core/glm_moe_native.cpp
-               src/kernels/glm47_parallel_shim.cpp src/kernels/glm_mla.cpp src/kernels/glm_moe.cpp
-               src/kernels/glm_norm.cpp)
+                src/kernels/glm47_parallel_shim.cpp src/kernels/glm_mla.cpp src/kernels/glm_moe.cpp
+                src/kernels/glm_norm.cpp src/kernels/glm47_device.cpp)
 target_include_directories(glm47_run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm47_run PRIVATE -O2)
 if(STRATA_ENABLE_CUDA)

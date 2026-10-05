@@ -77,6 +77,10 @@ struct MlaIntermediates {
     float* q_nope = nullptr; ///< [n_head][head_dim - n_rot]  q split before absorption
     float* q_pe = nullptr;   ///< [n_head][n_rot]             q rope half, AFTER RoPE
     float* k_pe = nullptr;   ///< [n_rot]                     k_pe, AFTER RoPE
+    /// When set, mla_forward returns right after producing kv/k_pe - the caller only wants the new cache
+    /// row (e.g. to append it before a second, full call).  Skips the absorption, attention and wo, so a
+    /// "harvest the latent" pass costs a fraction of a full one.
+    bool kv_only = false;
 };
 
 /// The model's rms norm epsilon (glm5next.attention.layer_norm_rms_epsilon = 1e-5).

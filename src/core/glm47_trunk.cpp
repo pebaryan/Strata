@@ -1,5 +1,6 @@
 #include "strata/core/glm47_trunk.hpp"
 
+#include <chrono>
 #include <cstring>
 
 #include "strata/core/glm_moe_native.hpp"
@@ -13,7 +14,12 @@ namespace {
 // GLM-4.7-Flash has no swiglu_clamp key, so both expert and dense SiLU are unclamped.  A nonzero limit
 // here would be a silent behaviour change (invisible until a pre-activation exceeds it).
 constexpr float kClamp = 0.0f;
+// Cumulative stage timings (milliseconds), read back by glm47_trunk_mla_ms / glm47_trunk_ffn_ms.
+double g_t_mla = 0.0, g_t_ffn = 0.0;
 }  // namespace
+
+double glm47_trunk_mla_ms() { return g_t_mla; }
+double glm47_trunk_ffn_ms() { return g_t_ffn; }
 
 bool glm47_trunk_forward(const Glm47TrunkLayer* layers, int n_layer,
                          const kernels::glm::MlaGeometry& mla_g, const float* x, int pos, float eps,
@@ -43,6 +49,7 @@ bool glm47_trunk_forward(const Glm47TrunkLayer* layers, int n_layer,
             return false;
         }
         std::vector<float>& cache = (*caches)[cache_index ? cache_index[l] : l];
+        const auto t_attn0 = std::chrono::steady_clock::now();
 
         // site 1: attn_norm -> MLA -> residual.  The current token's kv / k_pe are computed once and
         // appended to this layer's cache, then attention runs over history + this token.
@@ -56,13 +63,18 @@ bool glm47_trunk_forward(const Glm47TrunkLayer* layers, int n_layer,
         want.qr = g_qr.data(); want.q_nope = g_qn.data(); want.q_pe = g_qp.data(); want.kv = g_kv.data();
         want.k_pe = g_kp.data(); want.qcur = g_qc.data(); want.attn = g_at.data(); want.v = g_v.data();
         std::vector<float> attn((size_t) ne);
+        // pass 1: harvest the new latent row only (kv_only - skips the absorption, attention and wo), append
+        // it, then pass 2 attends over history + this token.
+        want.kv_only = true;
         glm::mla_forward(*ly.mla, mla_g, xb.data(), pos + 1, cache.data(), attn.data(), want, pos);
+        want.kv_only = false;
         std::memcpy(cache.data() + (size_t) pos * kv_dim, g_kv.data(), (size_t) kv_lora * sizeof(float));
         std::memcpy(cache.data() + (size_t) pos * kv_dim + kv_lora, g_kp.data(), (size_t) n_rot * sizeof(float));
         glm::mla_forward(*ly.mla, mla_g, xb.data(), pos + 1, cache.data(), attn.data(), want, pos);
 
         std::vector<float> x2((size_t) ne);
         for (int i = 0; i < ne; ++i) x2[(size_t) i] = cur[(size_t) i] + attn[(size_t) i];
+        const auto t_ffn0 = std::chrono::steady_clock::now();
 
         // site 2: ffn_norm -> FFN -> residual
         std::vector<float> ffv((size_t) ne), ffnout((size_t) ne);
@@ -123,6 +135,8 @@ bool glm47_trunk_forward(const Glm47TrunkLayer* layers, int n_layer,
         }
 
         for (int i = 0; i < ne; ++i) cur[(size_t) i] = x2[(size_t) i] + ffnout[(size_t) i];
+        g_t_mla += std::chrono::duration<double, std::milli>(t_ffn0 - t_attn0).count();
+        g_t_ffn += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ffn0).count();
         if (per_layer_out) (*per_layer_out)[(size_t) l] = cur;
     }
     std::memcpy(out, cur.data(), (size_t) ne * sizeof(float));

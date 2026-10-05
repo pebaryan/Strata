@@ -127,6 +127,7 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
     rope_neox_inplace(k_pe.data(), n_rot, pos, w.rope_freq_base);
     if (want.kv) std::copy(kv.begin(), kv.end(), want.kv);
     if (want.k_pe) std::copy(k_pe.begin(), k_pe.end(), want.k_pe);
+    if (want.kv_only) return;   // the caller only wanted the new cache row
 
     // Qcur[h] = wk_b[h] (kv_lora x nope) @ q_nope[h]
     std::vector<float> qcur((size_t) n_head * kv_lora, 0.0f);

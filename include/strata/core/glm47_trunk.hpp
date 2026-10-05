@@ -74,4 +74,9 @@ bool glm47_trunk_forward(const Glm47TrunkLayer* layers, int n_layer,
                          std::vector<std::vector<int32_t>>* ids_out,
                          std::vector<std::vector<float>>* per_layer_out, std::string& err);
 
+/// Diagnostics: cumulative milliseconds spent in the MLA (attention) vs the FFN (MoE/dense) stages, summed
+/// over every glm47_trunk_forward call.  A runner prints them to localise the per-token cost.
+double glm47_trunk_mla_ms();
+double glm47_trunk_ffn_ms();
+
 }  // namespace strata::core::glm
