@@ -102,6 +102,8 @@ struct Block {
     // dense (block 0)
     std::vector<float> wg, wu, wd;
     glm::MoeGeometry dg;
+    DevBlocks dw_wg, dw_wu, dw_wd;                // the dense stem as device blocks
+    int dtypes[3] = {0, 0, 0};
     // moe
     glm::MoeGeometry gg;
     std::vector<float> router, probs_b, s_gate, s_up, s_down;
@@ -236,9 +238,18 @@ int main(int argc, char** argv) {
         else b.mla.wo = b.mw[7].data();
         n_dev_proj += (int) d0 + (int) d2 + (int) d4 + (int) d7;
         if (b.kind == 0) {
-            if (!load(g, (p + "ffn_gate.weight").c_str(), b.wg, "dense gate")) return 1;
-            if (!load(g, (p + "ffn_up.weight").c_str(), b.wu, "dense up")) return 1;
-            if (!load(g, (p + "ffn_down.weight").c_str(), b.wd, "dense down")) return 1;
+            // the dense stem on the device when the artifact's own blocks have a native kernel, else host float
+            const bool xg = use_device && upload_blocks(g, p + "ffn_gate.weight", b.dw_wg);
+            const bool xu = use_device && upload_blocks(g, p + "ffn_up.weight", b.dw_wu);
+            const bool xd = use_device && upload_blocks(g, p + "ffn_down.weight", b.dw_wd);
+            if (xg && xu && xd) {
+                b.dtypes[0] = b.dw_wg.type; b.dtypes[1] = b.dw_wu.type; b.dtypes[2] = b.dw_wd.type;
+                if (verbosity) std::printf("  dense stem on the device: types %d/%d/%d\n", b.dtypes[0], b.dtypes[1], b.dtypes[2]);
+            } else {
+                if (!load(g, (p + "ffn_gate.weight").c_str(), b.wg, "dense gate")) return 1;
+                if (!load(g, (p + "ffn_up.weight").c_str(), b.wu, "dense up")) return 1;
+                if (!load(g, (p + "ffn_down.weight").c_str(), b.wd, "dense down")) return 1;
+            }
             b.dg.n_embd = N_EMBD; b.dg.n_expert = 0; b.dg.n_used = 0; b.dg.ff = DENSE_FF;
             b.dg.w_scale = 1.0f; b.dg.norm_w = false; b.dg.clamp_exp = 0.0f; b.dg.clamp_shexp = 0.0f;
         } else {
@@ -303,7 +314,13 @@ int main(int argc, char** argv) {
         Block& b = blk[(size_t) l];
         cglm::Glm47TrunkLayer& a = b.tl;
         a.kind = b.kind; a.attn_norm = b.attn_norm.data(); a.ffn_norm = b.ffn_norm.data(); a.mla = &b.mla;
-        if (b.kind == 0) { a.ffn_gate = b.wg.data(); a.ffn_up = b.wu.data(); a.ffn_down = b.wd.data(); a.dense_g = b.dg; }
+        if (b.kind == 0) {
+            a.ffn_gate = b.wg.data(); a.ffn_up = b.wu.data(); a.ffn_down = b.wd.data(); a.dense_g = b.dg;
+            if (b.dtypes[0] && b.dtypes[1] && b.dtypes[2]) {
+                a.dense_dev[0] = b.dw_wg.dev; a.dense_dev[1] = b.dw_wu.dev; a.dense_dev[2] = b.dw_wd.dev;
+                a.dense_types = b.dtypes;
+            }
+        }
         else {
             a.moe_router = b.router.data(); a.moe_probs_b = b.probs_b.data(); a.moe_g = &b.gg; a.shexp = b.shared;
             a.shexp_types = (b.s_types[0] && b.s_types[1] && b.s_types[2]) ? b.s_types : nullptr;  // native GLU or float
@@ -399,8 +416,8 @@ int main(int argc, char** argv) {
         double moe_ms[4] = {0, 0, 0, 0};
         long moe_calls = 0;
         cglm::glm_moe_single_token_timing(moe_ms, &moe_calls);
-        std::printf("  moe (%ld calls): route %.0f | blob %.0f | experts %.0f | shared %.0f ms\n",
-                    moe_calls, moe_ms[0], moe_ms[1], moe_ms[2], moe_ms[3]);
+        std::printf("  moe (%ld calls): route %.0f | blob %.0f | experts %.0f | shared %.0f ms  | dense(host) %.0f\n",
+                    moe_calls, moe_ms[0], moe_ms[1], moe_ms[2], moe_ms[3], cglm::glm47_trunk_dense_ms());
         std::printf("  row cache: %llu hits / %llu misses, %.2f GiB assembled once\n",
                     (unsigned long long) rc.hits, (unsigned long long) rc.misses,
                     (double) rc.bytes / 1073741824.0);

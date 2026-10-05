@@ -15,11 +15,12 @@ namespace {
 // here would be a silent behaviour change (invisible until a pre-activation exceeds it).
 constexpr float kClamp = 0.0f;
 // Cumulative stage timings (milliseconds), read back by glm47_trunk_mla_ms / glm47_trunk_ffn_ms.
-double g_t_mla = 0.0, g_t_ffn = 0.0;
+double g_t_mla = 0.0, g_t_ffn = 0.0, g_t_dense = 0.0;
 }  // namespace
 
 double glm47_trunk_mla_ms() { return g_t_mla; }
 double glm47_trunk_ffn_ms() { return g_t_ffn; }
+double glm47_trunk_dense_ms() { return g_t_dense; }
 
 bool glm47_trunk_forward(const Glm47TrunkLayer* layers, int n_layer,
                          const kernels::glm::MlaGeometry& mla_g, const float* x, int pos, float eps,
@@ -80,11 +81,24 @@ bool glm47_trunk_forward(const Glm47TrunkLayer* layers, int n_layer,
         std::vector<float> ffv((size_t) ne), ffnout((size_t) ne);
         glm::rms_norm_gain(ly.ffn_norm, ne, x2.data(), ffv.data(), eps);
         if (ly.kind == 0) {
-            if (!ly.ffn_gate || !ly.ffn_up || !ly.ffn_down) {
+            const bool dense_native = ly.dense_types != nullptr && ly.dense_dev[0] && ly.dense_dev[1] && ly.dense_dev[2];
+            if (!dense_native && (!ly.ffn_gate || !ly.ffn_up || !ly.ffn_down)) {
                 err = "glm47_trunk_forward: dense layer " + std::to_string(l) + " lacks its FFN weights";
                 return false;
             }
-            glm::expert_ffn(ly.ffn_gate, ly.ffn_up, ly.ffn_down, ly.dense_g, ffv.data(), ffnout.data(), kClamp);
+            const auto td0 = std::chrono::steady_clock::now();
+            if (dense_native) {
+                // the runner uploaded the dense stem's OWN quantized blocks; when they are set the host float
+                // weights are not, so a decline is an error, not a licence to read device memory as floats.
+                if (!glm_try_native_ffn(ly.dense_dev, ly.dense_types, ly.dense_g,
+                                        ffv.data(), ffnout.data(), kClamp)) {
+                    err = "glm47_trunk_forward: dense layer " + std::to_string(l) + " device FFN declined";
+                    return false;
+                }
+            } else {
+                glm::expert_ffn(ly.ffn_gate, ly.ffn_up, ly.ffn_down, ly.dense_g, ffv.data(), ffnout.data(), kClamp);
+            }
+            g_t_dense += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - td0).count();
         } else if (ly.moe_native_fmt && ly.moe_native_blob) {
             // the native (pack-quantized) path: glm_stage_moe_native routes and computes BOTH the routed
             // experts and the shared expert straight from the pack's blobs, so no expert is materialised.

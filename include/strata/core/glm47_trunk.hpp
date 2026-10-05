@@ -37,6 +37,8 @@ struct Glm47TrunkLayer {
     const float* ffn_up = nullptr;                ///< [dense_ff][n_embd]
     const float* ffn_down = nullptr;              ///< [n_embd][dense_ff]
     kernels::glm::MoeGeometry dense_g{};          ///< n_embd and ff for the dense FFN
+    const void* dense_dev[3] = {nullptr, nullptr, nullptr};  ///< the dense FFN's device (quantized) blocks
+    const int* dense_types = nullptr;             ///< their {gate,up,down} GGML types, or null (host float)
 
     // a routed block
     const float* moe_router = nullptr;            ///< [n_expert][n_embd]
@@ -78,5 +80,6 @@ bool glm47_trunk_forward(const Glm47TrunkLayer* layers, int n_layer,
 /// over every glm47_trunk_forward call.  A runner prints them to localise the per-token cost.
 double glm47_trunk_mla_ms();
 double glm47_trunk_ffn_ms();
+double glm47_trunk_dense_ms();
 
 }  // namespace strata::core::glm
