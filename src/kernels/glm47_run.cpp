@@ -375,6 +375,13 @@ int main(int argc, char** argv) {
     // and the decoupled-RoPE attention's K-absorb / V-un-absorb head-matvecs on the device
     if (use_device && n_dev_proj > 0) glm::mla_set_rope_head_cuda(true);
     if (use_device) glm::mla_set_rope_attention_cuda(true);
+    // OFF by default: the block is bit-exact at cache depth 1-2 but a residual divergence appears past that, so it is
+    // opt-in (STRATA_GLM_MLA_BLOCK=1) until that is fixed.
+    const char* mla_block_env = std::getenv("STRATA_GLM_MLA_BLOCK");
+    if (use_device && mla_block_env && mla_block_env[0] == '1') {
+        glm::mla_set_device_attention(true);
+        glm::mla_set_device_block(true);
+    }
     // fan the MLA's head loop out across the worker pool (bit-exact: each head is an independent serial pass).
     // STRATA_GLM_MLA_SERIAL=1 keeps the serial loop, for an A/B on a noisy machine.
     if (std::getenv("STRATA_GLM_MLA_SERIAL") == nullptr) glm::mla_set_parallel_for(glm_parallel_for_heads);

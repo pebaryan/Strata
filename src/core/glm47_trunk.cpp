@@ -60,18 +60,28 @@ bool glm47_trunk_forward(const Glm47TrunkLayer* layers, int n_layer,
         std::vector<float> g_qr((size_t) q_lora), g_qn((size_t) n_head * nope), g_qp((size_t) n_head * n_rot);
         std::vector<float> g_kv((size_t) kv_lora), g_kp((size_t) n_rot), g_qc((size_t) n_head * kv_lora);
         std::vector<float> g_at((size_t) n_head * kv_lora), g_v((size_t) n_head * head_dim);
-        glm::MlaIntermediates want;
-        want.qr = g_qr.data(); want.q_nope = g_qn.data(); want.q_pe = g_qp.data(); want.kv = g_kv.data();
-        want.k_pe = g_kp.data(); want.qcur = g_qc.data(); want.attn = g_at.data(); want.v = g_v.data();
         std::vector<float> attn((size_t) ne);
-        // pass 1: harvest the new latent row only (kv_only - skips the absorption, attention and wo), append
-        // it, then pass 2 attends over history + this token.
-        want.kv_only = true;
-        glm::mla_forward(*ly.mla, mla_g, xb.data(), pos + 1, cache.data(), attn.data(), want, pos);
-        want.kv_only = false;
-        std::memcpy(cache.data() + (size_t) pos * kv_dim, g_kv.data(), (size_t) kv_lora * sizeof(float));
-        std::memcpy(cache.data() + (size_t) pos * kv_dim + kv_lora, g_kp.data(), (size_t) n_rot * sizeof(float));
-        glm::mla_forward(*ly.mla, mla_g, xb.data(), pos + 1, cache.data(), attn.data(), want, pos);
+        if (glm::mla_device_block_enabled()) {
+            // The device block does the whole MLA layer for a decoded token in one upload/one download: q/kv
+            // projections, RoPE, appending this token's latent+k_pe row, attention, un-absorb and wo - no host round
+            // trips and no two-pass harvest.  It receives the row it appends through want.kv (so the host cache stays
+            // complete) and declines safely (falling to the two-pass host path below) if a precondition is unmet.
+            glm::MlaIntermediates bw;
+            bw.kv = cache.data() + (size_t) pos * kv_dim;
+            glm::mla_forward(*ly.mla, mla_g, xb.data(), pos + 1, cache.data(), attn.data(), bw, pos);
+        } else {
+            glm::MlaIntermediates want;
+            want.qr = g_qr.data(); want.q_nope = g_qn.data(); want.q_pe = g_qp.data(); want.kv = g_kv.data();
+            want.k_pe = g_kp.data(); want.qcur = g_qc.data(); want.attn = g_at.data(); want.v = g_v.data();
+            // pass 1: harvest the new latent row only (kv_only - skips the absorption, attention and wo), append
+            // it, then pass 2 attends over history + this token.
+            want.kv_only = true;
+            glm::mla_forward(*ly.mla, mla_g, xb.data(), pos + 1, cache.data(), attn.data(), want, pos);
+            want.kv_only = false;
+            std::memcpy(cache.data() + (size_t) pos * kv_dim, g_kv.data(), (size_t) kv_lora * sizeof(float));
+            std::memcpy(cache.data() + (size_t) pos * kv_dim + kv_lora, g_kp.data(), (size_t) n_rot * sizeof(float));
+            glm::mla_forward(*ly.mla, mla_g, xb.data(), pos + 1, cache.data(), attn.data(), want, pos);
+        }
 
         std::vector<float> x2((size_t) ne);
         for (int i = 0; i < ne; ++i) x2[(size_t) i] = cur[(size_t) i] + attn[(size_t) i];

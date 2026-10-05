@@ -239,15 +239,17 @@ bool mla_attention_rope_cuda(const float* qcur,const float* qpe,const float* cac
 // ---- batched (prompt-chunk) MLA: absorb -> causal latent attention -> un-absorb, all tokens at once, on the device ----
 
 namespace {
-// y[idx] for idx = (t, h, i): sum_j W[(h*rows+i)*cols + j] * x[(t*n_head+h)*cols + j].  One warp per output element.
-__global__ void mla_head_matvec_tokens(const float* m,const float* x,float* y,int rows,int cols,int n_head,size_t total){
+// y[idx] for idx = (t, h, i): sum_j W[(h*rows+i)*cols + j] * x[(t*n_head+h)*x_stride + j].  One warp per output element.
+// `cols` is the width of the dotted slice; `x_stride` is the per-head stride of x (== cols for the nope-only graph, but
+// head_dim for the decoupled-RoPE absorb, where only the first `nope` values of each q head are absorbed).
+__global__ void mla_head_matvec_tokens(const float* m,const float* x,float* y,int rows,int cols,int n_head,size_t total,int x_stride){
     const size_t idx=(size_t)blockIdx.x*(blockDim.x>>5)+(threadIdx.x>>5);
     const int lane=(int)(threadIdx.x&31);
     if(idx>=total)return;
     const size_t per_token=(size_t)n_head*rows;
     const size_t t=idx/per_token,rem=idx%per_token;
     const int h=(int)(rem/rows);
-    const float* row=m+rem*cols;const float* xh=x+(t*n_head+h)*cols;
+    const float* row=m+rem*cols;const float* xh=x+(t*n_head+h)*x_stride;
     float acc=0.0f;
     for(int j=lane;j<cols;j+=32)acc=fmaf(row[j],xh[j],acc);
     for(int o=16;o>0;o>>=1)acc+=__shfl_down_sync(0xffffffffu,acc,o);
@@ -416,7 +418,7 @@ static bool attend_batch_impl(const MlaWeights* iw,const MlaGeometry* ig,const f
     if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
     it->second.last_n=n_total;
     const size_t tot_k=(size_t)S*n_head*kv_lora,tot_v=(size_t)S*n_head*head_dim;
-    mla_head_matvec_tokens<<<(unsigned)((tot_k+7)/8),256>>>(dk,b.q,b.qcur,kv_lora,head_dim,n_head,tot_k);
+    mla_head_matvec_tokens<<<(unsigned)((tot_k+7)/8),256>>>(dk,b.q,b.qcur,kv_lora,head_dim,n_head,tot_k,head_dim);
     const float scale=1.0f/std::sqrt((float)head_dim);
     bool sparse=false;
     if(use_idx){
@@ -452,7 +454,7 @@ static bool attend_batch_impl(const MlaWeights* iw,const MlaGeometry* ig,const f
     if(!sparse)
         mla_latent_attention_batch<<<dim3((unsigned)S,(unsigned)n_head),256,(size_t)n_total*sizeof(float)>>>(
             b.qcur,it->second.device,c_base,kv_lora,scale,b.attn);
-    mla_head_matvec_tokens<<<(unsigned)((tot_v+7)/8),256>>>(dv,b.attn,b.v,head_dim,kv_lora,n_head,tot_v);
+    mla_head_matvec_tokens<<<(unsigned)((tot_v+7)/8),256>>>(dv,b.attn,b.v,head_dim,kv_lora,n_head,tot_v,kv_lora);
     if((e=cudaGetLastError())!=cudaSuccess||(e=cudaDeviceSynchronize())!=cudaSuccess)return fail(cudaGetErrorString(e));
     if((e=cudaMemcpy(v_out,b.v,(size_t)S*q_dim*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)return fail(cudaGetErrorString(e));
     if(error&&error_capacity)error[0]='\0';
@@ -498,29 +500,54 @@ __global__ void mla_rmsnorm1(const float* x,const float* w,float* y,int n,float 
     for(int i=threadIdx.x;i<n;i+=blockDim.x)y[i]=x[i]*inv*w[i];
 }
 
+// Decoupled-RoPE rotation, matching the host rope_neox_inplace bit for bit: pair (i, i+n_rot/2) rotated by
+// theta_i = pos * freq_base^(-2i/n_rot), the angle in DOUBLE (at these bases a float angle moves the rope half).
+__global__ void mla_rope_neox_inplace(float* v,int n_rows,int stride,int offset,int n_rot,int pos,float freq_base){
+    const int r=blockIdx.x*blockDim.x+threadIdx.x;
+    if(r>=n_rows)return;
+    float* p=v+(size_t)r*stride+offset;
+    const int half=n_rot/2;
+    for(int i=0;i<half;++i){
+        const double theta=(double)pos*pow((double)freq_base,-2.0*(double)i/(double)n_rot);
+        const float c=(float)cos(theta),s=(float)sin(theta);
+        const float x0=p[i],x1=p[i+half];
+        p[i]=x0*c-x1*s; p[i+half]=x0*s+x1*c;
+    }
+}
+
+// The rope path is capped at 8192 positions: the dense rope attention materialises one score per cached position.
+constexpr int MLA_ROPE_MAX_POS = 8192;
+
 struct DecodeScratch{
-    int n_embd=0,q_lora=0,q_dim=0,lat=0,kv_lora=0;
-    float *x=nullptr,*qr=nullptr,*q=nullptr,*kv=nullptr,*qcur=nullptr,*attn=nullptr,*v=nullptr,*out=nullptr;
+    int n_embd=0,q_lora=0,q_dim=0,lat=0,kv_lora=0,n_rot=0;
+    float *x=nullptr,*qr=nullptr,*q=nullptr,*kv=nullptr,*qcur=nullptr,*attn=nullptr,*v=nullptr,*out=nullptr,*qpe=nullptr,*scores=nullptr;
     void *xq=nullptr,*qrq=nullptr,*vq=nullptr;
+    float *dcos=nullptr,*dsin=nullptr;double rope_freq=-1.0;
     cudaStream_t stream=nullptr;
     ~DecodeScratch(){release();if(stream)cudaStreamDestroy(stream);}
     void release(){
-        float** all[]={&x,&qr,&q,&kv,&qcur,&attn,&v,&out};
+        float** all[]={&x,&qr,&q,&kv,&qcur,&attn,&v,&out,&qpe,&scores};
         for(float** p:all){if(*p)cudaFree(*p);*p=nullptr;}
         if(xq)cudaFree(xq);if(qrq)cudaFree(qrq);if(vq)cudaFree(vq);
-        xq=qrq=vq=nullptr;n_embd=0;
+        if(dcos)cudaFree(dcos);if(dsin)cudaFree(dsin);
+        xq=qrq=vq=nullptr;dcos=dsin=nullptr;rope_freq=-1.0;n_embd=0;
     }
     bool alloc(const MlaGeometry& g){
         const int qd=g.n_head*g.head_dim,lt=g.n_head*g.kv_lora;
-        if(n_embd==g.n_embd&&q_lora==g.q_lora&&q_dim==qd&&lat==lt&&kv_lora==g.kv_lora&&x)return true;
+        if(n_embd==g.n_embd&&q_lora==g.q_lora&&q_dim==qd&&lat==lt&&kv_lora==g.kv_lora&&n_rot==g.n_rot&&x)return true;
         release();
+        const int kvd=g.kv_lora+g.n_rot;   // kv_a output: the latent then the (unroped) k_pe tail
         auto mk=[&](float*& p,size_t n){return cudaMalloc(&p,n*sizeof(float))==cudaSuccess;};
-        if(!mk(x,g.n_embd)||!mk(qr,g.q_lora)||!mk(q,qd)||!mk(kv,g.kv_lora)||!mk(qcur,lt)||!mk(attn,lt)||!mk(v,qd)||!mk(out,g.n_embd)){release();return false;}
+        if(!mk(x,g.n_embd)||!mk(qr,g.q_lora)||!mk(q,qd)||!mk(kv,kvd)||!mk(qcur,lt)||!mk(attn,lt)||!mk(v,qd)||!mk(out,g.n_embd)){release();return false;}
+        if(g.n_rot>0){
+            if(!mk(qpe,(size_t)g.n_head*g.n_rot)||!mk(scores,(size_t)g.n_head*MLA_ROPE_MAX_POS)){release();return false;}
+            if(!mk(dcos,(size_t)MLA_ROPE_MAX_POS*(g.n_rot/2))||!mk(dsin,(size_t)MLA_ROPE_MAX_POS*(g.n_rot/2))){release();return false;}
+        }
         if(cudaMalloc(&xq,strata::kernels::native_q8_1_bytes(g.n_embd,1))!=cudaSuccess||
            cudaMalloc(&qrq,strata::kernels::native_q8_1_bytes(g.q_lora,1))!=cudaSuccess||
            cudaMalloc(&vq,strata::kernels::native_q8_1_bytes(qd,1))!=cudaSuccess){release();return false;}
         if(!stream&&cudaStreamCreateWithFlags(&stream,cudaStreamNonBlocking)!=cudaSuccess){release();return false;}
-        n_embd=g.n_embd;q_lora=g.q_lora;q_dim=qd;lat=lt;kv_lora=g.kv_lora;
+        n_embd=g.n_embd;q_lora=g.q_lora;q_dim=qd;lat=lt;kv_lora=g.kv_lora;n_rot=g.n_rot;
         return true;
     }
 };
@@ -545,8 +572,10 @@ static int mla_block_impl(const MlaWeights& w,const MlaGeometry& g,const float* 
        !native_mmvq_supported(w.wq_b_type)||!native_mmvq_supported(w.kv_a_type)||!native_mmvq_supported(w.wo_type))
         return decline("projection types not native");
     const int ne=g.n_embd,kvl=g.kv_lora,ql=g.q_lora,nh=g.n_head,hdim=g.head_dim,qd=nh*hdim;
+    const int n_rot=(int)g.n_rot,nope=hdim-n_rot,stride=kvl+n_rot;   // n_rot 0 => the nope-only graph, unchanged
     if(kvl>512||kvl%32||ql%32||ne%32||qd%32||ne>16384||qd>16384)return decline("unsupported geometry");
-    float* dk=resident_head_weights(w.wk_b,(size_t)nh*kvl*hdim);
+    if(n_rot<0||(n_rot&&(n_rot%2||n_rot>=hdim)))return decline("unsupported rope geometry");
+    float* dk=resident_head_weights(w.wk_b,(size_t)nh*kvl*nope);
     float* dv=resident_head_weights(w.wv_b,(size_t)nh*hdim*kvl);
     float* dqn=resident_head_weights(w.q_a_norm,(size_t)ql);
     float* dkn=resident_head_weights(w.kv_a_norm,(size_t)kvl);
@@ -555,7 +584,7 @@ static int mla_block_impl(const MlaWeights& w,const MlaGeometry& g,const float* 
     DecodeScratch& d=decode_scratch();
     if(!d.alloc(g))return decline("scratch allocation failed");
     // the device latent cache: rows [0, n_cache-1) must already be there; this block appends the new row
-    const size_t cn=(size_t)n_cache*kvl;
+    const size_t cn=(size_t)n_cache*stride;
     auto it=s.resident_caches.find(cache_host);
     bool full=false;
     if(it==s.resident_caches.end()){
@@ -573,8 +602,9 @@ static int mla_block_impl(const MlaWeights& w,const MlaGeometry& g,const float* 
     }else if(it->second.last_n!=n_cache-1){
         full=true;   // a reset, or a depth that does not follow on: the host cache is authoritative
     }
+    if(n_rot>0) full=true;   // the rope block re-syncs its device cache from the authoritative host cache every call
     cudaError_t e=cudaSuccess;
-    if(full&&n_cache>1)e=cudaMemcpy(it->second.device,cache_host,(size_t)(n_cache-1)*kvl*sizeof(float),cudaMemcpyHostToDevice);
+    if(full&&n_cache>1)e=cudaMemcpy(it->second.device,cache_host,(size_t)(n_cache-1)*stride*sizeof(float),cudaMemcpyHostToDevice);
     if(e!=cudaSuccess)return decline(cudaGetErrorString(e));
     it->second.last_n=n_cache;           // from here the device cache holds this position too
     float* cache_dev=it->second.device;
@@ -584,6 +614,42 @@ static int mla_block_impl(const MlaWeights& w,const MlaGeometry& g,const float* 
     float* outp=host_io?d.out:d_out_ext;
     if(host_io)e=cudaMemcpyAsync(d.x,x_host,(size_t)ne*sizeof(float),cudaMemcpyHostToDevice,st);
     if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
+    if(n_rot>0){
+        // ---- the decoupled-RoPE chain (GLM-4.7-Flash): q_a/norm/q_b, kv_a carrying the k_pe tail, RoPE on both rope
+        // halves, then the same absorb -> rope attention -> un-absorb -> wo.  All on `st`; one download of out (and of
+        // the appended latent+k_pe row so the host cache stays complete) in host mode, none in device mode.
+        if(n_cache>MLA_ROPE_MAX_POS)return decline("rope block past its position cap");
+        const int pos=n_cache-1;
+        native_quantize_q8_1(xin,d.xq,ne,1,sv);
+        native_mmvq(w.wq_a_type,w.wq_a,d.xq,d.qr,ne,ql,1,sv);
+        mla_rmsnorm1<<<1,512,0,st>>>(d.qr,dqn,d.qr,ql,MLA_RMS_EPS);
+        native_quantize_q8_1(d.qr,d.qrq,ql,1,sv);
+        native_mmvq(w.wq_b_type,w.wq_b,d.qrq,d.q,ql,qd,1,sv);
+        native_mmvq(w.kv_a_type,w.kv_a,d.xq,d.kv,ne,stride,1,sv);     // [kv_lora | k_pe tail]
+        mla_rmsnorm1<<<1,512,0,st>>>(d.kv,dkn,d.kv,kvl,MLA_RMS_EPS);   // the latent only
+        float* row=cache_dev+(size_t)pos*stride;
+        cudaMemcpyAsync(row,d.kv,(size_t)kvl*sizeof(float),cudaMemcpyDeviceToDevice,st);
+        cudaMemcpyAsync(row+kvl,d.kv+kvl,(size_t)n_rot*sizeof(float),cudaMemcpyDeviceToDevice,st);
+        mla_rope_neox_inplace<<<1,256,0,st>>>(row,1,stride,kvl,n_rot,pos,w.rope_freq_base);   // rope k_pe in place
+        cudaMemcpyAsync(kv_row_host,row,(size_t)stride*sizeof(float),cudaMemcpyDeviceToHost,st);  // ROPED row -> host cache
+        mla_rope_neox_inplace<<<1,256,0,st>>>(d.q,nh,hdim,nope,n_rot,pos,w.rope_freq_base);    // rope q_pe per head
+        cudaMemcpy2DAsync(d.qpe,(size_t)n_rot*sizeof(float),d.q+(size_t)nope,(size_t)hdim*sizeof(float),
+                          (size_t)n_rot*sizeof(float),nh,cudaMemcpyDeviceToDevice,st);          // gather the roped q_pe
+        const size_t tot_k=(size_t)nh*kvl,tot_v=(size_t)nh*hdim;
+        mla_head_matvec_tokens<<<(unsigned)((tot_k+7)/8),256,0,st>>>(dk,d.q,d.qcur,kvl,nope,nh,tot_k,hdim);
+        mla_latent_attention_rope<<<(unsigned)nh,256,0,st>>>(d.qcur,d.qpe,cache_dev,n_cache,kvl,n_rot,
+                                                             1.0f/std::sqrt((float)hdim),d.scores,d.attn);
+        mla_head_matvec_tokens<<<(unsigned)((tot_v+7)/8),256,0,st>>>(dv,d.attn,d.v,hdim,kvl,nh,tot_v,kvl);
+        native_quantize_q8_1(d.v,d.vq,qd,1,sv);
+        native_mmvq(w.wo_type,w.wo,d.vq,outp,qd,ne,1,sv);
+        if(host_io){
+            e=cudaMemcpyAsync(out_host,d.out,(size_t)ne*sizeof(float),cudaMemcpyDeviceToHost,st);
+            if(e==cudaSuccess)e=cudaStreamSynchronize(st);
+        }
+        if(e==cudaSuccess)e=cudaGetLastError();
+        if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
+        return 1;
+    }
     native_quantize_q8_1(xin,d.xq,ne,1,sv);
     native_mmvq(w.wq_a_type,w.wq_a,d.xq,d.qr,ne,ql,1,sv);
     mla_rmsnorm1<<<1,512,0,st>>>(d.qr,dqn,d.qr,ql,MLA_RMS_EPS);
@@ -594,7 +660,7 @@ static int mla_block_impl(const MlaWeights& w,const MlaGeometry& g,const float* 
     cudaMemcpyAsync(cache_dev+(size_t)(n_cache-1)*kvl,d.kv,(size_t)kvl*sizeof(float),cudaMemcpyDeviceToDevice,st);
     cudaMemcpyAsync(kv_row_host,d.kv,(size_t)kvl*sizeof(float),cudaMemcpyDeviceToHost,st);
     const size_t tot_k=(size_t)nh*kvl,tot_v=(size_t)nh*hdim;
-    mla_head_matvec_tokens<<<(unsigned)((tot_k+7)/8),256,0,st>>>(dk,d.q,d.qcur,kvl,hdim,nh,tot_k);
+    mla_head_matvec_tokens<<<(unsigned)((tot_k+7)/8),256,0,st>>>(dk,d.q,d.qcur,kvl,hdim,nh,tot_k,hdim);
     // The sparse indexer: its rows are written for EVERY position (they cannot be rebuilt later), and from IDX_SPARSE_FROM
     // positions on the layer reads only the cells it selects.  Where it cannot (rows missing, scratch), the dense kernel
     // below runs and says so once - beyond 8192 positions there is no dense fallback at all.
@@ -621,7 +687,7 @@ static int mla_block_impl(const MlaWeights& w,const MlaGeometry& g,const float* 
     else
         mla_latent_attention_batch<<<dim3(1,(unsigned)nh),256,(size_t)n_cache*sizeof(float),st>>>(
             d.qcur,cache_dev,n_cache-1,kvl,1.0f/std::sqrt((float)hdim),d.attn);
-    mla_head_matvec_tokens<<<(unsigned)((tot_v+7)/8),256,0,st>>>(dv,d.attn,d.v,hdim,kvl,nh,tot_v);
+    mla_head_matvec_tokens<<<(unsigned)((tot_v+7)/8),256,0,st>>>(dv,d.attn,d.v,hdim,kvl,nh,tot_v,kvl);
     native_quantize_q8_1(d.v,d.vq,qd,1,sv);
     native_mmvq(w.wo_type,w.wo,d.vq,outp,qd,ne,1,sv);
     if(host_io){

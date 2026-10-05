@@ -464,8 +464,44 @@ void mla_forward(const MlaWeights& w, const MlaGeometry& g, const float* x, int 
     // GLM-4.7-Flash (deepseek2): the decoupled-RoPE graph, host-only for now.  Kept as its own function so the
     // nope-only path below is byte-identical to the GLM-5.3 port (n_rot defaults to 0 and never reaches here).
     if (g.n_rot > 0) {
-        if (g_device_attention || g_device_block)
-            std::fprintf(stderr, "[mla] decoupled-RoPE MLA has no device path yet; using the host kernel\n");
+        // A decoded token on the device-resident rope block: same contract as the nope block below, but cache rows are
+        // (kv_lora + n_rot) wide.  It declines, touching nothing, whenever a precondition is unmet - then the host path runs.
+        const int stride = kv_lora + g.n_rot;
+        if (g_device_block && g_device_attention && want.kv && !want.qr && !want.qcur && !want.attn && n_cache >= 1 &&
+            want.kv == cache + (size_t) (n_cache - 1) * (size_t) stride) {
+            char block_err[256] = {};
+            const int r = mla_block_decode_cuda(w, g, x, n_cache, cache, want.kv, out, block_err, sizeof(block_err));
+            if (r == 1) {
+                if (std::getenv("STRATA_GLM_MLA_BLOCK_VERIFY")) {
+                    const std::vector<float> blk(out, out + g.n_embd), row_blk(want.kv, want.kv + stride);
+                    std::vector<float> ref((size_t) g.n_embd);
+                    g_device_block = false;
+                    mla_forward(w, g, x, n_cache, cache, ref.data(), want);
+                    g_device_block = true;
+                    double d = 0, m = 0, dr = 0;
+                    for (int i = 0; i < g.n_embd; ++i) {
+                        d = std::max(d, (double) std::fabs(ref[(size_t) i] - blk[(size_t) i]));
+                        m = std::max(m, (double) std::fabs(ref[(size_t) i]));
+                    }
+                    for (int i = 0; i < stride; ++i) dr = std::max(dr, (double) std::fabs(want.kv[i] - row_blk[(size_t) i]));
+                    std::fprintf(stderr, "MLA_BLOCK_ROPE_VERIFY n_cache %d: out diff %.3e (max|ref| %.3e), latent+k_pe row diff %.3e\n",
+                                 n_cache, d, m, dr);
+                    std::copy(ref.begin(), ref.end(), out);
+                }
+                return;
+            }
+            if (r < 0) {
+                std::fprintf(stderr, "GLM MLA rope device block failed: %s\n", block_err);
+                std::exit(1);
+            }
+            if (std::getenv("STRATA_GLM_MLA_BLOCK_VERIFY"))
+                std::fprintf(stderr, "[mla] rope block declined (n_cache=%d): %s\n", n_cache, block_err);
+        }
+        if (std::getenv("STRATA_GLM_MLA_BLOCK_VERIFY"))
+            std::fprintf(stderr, "[mla] rope block gate miss (n_cache=%d kv_set=%d kv_match=%d qr=%d qcur=%d attn=%d)\n",
+                         n_cache, (int) (want.kv != nullptr),
+                         (int) (want.kv && want.kv == cache + (size_t) (n_cache - 1) * (size_t) stride),
+                         (int) (want.qr != nullptr), (int) (want.qcur != nullptr), (int) (want.attn != nullptr));
         mla_forward_rope(w, g, x, n_cache, cache, out, want, pos);
         return;
     }
