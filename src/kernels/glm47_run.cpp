@@ -284,6 +284,8 @@ int main(int argc, char** argv) {
 
     // install the MLA native-projection hook: the four projections now run on the device
     if (use_device && n_dev_proj > 0) glm::mla_set_native_project(glm::glm47_native_project);
+    // and the decoupled-RoPE attention's K-absorb / V-un-absorb head-matvecs on the device
+    if (use_device && n_dev_proj > 0) glm::mla_set_rope_head_cuda(true);
     // install the native GLU: the shared expert runs on the device too
     if (use_device && n_dev_shexp > 0) cglm::glm_set_native_ffn(glm::glm47_native_ffn);
 

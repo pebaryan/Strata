@@ -96,6 +96,9 @@ using MlaNativeProjectFn = bool (*)(int count, const void* const* weights, const
                                     const float* x, int n_in, int n_out, float* const* out);
 void mla_set_native_project(MlaNativeProjectFn fn);
 void mla_set_device_attention(bool enabled);
+/// Run the decoupled-RoPE graph's K-absorb (wk_b) and V-un-absorb (wv_b) head-matvecs on the device kernel
+/// (falls back to the host loop per call if the kernel declines).  GLM-4.7's attention is otherwise host-only.
+void mla_set_rope_head_cuda(bool enabled);
 bool mla_attention_cuda(const float* qcur, const float* cache, int n_cache, int n_head, int head_dim, int kv_lora,
                         float* attn, char* error, size_t error_capacity);
 
