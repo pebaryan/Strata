@@ -47,7 +47,9 @@ struct Layer {
     const C::WeightRef *q{}, *k{}, *v{}, *o{}, *sg{}, *su{}, *sd{};
     const float *an{}, *pan{}, *fn{}, *pfn{}, *qn{}, *kn{}, *bias{};
     const void* router{};
-    float *kc{}, *vc{};
+    float *kc{}, *vc{};                 // fp32 KV cache (used when the q4 path is off)
+    unsigned char *kq{}, *vq{};         // quantized KV cache (q4_0 or q8_0 blocks)
+    float *ks{}, *vs{};                 // the current cell, before quantization
     cudaGraphExec_t pre{}, post{};
     KCPU::NativeFmt fmt{};
     std::function<bool()> pre_fn, post_fn;   // the same op sequence the graphs encode, runnable
@@ -290,8 +292,8 @@ int sample_logits(std::vector<float>& logits, const std::vector<int>& history, f
 }
 
 int main(int argc,char** argv){
-    std::string pack,model,gate_prefix,gate_tokens,prefill_tokens; int max_context=4096,gate_gen=0,pin_layers=0; bool serve=false;
-    for(int i=1;i<argc;++i){std::string a=argv[i]; if(a=="--serve")serve=true; else if(a=="--pack"&&i+1<argc)pack=argv[++i]; else if((a=="--native"||a=="--model")&&i+1<argc)model=argv[++i]; else if(a=="--max-context"&&i+1<argc)max_context=std::atoi(argv[++i]); else if(a=="--gate"&&i+2<argc){gate_prefix=argv[++i];gate_tokens=argv[++i];} else if(a=="--gen"&&i+1<argc)gate_gen=std::atoi(argv[++i]); else if(a=="--prefill"&&i+1<argc)prefill_tokens=argv[++i]; else if(a=="--pin-layers"&&i+1<argc)pin_layers=std::atoi(argv[++i]);}
+    std::string pack,model,gate_prefix,gate_tokens,prefill_tokens; int max_context=4096,gate_gen=0,pin_layers=0; int kv_bits=32; bool serve=false;   // 32 = fp32 KV, 8 = q8_0, 4 = q4_0
+    for(int i=1;i<argc;++i){std::string a=argv[i]; if(a=="--serve")serve=true; else if(a=="--pack"&&i+1<argc)pack=argv[++i]; else if((a=="--native"||a=="--model")&&i+1<argc)model=argv[++i]; else if(a=="--max-context"&&i+1<argc)max_context=std::atoi(argv[++i]); else if(a=="--gate"&&i+2<argc){gate_prefix=argv[++i];gate_tokens=argv[++i];} else if(a=="--gen"&&i+1<argc)gate_gen=std::atoi(argv[++i]); else if(a=="--prefill"&&i+1<argc)prefill_tokens=argv[++i]; else if(a=="--pin-layers"&&i+1<argc)pin_layers=std::atoi(argv[++i]); else if(a=="--kv-q4")kv_bits=4; else if(a=="--kv-q8")kv_bits=8;}
     if(pack.empty()||model.empty()){std::fprintf(stderr,"usage: strata-kolibri --pack DIR --native MODEL [--serve] [--max-context N]\n       strata-kolibri --pack DIR --native MODEL --gate ORACLE-PREFIX t1,t2,... [--gen N]\n");return 2;}
     std::string err;
     strata::GgufModel gm=strata::GgufModel::open(model); strata::Kolibri1Geometry geo;
@@ -335,6 +337,10 @@ int main(int argc,char** argv){
         l.an=(const float*)need(table,p+"attn_norm.weight",err)->data;l.pan=(const float*)need(table,p+"post_attention_norm.weight",err)->data;l.fn=(const float*)need(table,p+"ffn_norm.weight",err)->data;l.pfn=(const float*)need(table,p+"post_ffw_norm.weight",err)->data;l.qn=(const float*)need(table,p+"attn_q_norm.weight",err)->data;l.kn=(const float*)need(table,p+"attn_k_norm.weight",err)->data;l.router=need(table,p+"ffn_gate_inp.weight",err)->data;l.bias=(const float*)need(table,p+"exp_probs_b.bias",err)->data;
         if(!err.empty()){std::fprintf(stderr,"bind: %s\n",err.c_str());return 1;}
         alloc((void**)&l.kc,(size_t)max_context*N_KV*HD*4,"K cache");alloc((void**)&l.vc,(size_t)max_context*N_KV*HD*4,"V cache");
+        if(kv_bits<32){const size_t cell=(kv_bits==8)?KC::kv_q8_cell_bytes():KC::kv_q4_cell_bytes();
+            alloc((void**)&l.kq,(size_t)max_context*N_KV*cell,"K quant cache");alloc((void**)&l.vq,(size_t)max_context*N_KV*cell,"V quant cache");
+            cudaFree(l.kc);cudaFree(l.vc);l.kc=nullptr;l.vc=nullptr;                 // no fp32 copy alongside it
+            alloc((void**)&l.ks,N_KV*HD*4,"K cell");alloc((void**)&l.vs,N_KV*HD*4,"V cell");}
         if(!KCPU::native_fmt(types[b].first,types[b].second,N_EMBD,FF,l.fmt,err)){std::fprintf(stderr,"expert fmt: %s\n",err.c_str());return 1;}
         l.pre_fn=[&,b]()->bool{
             const Layer& L=layers[b];
@@ -343,8 +349,13 @@ int main(int argc,char** argv){
             bool okq=true;
             op_run("p_qkv",[&]{ okq=mmvq(L.q,q8b,q,stream,err)&&mmvq(L.k,q8b,k,stream,err)&&mmvq(L.v,q8b,v,stream,err); });
             if(!okq)return false;
-            op_run("p_qkn",[&]{ KC::qk_norm_rope_cache(q,k,v,L.qn,L.kn,L.kc,L.vc,pos_dev,geo.swa_pattern[b]!=0,geo.rope_freq_base,stream); });
-            op_run("p_attn",[&]{ KC::attention(q,L.kc,L.vc,att,pos_dev,geo.swa_pattern[b]!=0,(int)geo.swa_window,max_context,stream); });
+            op_run("p_qkn",[&]{ if(kv_bits<32){KC::qk_norm_rope_scratch(q,k,v,L.qn,L.kn,L.ks,L.vs,pos_dev,geo.swa_pattern[b]!=0,geo.rope_freq_base,stream);
+                                 if(kv_bits==8)KC::kv_store_q8(L.kq,L.vq,L.ks,L.vs,pos_dev,max_context,stream);
+                                 else KC::kv_store_q4(L.kq,L.vq,L.ks,L.vs,pos_dev,max_context,stream);}
+                             else KC::qk_norm_rope_cache(q,k,v,L.qn,L.kn,L.kc,L.vc,pos_dev,geo.swa_pattern[b]!=0,geo.rope_freq_base,stream); });
+            op_run("p_attn",[&]{ if(kv_bits==8)KC::attention_q8(q,L.kq,L.vq,att,pos_dev,geo.swa_pattern[b]!=0,(int)geo.swa_window,max_context,stream);
+                             else if(kv_bits==4)KC::attention_q4(q,L.kq,L.vq,att,pos_dev,geo.swa_pattern[b]!=0,(int)geo.swa_window,max_context,stream);
+                             else KC::attention(q,L.kc,L.vc,att,pos_dev,geo.swa_pattern[b]!=0,(int)geo.swa_window,max_context,stream); });
             op_run("p_o",[&]{ K::native_quantize_q8_1(att,q8a,N_HEAD*HD,1,stream);okq=mmvq(L.o,q8a,proj,stream,err); });
             if(!okq)return false;
             op_run("p_norms",[&]{ KC::rms_norm_residual(proj,L.pan,x,N_EMBD,geo.rms_eps,stream);KC::rms_norm(x,L.fn,norm,N_EMBD,geo.rms_eps,stream); });
@@ -450,7 +461,7 @@ int main(int argc,char** argv){
         if(prof){ms_head+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-h0).count();++prof_tokens;}
         return true;
     };
-    std::printf("INFO architecture=kolibri1 execution=cuda_graph expert_cache=gpu_lru cache_gb=%.2f pinned_layers=%d vocab=%d layers=%d\n",cache_gb,pin_layers,vocab,n_layers);std::printf("READY %d\n",max_context);std::fflush(stdout);
+    std::printf("INFO architecture=kolibri1 execution=cuda_graph expert_cache=gpu_lru cache_gb=%.2f pinned_layers=%d kv=%s vocab=%d layers=%d\n",cache_gb,pin_layers,kv_bits==8?"q8_0":(kv_bits==4?"q4_0":"fp32"),vocab,n_layers);std::printf("READY %d\n",max_context);std::fflush(stdout);
 
     // ---- --prefill: warm the row cache with a long prompt, no oracle comparison needed.  This is
     // the apples-to-apples setup against a llama-benchy/llama.cpp tg run, which always measures
