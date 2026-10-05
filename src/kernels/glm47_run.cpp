@@ -25,6 +25,8 @@
 
 #include <cuda_runtime.h>
 
+#include <unordered_map>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -109,8 +111,32 @@ struct Block {
     cglm::Glm47TrunkLayer tl;
 };
 
+// The routed-expert row cache.  In gguf mode (a pack with no experts.bin) FileExpertSource has no
+// contiguous blob in any file, so its staged path re-assembles the [gate|up|down] row out of the GGUF
+// on EVERY blob() call - hit or miss - round-tripping ~5.8 MB per expert off disk each token.  A row
+// is byte-identical every token, so assemble each (layer, expert) once and hand back the copy: on a hit
+// no host bytes move.  This is the same fix the V100 kolibri port landed (35e627f) for its row cache.
+struct RowCache {
+    strata::core::ExpertSource* src = nullptr;
+    std::vector<uint64_t> row_bytes;                    // per layer, from native_experts.txt
+    std::unordered_map<int64_t, std::unique_ptr<uint8_t[]>> rows;
+    uint64_t hits = 0, misses = 0, bytes = 0;
+};
 const uint8_t* blob_adapter(void* ctx, int layer, int expert) {
-    return ((strata::core::ExpertSource*) ctx)->blob(layer, expert);
+    RowCache* c = (RowCache*) ctx;
+    const int64_t key = ((int64_t) layer << 20) | (int64_t) expert;
+    auto it = c->rows.find(key);
+    if (it != c->rows.end()) { ++c->hits; return it->second.get(); }
+    const uint64_t nb = c->row_bytes[(size_t) layer];
+    if (nb == 0) return nullptr;
+    // copy_blob assembles the [gate|up|down] row STRAIGHT into our buffer - no FileExpertSource stage copy,
+    // so a miss is one read off the GGUF, not two.  make_unique (not vector) so we do not zero 5.8 MB first.
+    auto row = std::make_unique<uint8_t[]>(nb);
+    if (!c->src->copy_blob(layer, expert, row.get())) return nullptr;
+    uint8_t* p = row.get();
+    c->rows.emplace(key, std::move(row));
+    ++c->misses; c->bytes += nb;
+    return p;
 }
 
 bool load(strata::GgufFile& g, const char* name, std::vector<float>& out, const char* what) {
@@ -126,7 +152,7 @@ int main(int argc, char** argv) {
     const char* pack = "D:/aimodels/strata-pack-glm47";
     std::string tokens;
     int n_layer = N_LAYER, verbosity = 1, gen = 1;
-    bool bind_only = false, use_device = true;
+    bool bind_only = false, use_device = true, warm = false;
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--gguf") && i + 1 < argc) gguf = argv[++i];
         else if (!std::strcmp(argv[i], "--pack") && i + 1 < argc) pack = argv[++i];
@@ -136,6 +162,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--gen") && i + 1 < argc) gen = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--quiet")) verbosity = 0;
         else if (!std::strcmp(argv[i], "--cpu")) use_device = false;
+        else if (!std::strcmp(argv[i], "--warm")) warm = true;
     }
 
     std::printf("glm47_run: %d blocks (block 0 dense), n_embd %d, experts %d/%d, ff %d, %s\n",
@@ -150,6 +177,8 @@ int main(int argc, char** argv) {
         return die("pack: " + err) ? 0 : 1;
 
     std::map<int, int> gu_of, d_of;
+    RowCache rc;
+    rc.row_bytes.assign((size_t) N_LAYER, 0);
     { std::ifstream pf(std::string(pack) + "/native_experts.txt"); std::string line;
       while (std::getline(pf, line)) {
           if (line.empty() || line[0] == '#') continue;
@@ -157,7 +186,9 @@ int main(int argc, char** argv) {
           int64_t blk = -1, off = 0, nb = 0, go = 0, uo = 0, dob = 0; int gt = 0, dt = 0;
           if (!(is >> blk >> gt >> dt >> off >> nb >> go >> uo >> dob)) continue;
           gu_of[(int) blk] = gt; d_of[(int) blk] = dt;
+          if (blk >= 0 && blk < N_LAYER) rc.row_bytes[(size_t) blk] = (uint64_t) nb;
       } }
+    rc.src = &src;
 
     strata::GgufFile g(gguf);
     const auto t_bind0 = std::chrono::steady_clock::now();
@@ -266,13 +297,25 @@ int main(int argc, char** argv) {
         else {
             a.moe_router = b.router.data(); a.moe_probs_b = b.probs_b.data(); a.moe_g = &b.gg; a.shexp = b.shared;
             a.shexp_types = (b.s_types[0] && b.s_types[1] && b.s_types[2]) ? b.s_types : nullptr;  // native GLU or float
-            a.moe_native_fmt = &b.fmt; a.moe_native_blob = &blob_adapter; a.moe_native_ctx = &src;
+            a.moe_native_fmt = &b.fmt; a.moe_native_blob = &blob_adapter; a.moe_native_ctx = &rc;
         }
         arr[(size_t) l] = a;
     }
 
     if (verbosity) std::printf("  bind+upload: %.0f ms\n",
         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_bind0).count());
+
+    // --warm: assemble every routed expert's row once up front, so decode runs against host-resident rows
+    // (the V100's prefill-then-gen warm cache).  Layer 0 is dense and has no experts.
+    if (warm) {
+        const auto w0 = std::chrono::steady_clock::now();
+        for (int l = 1; l < n_layer; ++l)
+            for (int e = 0; e < N_EXPERT; ++e) blob_adapter(&rc, l, e);
+        const double wms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
+        if (verbosity) std::printf("  warmed the expert-row cache: %zu rows, %.2f GiB, %.1f s\n",
+                                   rc.rows.size(), (double) rc.bytes / 1073741824.0, wms / 1000.0);
+        rc.hits = rc.misses = 0;
+    }
 
     glm::MlaGeometry mg; mg.n_embd = N_EMBD; mg.n_head = N_HEAD; mg.head_dim = HEAD_DIM;
     mg.kv_lora = KV_LORA; mg.q_lora = Q_LORA; mg.n_rot = N_ROT;
@@ -348,6 +391,9 @@ int main(int argc, char** argv) {
         cglm::glm_moe_single_token_timing(moe_ms, &moe_calls);
         std::printf("  moe (%ld calls): route %.0f | blob %.0f | experts %.0f | shared %.0f ms\n",
                     moe_calls, moe_ms[0], moe_ms[1], moe_ms[2], moe_ms[3]);
+        std::printf("  row cache: %llu hits / %llu misses, %.2f GiB assembled once\n",
+                    (unsigned long long) rc.hits, (unsigned long long) rc.misses,
+                    (double) rc.bytes / 1073741824.0);
     }
     std::printf("  top-5 (last):");
     for (int i = 0; i < 5; ++i) std::printf(" %d(%.3f)", order[(size_t) i], (double) logits[(size_t) order[(size_t) i]]);
