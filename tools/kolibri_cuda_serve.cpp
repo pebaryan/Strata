@@ -60,6 +60,8 @@ struct CacheRuntime {
     float *x{}, *gate{}, *up{}, *out{}, *accum{};
     void *xq{}, *hq{};
     uint8_t* row_stage[N_USED]{};   // pinned, one per selected expert: the async H2D reads from these
+    std::vector<void*> pinned;          // per layer: device base holding all 384 rows, nullptr if not pinned
+    std::vector<size_t> pinned_stride;  // row stride for that layer's pinned block
     explicit CacheRuntime(size_t bytes) : cache([&] {
         C::ExpertRowCacheConfig c; c.budget_bytes=bytes; c.evict_ctx=this;
         c.on_evict=[](void*,const C::ExpertRowKey&,const C::ExpertRowEntry& e){ if(e.dev) cudaFree(e.dev); };
@@ -147,6 +149,7 @@ bool load_types(const std::string& pack, std::vector<std::pair<int,int>>& type, 
 struct RowGeom { size_t gate_off = 0, up_off = 0, down_off = 0, blob_bytes = 0; };
 std::vector<RowGeom> g_row;
 const uint8_t* g_gguf = nullptr;
+int g_gguf_fd = -1;
 
 bool load_row_geom(const std::string& pack, const std::string& model, int n_layers, std::string& err) {
     const int fd = ::open(model.c_str(), O_RDONLY);
@@ -154,9 +157,9 @@ bool load_row_geom(const std::string& pack, const std::string& model, int n_laye
     struct stat st{};
     if (fstat(fd, &st) != 0 || st.st_size <= 0) { err = "stat " + model; ::close(fd); return false; }
     void* view = mmap(nullptr, (size_t) st.st_size, PROT_READ, MAP_SHARED, fd, 0);
-    ::close(fd);
-    if (view == MAP_FAILED) { err = "mmap " + model; return false; }
+    if (view == MAP_FAILED) { err = "mmap " + model; ::close(fd); return false; }
     g_gguf = (const uint8_t*) view;
+    g_gguf_fd = fd;      // kept open: rows are read with pread, not by faulting the mapping
 
     std::FILE* f = std::fopen((pack + "/native_experts.txt").c_str(), "rb");
     if (f == nullptr) { err = "cannot open native_experts.txt"; return false; }
@@ -177,12 +180,22 @@ bool load_row_geom(const std::string& pack, const std::string& model, int n_laye
     return true;
 }
 
-// Assemble row `e` of `layer` into `dst` (three slices out of the mmap).
-inline void assemble_row(int layer, int e, size_t gu, size_t down, uint8_t* dst) {
+// Assemble row `e` of `layer` into `dst`: three preads, one per slice.
+//
+// This used to memcpy out of the mmap.  On a miss that meant ~640 minor page faults, each a 4 KB
+// synchronous read of a DRAM-less SATA SSD, measured at ~70 ms per 2.4 MB row (34 MB/s) - and a
+// generation that misses ~1.5 rows per token then runs at 135 ms/token no matter how fast the hits
+// are.  pread hands each slice to the kernel as one large request; the mapping stays for the
+// non-hot path and for validation.
+inline bool read_row(int layer, int e, size_t gu, size_t down, uint8_t* dst, std::string& err) {
     const RowGeom& g = g_row[(size_t) layer];
-    std::memcpy(dst, g_gguf + g.gate_off + (size_t) e * gu, gu);
-    std::memcpy(dst + gu, g_gguf + g.up_off + (size_t) e * gu, gu);
-    std::memcpy(dst + 2 * gu, g_gguf + g.down_off + (size_t) e * down, down);
+    const off_t o0 = (off_t) (g.gate_off + (size_t) e * gu);
+    const off_t o1 = (off_t) (g.up_off + (size_t) e * gu);
+    const off_t o2 = (off_t) (g.down_off + (size_t) e * down);
+    if (::pread(g_gguf_fd, dst, gu, o0) != (ssize_t) gu) { err = "pread gate"; return false; }
+    if (::pread(g_gguf_fd, dst + gu, gu, o1) != (ssize_t) gu) { err = "pread up"; return false; }
+    if (::pread(g_gguf_fd, dst + 2 * gu, down, o2) != (ssize_t) down) { err = "pread down"; return false; }
+    return true;
 }
 
 bool run_experts(CacheRuntime& rt, int layer, const Layer& l,
@@ -196,12 +209,16 @@ bool run_experts(CacheRuntime& rt, int layer, const Layer& l,
     bool rows_ok=true;
     op_run("expert_rows", [&]{
     for(int i=0;i<N_USED;++i) {
+        if(rt.pinned[(size_t)layer]) {   // whole layer resident: the address is arithmetic, nothing else
+            rows[i]=(const uint8_t*)rt.pinned[(size_t)layer]+(size_t)ids[i]*rt.pinned_stride[(size_t)layer];
+            continue;
+        }
         C::ExpertRowKey key{layer,ids[i]};
         auto state=rt.cache.lookup(key,bytes);          // cache first: a hit needs no host bytes at all
         void* dev=nullptr;
         if(state==C::ExpertRowState::resident) dev=rt.cache.find(key)->dev;
         else {
-            assemble_row(layer,ids[i],gu,down,rt.row_stage[i]);   // 3 memcpys from the mmap, hit-free path only
+            if(!read_row(layer,ids[i],gu,down,rt.row_stage[i],err)){ rows_ok=false; return; }   // miss only
             if(!check(cudaMalloc(&dev,bytes),"expert allocation",err)){ rows_ok=false; return; }
             if(!check(cudaMemcpyAsync(dev,rt.row_stage[i],bytes,cudaMemcpyHostToDevice,rt.stream),"expert upload",err)){ cudaFree(dev); rows_ok=false; return; }
             if(state==C::ExpertRowState::needs_upload){ rt.cache.insert(key,{dev,bytes}); dev=rt.cache.find(key)->dev; }
@@ -257,8 +274,8 @@ int sample_logits(std::vector<float>& logits, const std::vector<int>& history, f
 }
 
 int main(int argc,char** argv){
-    std::string pack,model,gate_prefix,gate_tokens,prefill_tokens; int max_context=4096,gate_gen=0; bool serve=false;
-    for(int i=1;i<argc;++i){std::string a=argv[i]; if(a=="--serve")serve=true; else if(a=="--pack"&&i+1<argc)pack=argv[++i]; else if((a=="--native"||a=="--model")&&i+1<argc)model=argv[++i]; else if(a=="--max-context"&&i+1<argc)max_context=std::atoi(argv[++i]); else if(a=="--gate"&&i+2<argc){gate_prefix=argv[++i];gate_tokens=argv[++i];} else if(a=="--gen"&&i+1<argc)gate_gen=std::atoi(argv[++i]); else if(a=="--prefill"&&i+1<argc)prefill_tokens=argv[++i];}
+    std::string pack,model,gate_prefix,gate_tokens,prefill_tokens; int max_context=4096,gate_gen=0,pin_layers=0; bool serve=false;
+    for(int i=1;i<argc;++i){std::string a=argv[i]; if(a=="--serve")serve=true; else if(a=="--pack"&&i+1<argc)pack=argv[++i]; else if((a=="--native"||a=="--model")&&i+1<argc)model=argv[++i]; else if(a=="--max-context"&&i+1<argc)max_context=std::atoi(argv[++i]); else if(a=="--gate"&&i+2<argc){gate_prefix=argv[++i];gate_tokens=argv[++i];} else if(a=="--gen"&&i+1<argc)gate_gen=std::atoi(argv[++i]); else if(a=="--prefill"&&i+1<argc)prefill_tokens=argv[++i]; else if(a=="--pin-layers"&&i+1<argc)pin_layers=std::atoi(argv[++i]);}
     if(pack.empty()||model.empty()){std::fprintf(stderr,"usage: strata-kolibri --pack DIR --native MODEL [--serve] [--max-context N]\n       strata-kolibri --pack DIR --native MODEL --gate ORACLE-PREFIX t1,t2,... [--gen N]\n");return 2;}
     std::string err;
     strata::GgufModel gm=strata::GgufModel::open(model); strata::Kolibri1Geometry geo;
@@ -342,7 +359,39 @@ int main(int argc,char** argv){
         else if(!capture(false,&l.pre)||!capture(true,&l.post)){std::fprintf(stderr,"capture layer %d: %s\n",b,err.c_str());return 1;}
     }
     const C::WeightRef* outnorm=need(table,"output_norm.weight",err); if(!outnorm){std::fprintf(stderr,"%s\n",err.c_str());return 1;}
-    double cache_gb=8.0;if(const char* e=std::getenv("STRATA_KOLIBRI_EXPERT_CACHE_GB"))cache_gb=std::atof(e);CacheRuntime cache((size_t)(cache_gb*1073741824.0));
+    double cache_gb=8.0;if(const char* e=std::getenv("STRATA_KOLIBRI_EXPERT_CACHE_GB"))cache_gb=std::atof(e);
+    if(pin_layers>(int)n_layers)pin_layers=(int)n_layers;
+    size_t pinned_bytes=0;for(int b=0;b<pin_layers;++b)pinned_bytes+=g_row[(size_t)b].blob_bytes*(size_t)N_EXPERT;
+    const size_t total_bytes=(size_t)(cache_gb*1073741824.0);
+    if(pinned_bytes>=total_bytes){std::fprintf(stderr,"pin-layers %d needs %.1f GB, budget is %.1f GB\n",pin_layers,(double)pinned_bytes/1073741824.0,cache_gb);return 1;}
+    CacheRuntime cache(total_bytes-pinned_bytes);
+    cache.pinned.assign(n_layers,nullptr);cache.pinned_stride.assign(n_layers,0);
+    if(pin_layers>0){
+        const auto p0=std::chrono::steady_clock::now();
+        const size_t batch=8;
+        uint8_t* hbuf=nullptr;
+        size_t max_row=0;for(int b=0;b<pin_layers;++b)max_row=std::max(max_row,g_row[(size_t)b].blob_bytes);
+        if(!check(cudaHostAlloc((void**)&hbuf,batch*max_row,cudaHostAllocDefault),"pin staging",err)){std::fprintf(stderr,"%s\n",err.c_str());return 1;}
+        for(int b=0;b<pin_layers;++b){
+            const size_t row=g_row[(size_t)b].blob_bytes;
+            const size_t gu=K::native_mmvq_weight_bytes(types[(size_t)b].first,N_EMBD,FF);
+            const size_t down=K::native_mmvq_weight_bytes(types[(size_t)b].second,FF,N_EMBD);
+            void* base=nullptr;
+            if(!check(cudaMalloc(&base,row*(size_t)N_EXPERT),"pinned layer",err)){std::fprintf(stderr,"%s\n",err.c_str());return 1;}
+            cache.pinned[(size_t)b]=base;cache.pinned_stride[(size_t)b]=row;
+            for(int e0=0;e0<N_EXPERT;e0+=(int)batch){
+                const int n=std::min<int>((int)batch,N_EXPERT-e0);
+                for(int j=0;j<n;++j)if(!read_row(b,e0+j,gu,down,hbuf+(size_t)j*row,err)){std::fprintf(stderr,"%s\n",err.c_str());return 1;}
+                if(!check(cudaMemcpyAsync((uint8_t*)base+(size_t)e0*row,hbuf,(size_t)n*row,cudaMemcpyHostToDevice,cache.stream),"pin upload",err)){std::fprintf(stderr,"%s\n",err.c_str());return 1;}
+                if(!check(cudaStreamSynchronize(cache.stream),"pin sync",err)){std::fprintf(stderr,"%s\n",err.c_str());return 1;}
+            }
+            if((b+1)%8==0||b+1==pin_layers)std::printf("  pinned %d/%d layers\n",b+1,pin_layers);
+        }
+        cudaFreeHost(hbuf);
+        std::printf("  pinned residency: %d layers, %.1f GB, in %.0f s; dynamic LRU gets %.1f GB\n",pin_layers,(double)pinned_bytes/1073741824.0,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now()-p0).count(),(double)(total_bytes-pinned_bytes)/1073741824.0);
+        std::fflush(stdout);
+    }
     std::vector<float> logits(vocab); int pos=0;
     // Per-phase attribution (STRATA_KOLIBRI_PROFILE=1): which phase actually owns the per-token time.
     // `pre` includes waiting on the PREVIOUS layer's post graph, because the sync that ends a layer
@@ -369,7 +418,7 @@ int main(int argc,char** argv){
         if(prof){ms_head+=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-h0).count();++prof_tokens;}
         return true;
     };
-    std::printf("INFO architecture=kolibri1 execution=cuda_graph expert_cache=gpu_lru cache_gb=%.2f vocab=%d layers=%d\n",cache_gb,vocab,n_layers);std::printf("READY %d\n",max_context);std::fflush(stdout);
+    std::printf("INFO architecture=kolibri1 execution=cuda_graph expert_cache=gpu_lru cache_gb=%.2f pinned_layers=%d vocab=%d layers=%d\n",cache_gb,pin_layers,vocab,n_layers);std::printf("READY %d\n",max_context);std::fflush(stdout);
 
     // ---- --prefill: warm the row cache with a long prompt, no oracle comparison needed.  This is
     // the apples-to-apples setup against a llama-benchy/llama.cpp tg run, which always measures
