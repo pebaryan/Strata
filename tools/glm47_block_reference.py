@@ -138,6 +138,112 @@ def write_fixture(path, mla_w, attn_norm_w, ffn_norm_w, moe_m, cases):
                 fh.write(np.ascontiguousarray(c[nm], np.float32).tobytes())
 
 
+DENSE_FF = 10240   # block 0's feed_forward_length (the dense stem)
+
+
+def dense_forward(x, mla_w, attn_norm_w, ffn_norm_w, wg, wu, wd, cache_latent, cache_kpe, pos):
+    """Block 0's stem: the same shell, but the FFN is a plain parallel-SiLU FFN (ff 10240), no router."""
+    xb = rms_norm(x, attn_norm_w).astype(np.float32)
+    attn = MLA.mla_forward(mla_w, xb, cache_latent, cache_kpe, pos, FREQ_BASE)["out"]
+    x2 = x.astype(np.float64) + attn
+    ff = rms_norm(x2.astype(np.float32), ffn_norm_w)
+    ffn = MOE.expert_ffn(wg, wu, wd, ff.astype(np.float32))
+    return {"xb": xb, "attn": attn, "x2": x2, "ff": ff, "ffn": ffn, "out": x2 + ffn}
+
+
+def write_dense_fixture(path, mla_w, attn_norm_w, ffn_norm_w, wg, wu, wd, cases):
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<II", MAGIC, FIXTURE_VERSION))
+        fh.write(struct.pack("<10i", N_EMBD, N_HEAD, HEAD_DIM, KV_LORA, Q_LORA, N_ROT,
+                             0, 0, DENSE_FF, len(cases)))     # n_expert 0 == the dense stem
+        fh.write(struct.pack("<2f", FREQ_BASE, EPS))
+        for k in ("wq_a", "q_a_norm", "wq_b", "wk_b", "kv_a", "kv_a_norm", "wv_b", "wo"):
+            fh.write(np.ascontiguousarray(mla_w[k], np.float32).tobytes())
+        fh.write(np.ascontiguousarray(attn_norm_w, np.float32).tobytes())
+        fh.write(np.ascontiguousarray(ffn_norm_w, np.float32).tobytes())
+        for t in (wg, wu, wd):
+            fh.write(np.ascontiguousarray(t, np.float32).tobytes())
+        for c in cases:
+            fh.write(struct.pack("<2i", int(c["pos"]), int(c["cache_latent"].shape[0])))
+            fh.write(np.ascontiguousarray(c["x"], np.float32).tobytes())
+            fh.write(np.ascontiguousarray(c["cache_latent"], np.float32).tobytes())
+            fh.write(np.ascontiguousarray(c["cache_kpe"], np.float32).tobytes())
+            for nm in ("xb", "attn", "x2", "ff", "ffn", "out"):
+                fh.write(np.ascontiguousarray(c[nm], np.float32).tobytes())
+
+
+def gguf_tensor_reader(gguf):
+    """A `name -> float32 array` reader straight from the GGUF, for tensors the MoE model object does
+    not carry (block 0 has no ffn_gate_inp / exp_probs_b, so GGUFModel refuses it)."""
+    sys.path.insert(0, str(HERE))
+    import iq_pack as P
+    from _paths import add_gguf_py
+    add_gguf_py()
+    from gguf import GGMLQuantizationType as Q, quants
+    m = P.Model(pathlib.Path(gguf))
+
+    def read(name):
+        g, t, mm, _ = m.where[name]
+        raw = np.asarray(P.tensor_bytes(mm, g, t))
+        return np.asarray(quants.dequantize(raw, Q[t.type_name]), dtype=np.float32).reshape(
+            tuple(int(d) for d in reversed(t.shape)))
+    return read
+
+
+def dense_main(a):
+    if a.gguf:
+        gg = pathlib.Path(a.gguf)
+        mla_w = MLA.load_real_weights(gg, 0)
+        rd = gguf_tensor_reader(gg)
+        attn_norm_w = rd("blk.0.attn_norm.weight")
+        ffn_norm_w = rd("blk.0.ffn_norm.weight")
+        wg = rd("blk.0.ffn_gate.weight")
+        wu = rd("blk.0.ffn_up.weight")
+        wd = rd("blk.0.ffn_down.weight")
+        src = f"REAL weights block 0 of {a.gguf}"
+    else:
+        rng = np.random.default_rng(a.seed)
+        mla_w = MLA.random_weights(rng)
+        attn_norm_w = (1.0 + 0.1 * rng.standard_normal(N_EMBD)).astype(np.float32)
+        ffn_norm_w = (1.0 + 0.1 * rng.standard_normal(N_EMBD)).astype(np.float32)
+        def rw(shape, fan):
+            return (rng.standard_normal(shape) / np.sqrt(fan)).astype(np.float32)
+        wg = rw((DENSE_FF, N_EMBD), N_EMBD)
+        wu = rw((DENSE_FF, N_EMBD), N_EMBD)
+        wd = rw((N_EMBD, DENSE_FF), DENSE_FF)
+        src = f"seeded random weights (seed {a.seed})"
+    print(f"glm47 dense-stem reference: {src}")
+    print(f"  block 0 = attn_norm -> MLA -> +x -> ffn_norm -> dense FFN (ff {DENSE_FF}) -> +x ; eps {EPS:g}")
+    specs = [(a.tokens, None), (1, 0), (5, 4)]
+    cases = []
+    for i in range(a.cases):
+        rng = np.random.default_rng(a.seed + 1000 + i)
+        nc, pos = specs[min(i, len(specs) - 1)]
+        p = (nc - 1) if pos is None else pos
+        hist_lat = rng.standard_normal((nc - 1, KV_LORA)).astype(np.float32)
+        hist_kpe = rng.standard_normal((nc - 1, N_ROT)).astype(np.float32)
+        x = rng.standard_normal(N_EMBD).astype(np.float32)
+        xb = rms_norm(x, attn_norm_w).astype(np.float32)
+        z = np.zeros((1, KV_LORA), np.float32)
+        zk = np.zeros((1, N_ROT), np.float32)
+        s1 = MLA.mla_forward(mla_w, xb, np.vstack([hist_lat, z]), np.vstack([hist_kpe, zk]), p, FREQ_BASE)
+        cl = np.vstack([hist_lat, s1["kv"].astype(np.float32)])
+        ck = np.vstack([hist_kpe, s1["k_pe"].astype(np.float32)])
+        st = dense_forward(x, mla_w, attn_norm_w, ffn_norm_w, wg, wu, wd, cl, ck, p)
+        st.update({"x": x, "cache_latent": cl, "cache_kpe": ck, "pos": p})
+        cases.append(st)
+    if a.selftest:
+        c = cases[0]
+        print(f"  case0 n_cache {c['cache_latent'].shape[0]} pos {c['pos']}  |attn| "
+              f"{np.linalg.norm(c['attn']):.4f}  |ffn| {np.linalg.norm(c['ffn']):.4f}  "
+              f"|out| {np.linalg.norm(c['out']):.4f}")
+    if a.raw_fixture:
+        write_dense_fixture(pathlib.Path(a.raw_fixture), mla_w, attn_norm_w, ffn_norm_w, wg, wu, wd, cases)
+        sz = pathlib.Path(a.raw_fixture).stat().st_size
+        print(f"wrote raw dense fixture {a.raw_fixture}: {len(cases)} cases, {sz/1e6:.1f} MB")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--raw-fixture")
@@ -147,7 +253,12 @@ def main() -> int:
     ap.add_argument("--cases", type=int, default=3)
     ap.add_argument("--tokens", type=int, default=7)
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--dense", action="store_true",
+                    help="block 0, the leading dense stem: a plain FFN (ff 10240), no router")
     a = ap.parse_args()
+
+    if a.dense:
+        return dense_main(a)
 
     if a.gguf:
         mla_w, attn_norm_w, ffn_norm_w, moe_m = real_block(pathlib.Path(a.gguf), a.layer)
