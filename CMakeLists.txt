@@ -197,6 +197,13 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(glm47_mla_parity PRIVATE strata_kernels CUDA::cudart)
 endif()
 
+# GLM-4.7-Flash router/MoE parity (branch glm47-port): the deepseek2 SIGMOID router (sigmoid then
+# +exp_probs_b, selection on the biased probs, weights from the unbiased ones, normalise then 1.8-scale)
+# and the shared-expert combine, against tools/glm47_moe_reference.py.  Host-only, like the MLA gate.
+add_executable(glm47_moe_parity src/kernels/glm47_moe_parity.cpp src/kernels/glm_moe.cpp)
+target_include_directories(glm47_moe_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm47_moe_parity PRIVATE -O2)
+
 # Indexer parity (branch glm5next-port): the 4:1 key pool and the whole-pool selection, against
 # tools/glm5_indexer_reference.py.
 add_executable(glm_indexer_parity src/kernels/glm_indexer_parity.cpp src/kernels/glm_indexer.cpp)

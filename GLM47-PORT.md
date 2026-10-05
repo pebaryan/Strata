@@ -60,7 +60,7 @@ Per-block wiring: `attn_norm → MLA → +x → ffn_norm → MoE → +x`. Block 
    one to gate first, because a wrong rope slice/order is silent).
 2. **MLA geometry** — 20 heads, `q_lora` 768 threaded through the packing + binding + kernel geometry.
 3. **Router/MoE geometry** — `n_expert 64`, `n_used 4`, `ff 1536`, `w_scale 1.8`, `norm true`,
-   `clamp_exp`/`clamp_shexp` 0 (no clamp key). Confirm the gating mode from the oracle before gating.
+   `clamp_exp`/`clamp_shexp` 0 (no clamp key). Gating mode SETTLED (phase 4): SIGMOID, sigmoid-then-bias.
 4. **Arch guard + geometry** — accept `deepseek2`; vocab 154880; refuse everything else precisely.
 5. **Packer** — `tools/glm47_pack.py`: all-MLA, dense stem block 0, 46 MoE blocks; gate/up are separate
    expert tensors (the Kolibri cut), down is per-layer Q4_K/Q6_K (the mixed-down table already exists).
@@ -83,7 +83,7 @@ gate below, exactly as llama.cpp's GLM5-Next graph was for phases 8-9 of the GLM
 | 1 ✅ | packer (`tools/glm47_pack.py`) | **PASSED** — `strata-load --layout --layout-layers 47`: 47 layers, 64 experts/layer, first expert block 1, 16.77 GB, dense stem block 0, Q4_K/Q6_K down mix |
 | 2 ✅ | arch guard + geometry (`deepseek2`) | **PASSED** — `strata-gguf <gguf> --glm47` reports 47 blocks / 47 MLA / 64 experts / rope 64 and accepts the artifact; a non-deepseek2 file refuses (`architecture is 'gpt-oss', expected 'deepseek2'`) |
 | 3 ✅ | MLA parity (incl. the new rope) | **PASSED** — `glm47_mla_parity` vs `tools/glm47_mla_reference.py`: all 9 stages (qr, q_nope, q_pe-after-rope, kv, k_pe-after-rope, Qcur, attn, v, out) under 1e-4 over 5 cases (depths 1–33, pos 0–4000); worst stage max abs 8.0e-06 |
-| 4 | router/MoE parity | routing ids+weights for random hidden states match the oracle (ids exact) |
+| 4 ✅ | router/MoE parity | **PASSED** — `glm47_moe_parity` vs `tools/glm47_moe_reference.py` (both gating tasks): top-4 ids EXACT on all 3 cases, weights 5.96e-08 (<1e-5), probs 1.25e-06, moe 3.58e-06 / shexp 1.61e-06 / out 3.96e-06 (<1e-4), over the model's REAL layer-1 `ffn_gate_inp` + `exp_probs_b` + experts; teeth 3/3 (ids flip without the bias and under bias-then-sigmoid) |
 | 5 | trunk + end-to-end | 64/64 greedy tokens identical to the oracle on a fixed prompt |
 | 6 | serving | `/v1/chat/completions` returns a valid response through the exported tokenizer |
 
@@ -93,9 +93,18 @@ gate below, exactly as llama.cpp's GLM5-Next graph was for phases 8-9 of the GLM
   roped `q[..., 192:256]`; `wkv_a_mqa` yields `kv_cmpr = [0:512]` (rms-normed, the latent) and `k_pe = [512:576]`
   (roped, one head). NEOX rope, theta_i = pos·freq_base^(-2i/64); kq_scale 1/16. The C++ path is verified
   against the float64 oracle stage by stage, so the layout is anchored to the reference, not the paper.
-- **Router gating mode** — `expert_gating_func` is absent from the header. GLM-5.3 is sigmoid-then-bias
-  (`SIGMOID`, selection on `sigmoid(logits)+bias`); Kolibri is bias-then-sigmoid. Establish GLM-4.7's
-  from the oracle *before* phase 4.
+- **Router gating mode — SETTLED (phase 4): `SIGMOID`, i.e. sigmoid-then-bias.** The artifact has no
+  `deepseek2.expert_gating_func` key, and `src/models/deepseek2.cpp:22-32`'s fallback maps
+  (`n_layer` 47, `n_vocab` 154880) → `LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID`. In `build_moe_ffn`
+  (`src/llama-graph.cpp:2064-2094`) the SIGMOID branch is `probs = sigmoid(logits)`, then
+  `selection_probs = probs + exp_probs_b` — the bias is added **AFTER** the sigmoid, selection is on the
+  **biased** probs, and the weights are gathered from the **unbiased** `sigmoid(logits)`, normalised,
+  then ×1.8. This is *not* Kolibri's own `SIGMOID_LOGIT_ADD` variant (`selection_probs = logits +
+  exp_probs_b`, i.e. bias-then-sigmoid), reserved for other models by the `:2085` branch. `glm_moe.hpp/cpp`
+  already implements exactly the SIGMOID order, so phase 4 reused it unmodified; the gate proves the
+  fixture distinguishes the two orders (all 3 cases change ids under bias-then-sigmoid) and that the bias
+  drives selection (all 3 change ids when it is dropped). Its magnitude is real: `exp_probs_b` ≈ 9.03 on
+  layer 1.
 - **F32 routers** — refuse unless the F32 values are exactly BF16, or narrow with `--compat-bf16` (the
   same policy as qwen4exp/glm5next); check id-identity, not just weight tolerance.
 - **Mixed down-quant** — down mixes Q4_K and Q6_K per layer; the table supports it but the CUDA grouped
