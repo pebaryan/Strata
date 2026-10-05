@@ -220,6 +220,7 @@ int main(int argc, char** argv) {
     std::string tokens;
     int n_layer = N_LAYER, verbosity = 1, gen = 1;
     bool bind_only = false, use_device = true, warm = false, dev_experts = true;
+    int selftest_attn = 0;
     size_t exp_budget = 6ull << 30;   // device bytes for resident expert rows (sized to the free VRAM)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--gguf") && i + 1 < argc) gguf = argv[++i];
@@ -230,6 +231,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--gen") && i + 1 < argc) gen = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--quiet")) verbosity = 0;
         else if (!std::strcmp(argv[i], "--cpu")) use_device = false;
+        else if (!std::strcmp(argv[i], "--selftest-attn") && i + 1 < argc) selftest_attn = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--warm")) warm = true;
         else if (!std::strcmp(argv[i], "--dev-experts")) dev_experts = true;
         else if (!std::strcmp(argv[i], "--no-dev-experts")) dev_experts = false;
@@ -465,6 +467,56 @@ int main(int argc, char** argv) {
         ++feed_n;
         return ok;
     };
+
+    // --selftest-attn N: grow a synthetic cache one row at a time to depth N and compare the device
+    // decoupled-RoPE attention against the host loop at every depth.  The incremental resident-cache upload's
+    // boundary (past the previous depth) is exactly where the engine's nope path once attended to stale rows,
+    // so this exercises it directly without paying for a real long-context prefill.
+    if (selftest_attn > 0) {
+        const int D = selftest_attn, H = N_HEAD, KL = KV_LORA, NR = N_ROT, stride = KL + NR;
+        auto rng = [](int i) { return (float) std::sin(0.6 * (double) i + 1.1); };
+        std::vector<float> qc((size_t) H * KL), qp((size_t) H * NR), ca((size_t) D * stride);
+        std::vector<float> hh((size_t) H * KL), dd((size_t) H * KL), sc((size_t) D);
+        for (size_t i = 0; i < qc.size(); ++i) qc[i] = rng((int) i);
+        for (size_t i = 0; i < qp.size(); ++i) qp[i] = rng((int) i + 7919);
+        for (size_t i = 0; i < ca.size(); ++i) ca[i] = rng((int) i + 104729) * 0.3f;
+        const float scale = 1.0f / std::sqrt((float) HEAD_DIM);
+        double worst = 0.0; int worst_d = 0;
+        for (int d = 1; d <= D; ++d) {
+            for (int h = 0; h < H; ++h) {
+                const float* Qh = qc.data() + (size_t) h * KL;
+                const float* pe = qp.data() + (size_t) h * NR;
+                float best = -INFINITY;
+                for (int t = 0; t < d; ++t) {
+                    const float* kt = ca.data() + (size_t) t * stride;
+                    const float* pt = kt + KL;
+                    float acc = 0.0f;
+                    for (int i = 0; i < KL; ++i) acc += Qh[i] * kt[i];
+                    for (int i = 0; i < NR; ++i) acc += pe[i] * pt[i];
+                    sc[(size_t) t] = acc * scale;
+                    if (sc[(size_t) t] > best) best = sc[(size_t) t];
+                }
+                double sum = 0.0;
+                for (int t = 0; t < d; ++t) { sc[(size_t) t] = std::exp(sc[(size_t) t] - best); sum += sc[(size_t) t]; }
+                float* Ah = hh.data() + (size_t) h * KL;
+                for (int i = 0; i < KL; ++i) Ah[i] = 0.0f;
+                for (int t = 0; t < d; ++t) {
+                    const float p = (float) (sc[(size_t) t] / sum);
+                    const float* kt = ca.data() + (size_t) t * stride;
+                    for (int i = 0; i < KL; ++i) Ah[i] += p * kt[i];
+                }
+            }
+            char e[256] = {};
+            if (!glm::mla_attention_rope_cuda(qc.data(), qp.data(), ca.data(), d, H, KL, NR, scale, dd.data(), e, sizeof(e))) {
+                std::printf("  selftest-attn: device declined at depth %d: %s\n", d, e); return 1;
+            }
+            double md = 0.0;
+            for (size_t i = 0; i < hh.size(); ++i) { const double x = std::fabs((double) hh[i] - (double) dd[i]); if (x > md) md = x; }
+            if (md > worst) { worst = md; worst_d = d; }
+        }
+        std::printf("  selftest-attn: depths 1..%d, max |host - device| = %.3e (worst at depth %d)\n", D, worst, worst_d);
+        return 0;
+    }
 
     for (size_t t = 0; t < ids.size(); ++t)
         if (!tfeed(ids[t], (int) t)) return die("trunk (prompt)") ? 0 : 1;
