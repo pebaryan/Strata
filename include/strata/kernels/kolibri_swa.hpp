@@ -37,20 +37,23 @@ inline bool swa_attends(int q, int k, int window) {
     return k <= q && (window <= 0 || q - k < window);
 }
 
-/// RoPE, theta base 10000, the ggml rope_ext default (no scaling): for head_dim d, pair (2i, 2i+1)
-/// rotates by pos * base^(-2i/d).  Applied to Q and K AFTER QK-norm, per token, per head; `heads`
-/// vectors of d floats each, stride `stride` between tokens' heads (the packed QKV layout).
+/// RoPE, theta base 10000, llama.cpp's ROPE_TYPE_NEOX as kolibri1 declares it
+/// (llama_model_rope_type: LLM_ARCH_KOLIBRI1 -> LLAMA_ROPE_TYPE_NEOX): within each head, dim i
+/// pairs with dim i + head_dim/2 (ggml's rotate_pairs(n_dims, n_dims/2) - the rotate-half
+/// convention, NOT GPT-J's interleaved (2i, 2i+1)); pair i rotates by pos * base^(-2i/d).
+/// Applied to Q and K AFTER QK-norm, per token, per head.
 inline void rope_neox(float* vec, int64_t pos, int heads, int head_dim, float theta_base,
                       int64_t stride) {
+    const int half = head_dim / 2;
     for (int h = 0; h < heads; ++h) {
         float* head = vec + (size_t) h * head_dim;
-        for (int i = 0; i < head_dim / 2; ++i) {
+        for (int i = 0; i < half; ++i) {
             const float freq = std::pow(theta_base, -2.0f * (float) i / (float) head_dim);
             const float angle = (float) pos * freq;
             const float c = std::cos(angle), s = std::sin(angle);
-            const float x0 = head[2 * i], x1 = head[2 * i + 1];
-            head[2 * i] = x0 * c - x1 * s;
-            head[2 * i + 1] = x0 * s + x1 * c;
+            const float x0 = head[i], x1 = head[i + half];
+            head[i] = x0 * c - x1 * s;
+            head[i + half] = x0 * s + x1 * c;
         }
         (void) stride;
     }

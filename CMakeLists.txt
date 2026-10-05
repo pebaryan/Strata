@@ -1146,6 +1146,11 @@ target_include_directories(kolibri_guard_gate PRIVATE ${CMAKE_SOURCE_DIR}/includ
 add_executable(kolibri_trunk_gate tools/kolibri_trunk_gate.cpp src/kernels/glm_moe.cpp)
 target_include_directories(kolibri_trunk_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+# kolibri_multitoken_gate (branch kolibri-port): phase 6b - the trunk over a real prompt (RoPE at
+# nonzero positions, causal KV, GQA), logits at the last position vs the oracle's dump.
+add_executable(kolibri_multitoken_gate tools/kolibri_multitoken_gate.cpp src/kernels/glm_moe.cpp)
+target_include_directories(kolibri_multitoken_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 # glm45_run (branch glm5next-port): THE PORT'S LAST STEP.  The engine's own 45-block trunk, from the pack,
 # ending in a token.  The acceptance test is argmax == 12089, not a per-layer float match, because the
 # engine accumulates the quantization of 43 routed blocks (~5% of rms worst element, measured).
