@@ -146,6 +146,96 @@ bool mla_attention_cuda(const float* qcur,const float* cache,int n_cache,int n_h
     if(error&&error_capacity)error[0]='\0';return true;
 }
 
+// ---- the decoupled-RoPE MLA attention on the device ----
+// The nope-only kernel above assumes cache rows of `kv_lora` floats and no positional term.  GLM-4.7's rows
+// carry the roped k_pe after the latent (stride = kv_lora + n_rot) and the score adds q_pe . k_pe.  This is
+// the same kernel with that term, so the host scores/softmax/PV loop - the last host-only stage of the MLA -
+// can run on the device, gated on cache depth exactly like the nope path.
+namespace {
+struct RopeAttnScratch {
+    struct ResidentCache { float* device=nullptr; size_t capacity=0; int last_n=0; };
+    float *q=nullptr,*qpe=nullptr,*attn=nullptr,*scores=nullptr;
+    size_t q_cap=0,qpe_cap=0,attn_cap=0,scores_cap=0;
+    std::unordered_map<const float*,ResidentCache> resident_caches;
+    std::mutex mutex;
+    ~RopeAttnScratch(){cudaFree(q);cudaFree(qpe);cudaFree(attn);cudaFree(scores);
+                       for(auto& kv:resident_caches)cudaFree(kv.second.device);}
+    bool reserve(float*& p,size_t& cap,size_t n){
+        if(n<=cap)return true;cudaFree(p);p=nullptr;
+        if(cudaMalloc(&p,n*sizeof(float))!=cudaSuccess)return false;cap=n;return true;}
+};
+RopeAttnScratch& rope_attn_scratch(){static RopeAttnScratch s;return s;}
+
+__global__ void mla_latent_attention_rope(const float* q,const float* qpe,const float* cache,int n_cache,
+                                          int kv_lora,int n_rot,float scale,float* scores,float* out){
+    const int h=(int)blockIdx.x,tid=(int)threadIdx.x;
+    __shared__ float reduce[256];
+    const int stride=kv_lora+n_rot;
+    const float* qh=q+(size_t)h*kv_lora;
+    const float* ph=qpe+(size_t)h*n_rot;
+    float local_max=-1.0e30f;
+    for(int t=tid;t<n_cache;t+=blockDim.x){
+        const float* kt=cache+(size_t)t*stride;const float* pt=kt+kv_lora;float dot=0.0f;
+        for(int i=0;i<kv_lora;++i)dot=fmaf(qh[i],kt[i],dot);
+        for(int i=0;i<n_rot;++i)dot=fmaf(ph[i],pt[i],dot);
+        const float s=dot*scale;scores[(size_t)h*n_cache+t]=s;local_max=fmaxf(local_max,s);
+    }
+    reduce[tid]=local_max;__syncthreads();
+    for(int step=blockDim.x/2;step>0;step>>=1){if(tid<step)reduce[tid]=fmaxf(reduce[tid],reduce[tid+step]);__syncthreads();}
+    const float max_score=reduce[0];float local_sum=0.0f;
+    for(int t=tid;t<n_cache;t+=blockDim.x){
+        float p=expf(scores[(size_t)h*n_cache+t]-max_score);scores[(size_t)h*n_cache+t]=p;local_sum+=p;}
+    reduce[tid]=local_sum;__syncthreads();
+    for(int step=blockDim.x/2;step>0;step>>=1){if(tid<step)reduce[tid]+=reduce[tid+step];__syncthreads();}
+    const float denom=reduce[0];
+    for(int i=tid;i<kv_lora;i+=blockDim.x){
+        float acc=0.0f;
+        for(int t=0;t<n_cache;++t)acc=fmaf(scores[(size_t)h*n_cache+t],cache[(size_t)t*stride+i],acc);
+        out[(size_t)h*kv_lora+i]=acc/denom;
+    }
+}
+}  // namespace
+
+bool mla_attention_rope_cuda(const float* qcur,const float* qpe,const float* cache,int n_cache,int n_head,
+                             int kv_lora,int n_rot,float scale,float* attn,char* error,size_t error_capacity){
+    auto fail=[&](const char* msg){if(error&&error_capacity)std::snprintf(error,error_capacity,"%s",msg);return false;};
+    if(!qcur||!qpe||!cache||!attn||n_cache<1||n_cache>8192||n_head<1||kv_lora<1||n_rot<1)
+        return fail("invalid MLA rope attention geometry or pointers");
+    const int stride=kv_lora+n_rot;
+    RopeAttnScratch& s=rope_attn_scratch();std::lock_guard<std::mutex> lock(s.mutex);
+    const size_t qn=(size_t)n_head*kv_lora,pn=(size_t)n_head*n_rot,cn=(size_t)n_cache*stride,on=qn,sn=(size_t)n_head*n_cache;
+    if(!s.reserve(s.q,s.q_cap,qn)||!s.reserve(s.qpe,s.qpe_cap,pn)||!s.reserve(s.attn,s.attn_cap,on)||
+       !s.reserve(s.scores,s.scores_cap,sn))return fail("MLA rope attention scratch allocation failed");
+    auto it=s.resident_caches.find(cache);
+    bool full_upload=false;
+    if(it==s.resident_caches.end()){
+        RopeAttnScratch::ResidentCache entry;size_t cap=1;while(cap<cn)cap*=2;
+        if(cudaMalloc(&entry.device,cap*sizeof(float))!=cudaSuccess)return fail("MLA rope resident cache allocation failed");
+        entry.capacity=cap;entry.last_n=0;
+        it=s.resident_caches.emplace(cache,entry).first;
+        full_upload=true;
+    }else if(cn>it->second.capacity){
+        size_t cap=it->second.capacity?it->second.capacity:1;while(cap<cn)cap*=2;
+        float* grown=nullptr;
+        if(cudaMalloc(&grown,cap*sizeof(float))!=cudaSuccess)return fail("MLA rope resident cache growth failed");
+        cudaFree(it->second.device);it->second.device=grown;it->second.capacity=cap;it->second.last_n=0;
+        full_upload=true;
+    }else if(n_cache!=it->second.last_n+1){full_upload=true;}
+    cudaError_t e=cudaMemcpy(s.q,qcur,qn*sizeof(float),cudaMemcpyHostToDevice);
+    if(e==cudaSuccess)e=cudaMemcpy(s.qpe,qpe,pn*sizeof(float),cudaMemcpyHostToDevice);
+    if(e==cudaSuccess){
+        const size_t first=full_upload?0:(size_t)it->second.last_n*(size_t)stride;
+        const size_t count=full_upload?cn:(size_t)stride;
+        e=cudaMemcpy(it->second.device+first,cache+first,count*sizeof(float),cudaMemcpyHostToDevice);
+    }
+    if(e!=cudaSuccess)return fail(cudaGetErrorString(e));
+    it->second.last_n=n_cache;
+    mla_latent_attention_rope<<<n_head,256>>>(s.q,s.qpe,it->second.device,n_cache,kv_lora,n_rot,scale,s.scores,s.attn);
+    if((e=cudaGetLastError())!=cudaSuccess||(e=cudaDeviceSynchronize())!=cudaSuccess)return fail(cudaGetErrorString(e));
+    if((e=cudaMemcpy(attn,s.attn,on*sizeof(float),cudaMemcpyDeviceToHost))!=cudaSuccess)return fail(cudaGetErrorString(e));
+    if(error&&error_capacity)error[0]='\0';return true;
+}
+
 // ---- batched (prompt-chunk) MLA: absorb -> causal latent attention -> un-absorb, all tokens at once, on the device ----
 
 namespace {

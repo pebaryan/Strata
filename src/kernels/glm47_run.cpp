@@ -306,6 +306,7 @@ int main(int argc, char** argv) {
     if (use_device && n_dev_proj > 0) glm::mla_set_native_project(glm::glm47_native_project);
     // and the decoupled-RoPE attention's K-absorb / V-un-absorb head-matvecs on the device
     if (use_device && n_dev_proj > 0) glm::mla_set_rope_head_cuda(true);
+    if (use_device) glm::mla_set_rope_attention_cuda(true);
     // install the native GLU: the shared expert runs on the device too
     if (use_device && n_dev_shexp > 0) cglm::glm_set_native_ffn(glm::glm47_native_ffn);
     // install the routed-expert device path (native_mmvq over resident rows - the engine's own expert guard
@@ -430,6 +431,10 @@ int main(int argc, char** argv) {
         if (eh || em) std::printf("  expert rows on the device: %llu hits / %llu misses (%llu evicted), %.2f GiB\n",
                                   (unsigned long long) eh, (unsigned long long) em, (unsigned long long) ee,
                                   (double) eb / 1073741824.0);
+        double mp = 0, ma = 0, msx = 0, mu = 0, mw = 0;
+        glm::mla_stage_ms(&mp, &ma, &msx, &mu, &mw);
+        std::printf("  mla stages: proj %.0f | absorb %.0f | scores+softmax %.0f | unabsorb %.0f | wo %.0f ms\n",
+                    mp, ma, msx, mu, mw);
     }
     std::printf("  top-5 (last):");
     for (int i = 0; i < 5; ++i) std::printf(" %d(%.3f)", order[(size_t) i], (double) logits[(size_t) order[(size_t) i]]);

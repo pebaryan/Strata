@@ -99,6 +99,14 @@ void mla_set_device_attention(bool enabled);
 /// Run the decoupled-RoPE graph's K-absorb (wk_b) and V-un-absorb (wv_b) head-matvecs on the device kernel
 /// (falls back to the host loop per call if the kernel declines).  GLM-4.7's attention is otherwise host-only.
 void mla_set_rope_head_cuda(bool enabled);
+/// Run the decoupled-RoPE attention (scores/softmax/PV) on the device, so the MLA has no host-only stage.
+void mla_set_rope_attention_cuda(bool enabled);
+/// The device decoupled-RoPE attention: attn[h] = softmax((Qcur[h].latent + q_pe[h].kpe)*scale) . latent.
+bool mla_attention_rope_cuda(const float* qcur, const float* qpe, const float* cache, int n_cache, int n_head,
+                             int kv_lora, int n_rot, float scale, float* attn, char* error, size_t error_capacity);
+/// The MLA's own stage timers (ms, cumulative): the projections, the K-absorb, the host scores/softmax/PV
+/// loop, the V-un-absorb, and the output projection.  So "mla" stops being one opaque number.
+void mla_stage_ms(double* proj, double* absorb, double* scores, double* unabsorb, double* wo);
 bool mla_attention_cuda(const float* qcur, const float* cache, int n_cache, int n_head, int head_dim, int kv_lora,
                         float* attn, char* error, size_t error_capacity);
 

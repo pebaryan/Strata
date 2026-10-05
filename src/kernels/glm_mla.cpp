@@ -5,6 +5,7 @@
 #include "strata/kernels/glm_indexer_device.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -19,6 +20,14 @@ bool g_device_attention = false;
 // wv_b: [n_head][head_dim][kv_lora]); when set, mla_forward_rope runs them on the device kernel and falls
 // back to the host loop if the kernel declines.  This is the GLM-4.7 path's missing device work.
 bool g_rope_head_cuda = false;
+bool g_rope_attn_cuda = false;
+// Stage timers for the MLA, so "attention" stops being one opaque number: the projections, the K-absorb,
+// the host scores/softmax/PV loop, the V-un-absorb and the output projection are each timed here.
+double g_mla_proj_ms = 0, g_mla_absorb_ms = 0, g_mla_scores_ms = 0, g_mla_unabsorb_ms = 0, g_mla_wo_ms = 0;
+double mnow_ms() {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 // The V100 launch/copy overhead exceeds the host loop at short cache depths. Keep the measured default, while
 // allowing a controlled A/B threshold without rebuilding the persistent serving process.
 int mla_cuda_min_cache() {
@@ -68,6 +77,7 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
     const int stride = kv_lora + n_rot;   // one cache row: latent then roped k_pe
     if (pos < 0) pos = n_cache - 1;
 
+    const double tp0 = mnow_ms();
     std::vector<float> qr((size_t) q_lora, 0.0f);
     bool qr_done = false;
     if (g_native_project != nullptr && w.wq_a_type != 0) {
@@ -131,10 +141,12 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
     rope_neox_inplace(k_pe.data(), n_rot, pos, w.rope_freq_base);
     if (want.kv) std::copy(kv.begin(), kv.end(), want.kv);
     if (want.k_pe) std::copy(k_pe.begin(), k_pe.end(), want.k_pe);
+    g_mla_proj_ms += mnow_ms() - tp0;
     if (want.kv_only) return;   // the caller only wanted the new cache row
 
     // Qcur[h] = wk_b[h] (kv_lora x nope) @ q_nope[h].  wk_b is [n_head][kv_lora][nope] and q_nope is
     // [n_head][nope], which is exactly the head-matvec kernel's [n_head][rows][cols] @ [n_head][cols].
+    const double ta0 = mnow_ms();
     std::vector<float> qcur((size_t) n_head * kv_lora, 0.0f);
     bool absorb_done = false;
     if (g_rope_head_cuda) {
@@ -155,12 +167,23 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
         }
     }
     if (want.qcur) std::copy(qcur.begin(), qcur.end(), want.qcur);
+    g_mla_absorb_ms += mnow_ms() - ta0;
 
     // decoupled attention: score[h][t] = (Qcur[h] . latent_t + q_pe[h] . kpe_t) * kq_scale, V = latent
+    const double ts0 = mnow_ms();
     const float kq_scale = 1.0f / std::sqrt((float) head_dim);
     std::vector<float> attn((size_t) n_head * kv_lora, 0.0f);
     std::vector<float> scores((size_t) (n_cache > 0 ? n_cache : 1), 0.0f);
-    for (int h = 0; h < n_head; ++h) {
+    // On the device when it is worth a launch: the same gate the nope path uses, so a short cache stays on
+    // the host loop where the work is smaller than the copy.  Falls back to the host loop on any decline.
+    bool scores_done = false;
+    if (g_rope_attn_cuda && n_cache >= mla_cuda_min_cache()) {
+        char cuda_err[256] = {};
+        scores_done = mla_attention_rope_cuda(qcur.data(), q_pe.data(), cache, n_cache, n_head, kv_lora, n_rot,
+                                              kq_scale, attn.data(), cuda_err, sizeof(cuda_err));
+        if (!scores_done) std::fprintf(stderr, "GLM MLA rope attention unavailable: %s; using host\n", cuda_err);
+    }
+    for (int h = 0; !scores_done && h < n_head; ++h) {
         const float* Qh = qcur.data() + (size_t) h * kv_lora;
         const float* pe = q_pe.data() + (size_t) h * n_rot;
         float best = -INFINITY;
@@ -186,8 +209,10 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
         }
     }
     if (want.attn) std::copy(attn.begin(), attn.end(), want.attn);
+    g_mla_scores_ms += mnow_ms() - ts0;
 
     // v[h] = wv_b[h] @ attn[h]; out = wo @ concat(v).  wv_b is [n_head][head_dim][kv_lora], attn is [n_head][kv_lora].
+    const double tu0 = mnow_ms();
     std::vector<float> v((size_t) q_dim, 0.0f);
     bool unabsorb_done = false;
     if (g_rope_head_cuda) {
@@ -208,6 +233,8 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
         }
     }
     if (want.v) std::copy(v.begin(), v.end(), want.v);
+    g_mla_unabsorb_ms += mnow_ms() - tu0;
+    const double tw0 = mnow_ms();
     bool wo_done = false;
     if (g_native_project != nullptr && w.wo_type != 0) {
         const void* nw[1] = {w.wo};
@@ -221,6 +248,7 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
         for (int i = 0; i < q_dim; ++i) acc += row[i] * v[(size_t) i];
         out[e] = acc;
     }
+    g_mla_wo_ms += mnow_ms() - tw0;
 }
 
 }  // namespace
@@ -235,6 +263,14 @@ void mla_set_native_project(MlaNativeProjectFn fn) { g_native_project = fn; }
 void mla_set_device_attention(bool enabled) { g_device_attention = enabled; }
 void mla_set_native_project_batch(MlaNativeProjectBatchFn fn) { g_native_project_batch = fn; }
 void mla_set_rope_head_cuda(bool enabled) { g_rope_head_cuda = enabled; }
+void mla_set_rope_attention_cuda(bool enabled) { g_rope_attn_cuda = enabled; }
+void mla_stage_ms(double* proj, double* absorb, double* scores, double* unabsorb, double* wo) {
+    if (proj) *proj = g_mla_proj_ms;
+    if (absorb) *absorb = g_mla_absorb_ms;
+    if (scores) *scores = g_mla_scores_ms;
+    if (unabsorb) *unabsorb = g_mla_unabsorb_ms;
+    if (wo) *wo = g_mla_wo_ms;
+}
 void mla_set_parallel_for(MlaParallelFor fn) { g_parallel_for = fn; }
 
 #if !defined(STRATA_ENABLE_CUDA)
