@@ -750,4 +750,99 @@ inline std::string check_glm5next_architecture(const GgufFile& g, Glm5NextGeomet
     return {};   // empty == ok
 }
 
+/// Kolibri 1's guard (branch kolibri-port): architecture, geometry and tensor agreement for
+/// Aleph Alpha's Kolibri-1 as converted by kolibri1-llama.cpp.patch.  The metadata keys are
+/// arch-prefixed (kolibri1.*) exactly as llama.cpp writes them.  Shape mirrors
+/// check_glm5next_architecture: a Kolibri1Geometry out-param, required scalars, then the two
+/// arrays cross-checked against the tensors.
+struct Kolibri1Geometry {
+    uint32_t block_count = 50;
+    uint64_t hidden = 2560, head_count = 48, head_count_kv = 4, head_dim = 128;
+    uint64_t experts = 384, experts_used = 6, shared_experts = 1, expert_ffn = 512, shared_ffn = 512;
+    uint64_t context_length = 262144;
+    float rms_eps = 1e-6f, rope_freq_base = 10000.0f;
+    uint32_t swa_window = 513;
+    std::vector<uint8_t> swa_pattern;    // per layer: 1 = sliding (RoPE + window), 0 = full (NoPE)
+    // the tensor-derived facts the trunk needs beside the geometry
+    bool every_block_moe = true;
+    uint32_t first_moe = 0;
+};
+
+inline std::string check_kolibri1_architecture(const GgufFile& g, Kolibri1Geometry& out,
+                                               const std::set<std::string>* other_shards = nullptr) {
+    const MetaValue* arch = g.get("general.architecture");
+    if (!arch) return "missing general.architecture";
+    if (arch->s != "kolibri1") return "architecture is '" + arch->s + "', expected 'kolibri1'";
+
+    // required scalars; the trailing bool says the value must match exactly (geometry is compile-
+    // time in the kernels: 2560 % 256 == 0 and 512 % 256 == 0 are what native_fmt's block checks need)
+    struct Req { const char* key; uint64_t want; };
+    const Req reqs[] = {
+        {"kolibri1.block_count", out.block_count},
+        {"kolibri1.embedding_length", out.hidden},
+        {"kolibri1.attention.head_count", out.head_count},
+        {"kolibri1.attention.head_count_kv", out.head_count_kv},
+        {"kolibri1.attention.key_length", out.head_dim},
+        {"kolibri1.expert_count", out.experts},
+        {"kolibri1.expert_used_count", out.experts_used},
+        {"kolibri1.expert_shared_count", out.shared_experts},
+        {"kolibri1.expert_feed_forward_length", out.expert_ffn},
+        {"kolibri1.expert_shared_feed_forward_length", out.shared_ffn},
+        {"kolibri1.expert_gating_func", 5},   // SIGMOID_LOGIT_ADD; the loader asserts this too
+    };
+    for (const auto& r : reqs) {
+        const MetaValue* v = g.get(r.key);
+        if (!v) return std::string("missing ") + r.key;
+        if (v->type == MetaType::ARRAY) return std::string(r.key) + " is an array, expected a scalar";
+        if (v->u != r.want)
+            return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
+    }
+    if (const MetaValue* v = g.get("kolibri1.expert_weights_norm"); v && v->u != 0)
+        return "kolibri1.expert_weights_norm = 1; this port pins the artifact's no-renormalisation "
+               "router (weights_norm is carried in the pack manifest, not flipped in the engine)";
+    out.context_length = g.get("kolibri1.context_length") ? g.get("kolibri1.context_length")->u
+                                                          : out.context_length;
+    if (const MetaValue* v = g.get("kolibri1.attention.layer_norm_rms_epsilon")) out.rms_eps = v->f;
+    if (const MetaValue* v = g.get("kolibri1.rope.freq_base")) out.rope_freq_base = v->f;
+
+    // the SWA window and the per-layer pattern: both required (the patch's loader refuses
+    // sliding_window == 0 too), the pattern's length must be the block count
+    const MetaValue* win = g.get("kolibri1.attention.sliding_window");
+    if (!win) return "missing kolibri1.attention.sliding_window";
+    if (win->u == 0) return "kolibri1.attention.sliding_window must be > 0";
+    out.swa_window = (uint32_t) win->u;
+    const MetaValue* pat = g.get("kolibri1.attention.sliding_window_pattern");
+    if (!pat) return "missing kolibri1.attention.sliding_window_pattern";
+    if (pat->type != MetaType::ARRAY) return "kolibri1.attention.sliding_window_pattern is not an array";
+    if (pat->count != out.block_count)
+        return "sliding_window_pattern has " + std::to_string(pat->count) + " entries for " +
+               std::to_string(out.block_count) + " blocks";
+    out.swa_pattern.assign((size_t) out.block_count, 0);
+    for (uint32_t b = 0; b < out.block_count; ++b)
+        out.swa_pattern[(size_t) b] = pat->items[b].u != 0;
+
+    // tensor agreement: every block carries the MoE quartet, the sandwich norms, QK-norm, the
+    // router bias, and the shared expert.  A split model's other shards count as present.
+    auto has = [&](uint32_t b, const char* suffix) {
+        char name[128];
+        std::snprintf(name, sizeof name, "blk.%u.%s", b, suffix);
+        return g.find(name) != nullptr || (other_shards && other_shards->count(name) != 0);
+    };
+    for (uint32_t b = 0; b < out.block_count; ++b) {
+        const char* need[] = {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight",
+                              "ffn_gate_inp.weight", "exp_probs_b.bias",
+                              "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight",
+                              "attn_norm.weight", "post_attention_norm.weight",
+                              "ffn_norm.weight", "post_ffw_norm.weight",
+                              "attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight",
+                              "attn_q_norm.weight", "attn_k_norm.weight"};
+        for (const char* suffix : need)
+            if (!has(b, suffix))
+                return "blk." + std::to_string(b) + " is missing " + suffix;
+    }
+    out.first_moe = 0;
+    out.every_block_moe = true;
+    return {};   // empty == ok
+}
+
 } // namespace strata

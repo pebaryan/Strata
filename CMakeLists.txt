@@ -1134,6 +1134,12 @@ target_include_directories(kolibri_router_gate PRIVATE ${CMAKE_SOURCE_DIR}/inclu
 add_executable(kolibri_layer_gate tools/kolibri_layer_gate.cpp)
 target_include_directories(kolibri_layer_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+# kolibri_guard_gate (branch kolibri-port): phase 2 - the arch guard against the real artifact,
+# plus a refusal check on a non-kolibri GGUF.  (gguf_reader.hpp is header-only; the .cpp carries
+# the glm5next report tool's main and must not be linked here.)
+add_executable(kolibri_guard_gate tools/kolibri_guard_gate.cpp)
+target_include_directories(kolibri_guard_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 # glm45_run (branch glm5next-port): THE PORT'S LAST STEP.  The engine's own 45-block trunk, from the pack,
 # ending in a token.  The acceptance test is argmax == 12089, not a per-layer float match, because the
 # engine accumulates the quantization of 43 routed blocks (~5% of rms worst element, measured).
