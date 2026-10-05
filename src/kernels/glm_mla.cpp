@@ -47,9 +47,10 @@ int mla_cuda_min_cache() {
 
 /// x -> rms_norm(x) * weight, over the whole row (the reference normalizes ne0 and scales by the weight).
 void rms_norm_inplace(float* x, int n, const float* weight) {
-    double ss = 0.0;
-    for (int i = 0; i < n; ++i) ss += (double) x[i] * (double) x[i];
-    const float inv = 1.0f / std::sqrt((float) (ss / n) + MLA_RMS_EPS);
+    // float accumulation, matching llama.cpp's rms_norm_f32 (the port previously summed in double).
+    float ss = 0.0f;
+    for (int i = 0; i < n; ++i) ss += x[i] * x[i];
+    const float inv = 1.0f / std::sqrt(ss / (float) n + MLA_RMS_EPS);
     for (int i = 0; i < n; ++i) x[i] = x[i] * inv * (weight ? weight[i] : 1.0f);
 }
 
@@ -204,14 +205,14 @@ void mla_forward_rope(const MlaWeights& w, const MlaGeometry& g, const float* x,
             sc[t] = acc * kq_scale;
             if (sc[t] > best) best = sc[t];
         }
-        double sum = 0.0;
+        float sum = 0.0f;
         for (int t = 0; t < n_cache; ++t) {
-            sc[t] = std::exp(sc[t] - best);
+            sc[t] = expf(sc[t] - best);
             sum += sc[t];
         }
         float* Ah = attn.data() + (size_t) h * kv_lora;
         for (int t = 0; t < n_cache; ++t) {
-            const float p = (float) (sc[t] / sum);
+            const float p = sc[t] / sum;
             const float* kt = cache + (size_t) t * stride;
             for (int i = 0; i < kv_lora; ++i) Ah[i] += p * kt[i];
         }
