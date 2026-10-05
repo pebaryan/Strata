@@ -19,8 +19,10 @@
 //   build/glm47_trunk_parity.exe D:/tmp/glm47_trunk.bin
 #include "strata/core/glm47_trunk.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/glm47_read.hpp"
 #include "strata/kernels/glm_mla.hpp"
 #include "strata/kernels/glm_moe.hpp"
 #include "strata/kernels/glm_norm.hpp"
@@ -398,6 +400,53 @@ int main(int argc, char** argv) {
                 native_ran = true;
             }
         }
+    }
+
+    // ---- optional: read the SAME tensors from the ARTIFACT and compare to the fixture: --check-read <gguf>
+    //
+    // The runner reads the GGUF directly (strata/kernels/glm47_read.hpp).  The fixtures were written by the
+    // Python reference reading that same GGUF, so every tensor the reader returns must equal the fixture's
+    // copy - F32 exactly, the quantized ones to fp.  This is what proves the C++ layout/dequant matches.
+    const char* chk_gguf = nullptr;
+    for (int i = 2; i + 1 < argc; ++i) if (!std::strcmp(argv[i], "--check-read")) chk_gguf = argv[i + 1];
+    if (chk_gguf) {
+        const char* tn[8] = {"attn_q_a.weight", "attn_q_a_norm.weight", "attn_q_b.weight", "attn_k_b.weight",
+                             "attn_kv_a_mqa.weight", "attn_kv_a_norm.weight", "attn_v_b.weight", "attn_output.weight"};
+        std::string rerr;
+        bool rok = true;
+        double worst = 0.0, worst_rel = 0.0;
+        try {
+            strata::GgufFile gg(chk_gguf);
+            for (int l = 0; l < L && rok; ++l) {
+                const Layer& ly = layers[(size_t) l];
+                auto cmp = [&](const std::string& nm, const std::vector<float>& ref) -> bool {
+                    std::vector<float> got;
+                    if (!glm::load_tensor_f32(gg, nm, got, rerr)) { std::printf("  read    %s\n", rerr.c_str()); return false; }
+                    if (got.size() != ref.size()) {
+                        std::printf("  read    %s: %zu elems, fixture %zu\n", nm.c_str(), got.size(), ref.size());
+                        return false;
+                    }
+                    double m = 0.0, r = 0.0;
+                    for (size_t i = 0; i < got.size(); ++i) {
+                        m = std::max(m, (double) std::fabs((double) got[i] - (double) ref[i]));
+                        r = std::max(r, (double) std::fabs((double) ref[i]));
+                    }
+                    worst = std::max(worst, m);
+                    worst_rel = std::max(worst_rel, m / std::max(r, 1e-12));
+                    return true;
+                };
+                const std::string p = "blk." + std::to_string(l) + ".";
+                rok = cmp(p + "attn_norm.weight", ly.attn_norm) &&
+                      cmp(p + "ffn_norm.weight", ly.ffn_norm);
+                for (int m = 0; m < 8 && rok; ++m) rok = cmp(p + tn[m], ly.mw[m]);
+            }
+            std::printf("  read    artifact tensors vs the reference fixture: worst abs %.3e (rel %.3e)   %s\n",
+                        worst, worst_rel, (rok && worst_rel < 1e-4) ? "PASS" : "FAIL");
+        } catch (const std::exception& e) {
+            std::printf("  read    cannot open %s: %s\n", chk_gguf, e.what());
+            rok = false;
+        }
+        ok = ok && rok && (worst_rel < 1e-4);
     }
 
     const bool h_ok = worst_h < 1e-4, hn_ok = d_hn < 1e-4, log_ok = d_log < 1e-4;
