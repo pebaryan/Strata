@@ -66,6 +66,14 @@ bytes, sha256 `c2ac1301424441ef210b6de50ce25e8ccf69f86494df53d6ba52ed558456062e`
 Discipline from `GLM5NEXT-PORT.md` carries over: every phase ends in a committed, passing gate, and
 nothing proceeds on an unverified assumption.
 
+**Status (2026-10-05):** branch `kolibri-port` at `d7cb66a`. The router piece is DONE and gated:
+`MoeGeometry::Gating` in `glm_moe.hpp` (SIGMOID_LOGIT_ADD vs the pinned SIGMOID_BIASED), parity gate
+`tools/kolibri_router_gate.cpp` 7/7 PASS (build dir `build-kolibri-gate`). The gate caught two real
+kernel bugs on the way (unfilled logit sort key; a dropped sigmoid in the else branch), which is why
+the saturation and bias-reordering checks exist. The packer (phase 1) is ON HOLD until the
+`iq_pack` job frees the disk. Next: the layer graph (sandwich norms, QK-norm, SWA 513 + NoPE flags)
+as a CPU parity gate, then the trunk.
+
 ### Phase 0 - inventory (done, this document)
 Tensor names, quants, shapes and metadata read from the artifact with gguf-py. Regenerate with
 `tools/glm5_inventory.py`'s approach (a `kolibri1` variant is phase 1's first output).
