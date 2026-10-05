@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
     const char* pack = "D:/aimodels/strata-pack-glm47";
     std::string tokens;
     int n_layer = N_LAYER, verbosity = 1, gen = 1;
-    bool bind_only = false, use_device = true, warm = false, dev_experts = false;
+    bool bind_only = false, use_device = true, warm = false, dev_experts = true;
     size_t exp_budget = 6ull << 30;   // device bytes for resident expert rows (sized to the free VRAM)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--gguf") && i + 1 < argc) gguf = argv[++i];
@@ -172,6 +172,7 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--cpu")) use_device = false;
         else if (!std::strcmp(argv[i], "--warm")) warm = true;
         else if (!std::strcmp(argv[i], "--dev-experts")) dev_experts = true;
+        else if (!std::strcmp(argv[i], "--no-dev-experts")) dev_experts = false;
         else if (!std::strcmp(argv[i], "--exp-budget-mb") && i + 1 < argc) exp_budget = (size_t) std::atoi(argv[++i]) << 20;
     }
 

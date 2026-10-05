@@ -130,7 +130,8 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
     g_moe1_ms[1] += lap();
 
     bool device_combined = false;
-    if (g_device_moe_ffn != nullptr && glm_expert_layer_supported(fmt.gu_type, fmt.d_type)) {
+    if (g_device_moe_ffn != nullptr &&
+        (g_device_expert_native || glm_expert_layer_supported(fmt.gu_type, fmt.d_type))) {
         if (!g_device_moe_ffn(g_device_moe_ctx, layer, g.n_used, ids, blobs.data(), weights,
                               fmt, xn, out, err)) {
             if (err.empty()) err = "glm_stage_moe_native: device MoE FFN failed";

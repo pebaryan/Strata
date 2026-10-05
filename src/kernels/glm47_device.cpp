@@ -147,15 +147,19 @@ bool glm47_native_ffn(const void* const* weights, const int* types, const MoeGeo
     return ok;
 }
 
-// ---- the routed experts on the device. ----
+// ---- the routed experts on the device, BATCHED. ----
 //
 // The engine's device expert path is iq_mmvq, whose dispatch covers the IQ types and Q2_K but NOT the
 // k-quants; this model's experts are Q4_K (gate/up) and Q6_K (down), so glm_expert_layer_supported is false
-// and the stage falls back to the CPU.  native_mmvq - the kernel the MLA projections and the shared GLU
-// already use - DOES cover the k-quants, and a routed expert is the same GLU shape as the shared one:
+// and the stage falls back to the CPU.  native_mmvq - the kernel the MLA projections, the shared GLU and the
+// dense stem all use - DOES cover the k-quants, and a routed expert is the same GLU shape as the shared one:
 // gate = mmvq(gu, row); up = mmvq(gu, row + up_off); h = swiglu*quantise; out = mmvq(down, row + down_off).
-// A row is uploaded once per (layer, expert) and reused (FIFO eviction past the budget), so a hit costs no
-// PCIe traffic - the same residency rule the engine's ExpertRowCache applies, sized to whatever VRAM is free.
+//
+// ONE expert at a time is a loss (measured: experts 3663 vs 1065 ms): every expert paid its own activation
+// upload, Q8_1 quantise and stream sync.  Batching the layer's n_used experts amortises all three - the
+// shape the V100's grouped MoE fix had (35e627f: '1,200 mmvq launches and a host round trip per layer, which
+// is what the grouped device MoE is for').  Rows are uploaded once per (layer, expert) and reused, FIFO-
+// evicted past the budget, so a warm row costs no PCIe traffic.
 namespace {
 struct ExpertRowDev {
     struct Slot { void* dev = nullptr; size_t bytes = 0; };
@@ -166,49 +170,108 @@ struct ExpertRowDev {
 };
 ExpertRowDev& experts() { static ExpertRowDev c; return c; }
 
-bool expert_hook(void* ctx, int layer, int expert, const uint8_t* blob,
-                 const strata::kernels::cpu::NativeFmt& f, const float* x, float* out, std::string& err) {
-    ExpertRowDev* c = (ExpertRowDev*) ctx;
-    if (c == nullptr || blob == nullptr || x == nullptr || out == nullptr) { err = "expert hook: null argument"; return false; }
+const uint8_t* ensure_row(ExpertRowDev* c, int layer, int expert, const uint8_t* blob, size_t nb,
+                          const char** err) {
     const int64_t key = ((int64_t) layer << 20) | (int64_t) expert;
-    uint8_t* row = nullptr;
     auto it = c->rows.find(key);
-    if (it != c->rows.end()) { row = (uint8_t*) it->second.dev; ++c->hits; }
-    else {
-        const size_t nb = f.bytes;
-        while (c->budget != 0 && c->bytes + nb > c->budget && !c->fifo.empty()) {
-            const int64_t ev = c->fifo.front();
-            c->fifo.erase(c->fifo.begin());
-            auto e = c->rows.find(ev);
-            if (e == c->rows.end()) continue;
-            if (e->second.dev) cudaFree(e->second.dev);
-            c->bytes -= e->second.bytes;
-            c->rows.erase(e);
-            ++c->evicted;
-        }
-        void* dev = nullptr;
-        if (cudaMalloc(&dev, nb) != cudaSuccess) { err = "expert row cudaMalloc failed"; return false; }
-        if (cudaMemcpy(dev, blob, nb, cudaMemcpyHostToDevice) != cudaSuccess) {
-            cudaFree(dev); err = "expert row upload failed"; return false;
-        }
-        row = (uint8_t*) dev;
-        c->rows.emplace(key, ExpertRowDev::Slot{dev, nb});
-        c->fifo.push_back(key);
-        c->bytes += nb;
-        ++c->misses;
+    if (it != c->rows.end()) { ++c->hits; return (const uint8_t*) it->second.dev; }
+    while (c->budget != 0 && c->bytes + nb > c->budget && !c->fifo.empty()) {
+        const int64_t ev = c->fifo.front();
+        c->fifo.erase(c->fifo.begin());
+        auto e = c->rows.find(ev);
+        if (e == c->rows.end()) continue;
+        if (e->second.dev) cudaFree(e->second.dev);
+        c->bytes -= e->second.bytes;
+        c->rows.erase(e);
+        ++c->evicted;
     }
-    // the blob is [gate | up | down]; the two hidden projections sit at the layout's OWN offsets
-    const void* w[3] = { row, row + f.up_off, row + f.down_off };
+    void* dev = nullptr;
+    if (cudaMalloc(&dev, nb) != cudaSuccess) { *err = "expert row cudaMalloc failed"; return nullptr; }
+    if (cudaMemcpy(dev, blob, nb, cudaMemcpyHostToDevice) != cudaSuccess) {
+        cudaFree(dev); *err = "expert row upload failed"; return nullptr;
+    }
+    c->rows.emplace(key, ExpertRowDev::Slot{dev, nb});
+    c->fifo.push_back(key);
+    c->bytes += nb;
+    ++c->misses;
+    return (const uint8_t*) dev;
+}
+
+// One activation, one Q8_1, then per-expert gate/up/SwiGLU-Q8_1/down on the stream; one D2H and one sync.
+struct MoeScratch {
+    float* x = nullptr; void* xq = nullptr; size_t xc = 0, xqc = 0;
+    float* gate = nullptr; size_t gtc = 0;
+    float* up = nullptr; size_t upc = 0;
+    void* hq = nullptr; size_t hqc = 0;
+    float* outp = nullptr; size_t outc = 0;
+    std::vector<float> hostout;   // the combine's staging, grown once
+};
+MoeScratch& moe_scratch() { static MoeScratch s; return s; }
+
+bool moe_batch_impl(const uint8_t* const* rows, const int* types, int64_t n_embd, int64_t n_ff, size_t up_off,
+                    size_t down_off, const float* weights, int n_used, const float* x, float* out) {
+    if (n_used < 1 || n_used > 64 || !rows || !types || !weights || !x || !out) return false;
+    const int gu = types[0], dt = types[2];
+    if (!native_mmvq_supported(gu) || !native_mmvq_supported(dt)) return false;
+    cudaStream_t st = project_stream();
+    if (!st) return false;
+    const int ne = (int) n_embd, nf = (int) n_ff;
+    const size_t hqb = native_q8_1_bytes(nf, 1);
+    MoeScratch& s = moe_scratch();
+    if (!grow_f32(s.x, s.xc, (size_t) ne * sizeof(float)) ||
+        !grow(s.xq, s.xqc, native_q8_1_bytes(ne, 1)) ||
+        !grow_f32(s.gate, s.gtc, (size_t) n_used * nf * sizeof(float)) ||
+        !grow_f32(s.up, s.upc, (size_t) n_used * nf * sizeof(float)) ||
+        !grow(s.hq, s.hqc, (size_t) n_used * hqb) ||
+        !grow_f32(s.outp, s.outc, (size_t) n_used * ne * sizeof(float))) return false;
+    if (cudaMemcpyAsync(s.x, x, (size_t) ne * sizeof(float), cudaMemcpyHostToDevice, st) != cudaSuccess) return false;
+    native_quantize_q8_1(s.x, s.xq, ne, 1, st);
+    for (int i = 0; i < n_used; ++i) {
+        float* gi = s.gate + (size_t) i * nf;
+        float* ui = s.up + (size_t) i * nf;
+        float* oi = s.outp + (size_t) i * ne;
+        void* hi = (uint8_t*) s.hq + (size_t) i * hqb;
+        native_mmvq(gu, rows[i], s.xq, gi, ne, nf, 1, st);
+        native_mmvq(gu, rows[i] + up_off, s.xq, ui, ne, nf, 1, st);
+        native_swiglu_quantize_q8_1(gi, ui, hi, nf, 1, st);
+        native_mmvq(dt, rows[i] + down_off, hi, oi, nf, ne, 1, st);
+    }
+    s.hostout.resize((size_t) n_used * ne);
+    if (cudaMemcpyAsync(s.hostout.data(), s.outp, (size_t) n_used * ne * sizeof(float),
+                        cudaMemcpyDeviceToHost, st) != cudaSuccess) return false;
+    if (cudaStreamSynchronize(st) != cudaSuccess) return false;
+    // combine in the SAME order the CPU path does: out[j] = sum_i weights[i] * expert_i[j]
+    for (int j = 0; j < ne; ++j) {
+        float acc = 0.0f;
+        for (int i = 0; i < n_used; ++i) acc += s.hostout[(size_t) i * ne + j] * weights[i];
+        out[j] = acc;
+    }
+    return true;
+}
+
+bool moe_hook(void* ctx, int layer, int n_experts, const int32_t* experts_, const uint8_t* const* blobs,
+              const float* weights, const strata::kernels::cpu::NativeFmt& f, const float* x, float* out,
+              std::string& err) {
+    ExpertRowDev* c = (ExpertRowDev*) ctx;
+    if (c == nullptr || !experts_ || !blobs || !weights || !x || !out) { err = "moe hook: null argument"; return false; }
+    const uint8_t* rows[64];
+    for (int i = 0; i < n_experts; ++i) {
+        const char* e = nullptr;
+        rows[i] = ensure_row(c, layer, (int) experts_[i], blobs[i], f.bytes, &e);
+        if (rows[i] == nullptr) { err = e ? e : "expert row"; return false; }
+    }
     const int t[3] = { f.gu_type, f.gu_type, f.d_type };
-    MoeGeometry g; g.n_embd = f.n_embd; g.ff = f.n_ff; g.clamp_exp = 0.0f; g.clamp_shexp = 0.0f;
-    return glm47_native_ffn(w, t, g, x, out, 0.0f);
+    const double t0 = now_ms();
+    const bool ok = moe_batch_impl(rows, t, f.n_embd, f.n_ff, f.up_off, f.down_off, weights, n_experts, x, out);
+    g_ffn_ms += now_ms() - t0;
+    return ok;
 }
 }  // namespace
 
 void glm47_install_device_experts(size_t budget_bytes) {
     ExpertRowDev& c = experts();
     c.budget = budget_bytes;
-    strata::core::glm::glm_set_device_expert_ffn(expert_hook, &c);
+    strata::core::glm::glm_set_device_moe_ffn(moe_hook, &c);
     strata::core::glm::glm_set_device_expert_native(true);
 }
 void glm47_device_expert_stats(uint64_t* hits, uint64_t* misses, uint64_t* evicted, size_t* bytes) {
