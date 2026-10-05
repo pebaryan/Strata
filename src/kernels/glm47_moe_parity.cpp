@@ -17,6 +17,10 @@
 // Kolibri's bias-then-sigmoid (SIGMOID_LOGIT_ADD) order, could not catch a port that dropped or swapped
 // the bias.  So the gate recomputes both alternatives itself and requires the fixture to tell them apart.
 #include "strata/kernels/glm_moe.hpp"
+#include "strata/core/expert_source.hpp"
+#include "strata/core/glm_moe_native.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -24,9 +28,18 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
+#include <sstream>
+#include <string>
 #include <vector>
 
 namespace glm = strata::kernels::glm;
+namespace cglm = strata::core::glm;
+
+/// The pack reader as the native stage wants it: a plain blob_fn (ExpertSource::blob in production).
+const uint8_t* moe_blob_adapter(void* ctx, int layer, int expert) {
+    return ((strata::core::ExpertSource*) ctx)->blob(layer, expert);
+}
 
 namespace {
 
@@ -132,6 +145,9 @@ int main(int argc, char** argv) {
     bool pos_ok = true, distinct_ok = true, range_ok = true;
     bool ok = true;
     int bias_teeth = 0, mode_teeth = 0;
+    // case 0's data, kept for the native (pack) path after the loop
+    std::vector<float> nat_x, nat_got, nat_want;
+    std::vector<int32_t> nat_ids;
 
     for (int c = 0; c < n_cases; ++c) {
         const std::vector<float> x = read_floats(f, (size_t) ne);
@@ -217,6 +233,8 @@ int main(int argc, char** argv) {
             range_ok = range_ok && sorted.front() >= 0 && sorted.back() < E;
         }
 
+        if (c == 0) { nat_x = x; nat_ids = e_ids; nat_got = got_out; nat_want = e_out; }
+
         std::printf("  case %d: ids", c);
         for (int i = 0; i < k; ++i) std::printf(" %d", (int) got_ids[(size_t) i]);
         std::printf("  %s (want", mism ? "FAIL" : "PASS");
@@ -260,6 +278,79 @@ int main(int argc, char** argv) {
                     "under bias-then-sigmoid (SIGMOID_LOGIT_ADD)   %s\n",
                     bias_teeth, (int) n_cases, mode_teeth, (int) n_cases, teeth_ok ? "PASS" : "FAIL");
         ok = ok && teeth_ok;
+    }
+
+    // ============ THE PRODUCTION PATH: the same input and ids, QUANTIZED BLOBS FROM THE PACK ============
+    //
+    // Everything above compares glm::moe_forward - FLOAT experts - against the oracle.  That is not the path
+    // the model runs: the trunk hands glm_stage_moe_native QUANTIZED BYTES FROM A PACK.  So drive the native
+    // stage with the pack's OWN blobs for the ids case 0 selected, on case 0's input, and report the result
+    // against the float64 oracle and against the float engine path.  A gap far beyond what the pack's expert
+    // format can explain would be a real defect; the ids must be identical (same router).
+    if (argc < 3) {
+        std::printf("  native   no pack named (arg 2) - the pack path is skipped; pass a pack dir to exercise it\n");
+    } else {
+        const char* pack = argv[2];
+        const int layer = (argc >= 4) ? std::atoi(argv[3]) : 1;
+        int gu_type = -1, d_type = -1;
+        {
+            std::ifstream pf(std::string(pack) + "/native_experts.txt");
+            std::string line;
+            while (std::getline(pf, line)) {
+                if (line.empty() || line[0] == '#') continue;
+                std::istringstream is(line);
+                int64_t l = -1, off = 0, nb = 0, go = 0, uo = 0, dob = 0;
+                int gt = 0, dt = 0;
+                if (!(is >> l >> gt >> dt >> off >> nb >> go >> uo >> dob)) continue;
+                if (l == (int64_t) layer) { gu_type = gt; d_type = dt; break; }
+            }
+        }
+        std::string nerr;
+        strata::kernels::cpu::NativeFmt fmt;
+        strata::core::FileExpertSource src;
+        // this pack keeps no experts.bin: they are read IN PLACE from the model GGUF, so name the --native shard
+        const char* gguf = (argc >= 5) ? argv[4] : "D:/aimodels/Huihui-GLM-4.7-Flash-abliterated.Q4_K_M.gguf";
+        src.set_gguf(gguf);
+        if (gu_type < 0) {
+            std::printf("  native   layer %d is not in %s/native_experts.txt (skipped)\n", layer, pack);
+        } else if (!strata::kernels::cpu::expert_layout_load(pack, 47, E, nerr, ne, ff) ||
+                   !src.open(pack, 47, E, nerr)) {
+            std::printf("  native   the pack will not open: %s (skipped)\n", nerr.c_str());
+        } else if (!strata::kernels::cpu::native_fmt(gu_type, d_type, ne, ff, fmt, nerr)) {
+            std::printf("  native   native_fmt(%d,%d) refused: %s (skipped)\n", gu_type, d_type, nerr.c_str());
+        } else {
+            glm::MoeGeometry sg;
+            sg.n_embd = ne; sg.ff = ff; sg.n_expert = E; sg.n_used = k;
+            sg.w_scale = g.w_scale; sg.norm_w = g.norm_w;
+            sg.clamp_exp = g.clamp_exp; sg.clamp_shexp = g.clamp_shexp;
+            std::vector<float> nat_out((size_t) ne, 0.0f);
+            std::vector<int32_t> nids((size_t) k, -1);
+            // shared_types = nullptr -> the +1 shared expert runs through the float expert_ffn fallback
+            const bool nat_ok = cglm::glm_stage_moe_native(
+                nat_x.data(), router.data(), probs_b.data(), g, layer, fmt, &moe_blob_adapter, &src,
+                &sg, shared, nullptr, g.clamp_shexp, nat_out.data(), nerr, nids.data());
+            if (!nat_ok) {
+                std::printf("  native   the stage refused: %s\n", nerr.c_str());
+            } else {
+                bool ids_same = true;
+                for (int i = 0; i < k; ++i) ids_same = ids_same && (nids[(size_t) i] == nat_ids[(size_t) i]);
+                double dn = 0.0, df = 0.0, rr = 0.0;
+                for (int i = 0; i < ne; ++i) {
+                    dn = std::max(dn, (double) std::fabs((double) nat_out[(size_t) i] - (double) nat_want[(size_t) i]));
+                    df = std::max(df, (double) std::fabs((double) nat_out[(size_t) i] - (double) nat_got[(size_t) i]));
+                    rr += (double) nat_want[(size_t) i] * (double) nat_want[(size_t) i];
+                }
+                const double rms = std::sqrt(rr / (double) ne);
+                std::printf("  native   pack blobs (Q4_K/Q6_K via ggml-cpu), layer %d: ids %s\n",
+                            layer, ids_same ? "IDENTICAL to the oracle's" : "DIFFERENT");
+                std::printf("  native   vs oracle (float64) worst %.4g = %.3g of rms   "
+                            "vs float engine worst %.4g = %.3g of rms\n",
+                            dn, dn / (rms > 0 ? rms : 1.0), df, df / (rms > 0 ? rms : 1.0));
+                std::printf("  native   %s   (a gap of a few %% of rms vs the float path is the expert quantization;\n"
+                            "           far more would be a defect in the stage)\n", ids_same ? "PASS" : "FAIL");
+                ok = ok && ids_same;
+            }
+        }
     }
 
     std::printf("glm47_moe_parity: %s\n", ok ? "PASS" : "FAIL");

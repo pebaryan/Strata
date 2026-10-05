@@ -200,9 +200,17 @@ endif()
 # GLM-4.7-Flash router/MoE parity (branch glm47-port): the deepseek2 SIGMOID router (sigmoid then
 # +exp_probs_b, selection on the biased probs, weights from the unbiased ones, normalise then 1.8-scale)
 # and the shared-expert combine, against tools/glm47_moe_reference.py.  Host-only, like the MLA gate.
-add_executable(glm47_moe_parity src/kernels/glm47_moe_parity.cpp src/kernels/glm_moe.cpp)
+add_executable(glm47_moe_parity src/kernels/glm47_moe_parity.cpp src/kernels/glm_moe.cpp
+               src/kernels/glm_mla.cpp src/core/glm_moe_native.cpp src/kernels/glm47_parallel_shim.cpp)
 target_include_directories(glm47_moe_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm47_moe_parity PRIVATE -O2)
+# the gate also drives the PRODUCTION path (glm_stage_moe_native) with the pack's own quantized blobs.  That
+# needs the pack reader + peer/remote expert machinery, which live in strata_engine (which PUBLIC-links
+# strata_core / strata_kernels / strata_kernels_cpu -> ggml-cpu).  glm_moe_native.cpp's one trunk dependency,
+# glm_parallel_for, comes from glm47_parallel_shim.cpp.
+if(STRATA_ENABLE_CUDA)
+  target_link_libraries(glm47_moe_parity PRIVATE strata_engine CUDA::cudart)
+endif()
 
 # GLM-4.7-Flash full decoder-block parity (branch glm47-port): attn_norm -> MLA -> +x -> ffn_norm ->
 # MoE(+shexp) -> +x, composing the phase-3 MLA and phase-4 MoE with the two block norms (glm_norm.cpp)

@@ -2490,6 +2490,11 @@ bool check_experts_gguf(const std::string& gguf, const strata::kernels::cpu::Exp
     try {
         std::map<std::string, std::unique_ptr<strata::GgufFile>> files;
         for (int64_t l = 0; l < lay.n_layers; ++l) {
+            // A layer with no line in native_experts.txt (offset still the ~0ull sentinel) has no expert
+            // tensors - the dense stem of a model whose first expert block is > 0 (GLM-4.7: block 0 dense,
+            // experts on blocks 1..46).  Asking the GGUF for blk.0.ffn_gate_exps.weight there is wrong, not a
+            // mismatch: skip it.
+            if (lay.offset[(size_t) l] == ~0ull) continue;
             const auto& fm = lay.fmt[(size_t) l];
             const uint64_t blob = lay.bytes[(size_t) l];
             const uint64_t per[3] = {fm.up_off, fm.up_off, blob - fm.down_off};
