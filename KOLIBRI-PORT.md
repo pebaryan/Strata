@@ -66,13 +66,30 @@ bytes, sha256 `c2ac1301424441ef210b6de50ce25e8ccf69f86494df53d6ba52ed558456062e`
 Discipline from `GLM5NEXT-PORT.md` carries over: every phase ends in a committed, passing gate, and
 nothing proceeds on an unverified assumption.
 
-**Status (2026-10-05):** branch `kolibri-port` at `d7cb66a`. The router piece is DONE and gated:
-`MoeGeometry::Gating` in `glm_moe.hpp` (SIGMOID_LOGIT_ADD vs the pinned SIGMOID_BIASED), parity gate
-`tools/kolibri_router_gate.cpp` 7/7 PASS (build dir `build-kolibri-gate`). The gate caught two real
-kernel bugs on the way (unfilled logit sort key; a dropped sigmoid in the else branch), which is why
-the saturation and bias-reordering checks exist. The packer (phase 1) is ON HOLD until the
-`iq_pack` job frees the disk. Next: the layer graph (sandwich norms, QK-norm, SWA 513 + NoPE flags)
-as a CPU parity gate, then the trunk.
+**Status (2026-10-05, evening):** branch `kolibri-port`, four phases DONE and gated:
+
+- `d7cb66a` router: `MoeGeometry::Gating` (SIGMOID_LOGIT_ADD vs pinned SIGMOID_BIASED),
+  `tools/kolibri_router_gate.cpp` 7/7 PASS. The gate caught two real kernel bugs (unfilled logit
+  sort key; dropped sigmoid in the else branch).
+- `957d0fc` layer graph: `kolibri_swa.hpp` (pattern reader, SWA mask, RoPE, QK-norm before RoPE)
+  + `tools/kolibri_layer_gate.cpp` 7/7 PASS (600 positions, probes at 0/512/599).
+- `eaa84ed` packer: `tools/kolibri_pack.py`; pack at
+  `/home/peb/moredata/strata-pack-kolibri`; phase-1 gate
+  `strata-load --layout <pack> --layout-layers 50 --layout-hidden 2560 --layout-ffn 512` PASS
+  (50 layers x 384 experts, 45.71 GB; the hidden/ffn flags are required - defaults are the
+  binary's compiled GLM geometry).
+- `0d1ba6b` arch guard: `check_kolibri1_architecture` + `tools/kolibri_guard_gate.cpp`
+  (acceptance on the real artifact AND refusal of a glm5next file, both PASS).
+
+Oracle: `llama.cpp-kolibri-try/examples/simple/kolibri-oracle.cpp` (built as
+`build-oracle/bin/llama-kolibri-oracle`), experts pinned to CPU via
+`tensor_buft_overrides`; verified end to end on "The capital of Austria is" ->
+greedy `29116 46 1914 262 3515 735` = "Vienna. So the answer is"; logits dumps at
+`/home/peb/moredata/kolibri-oracle/`. NOTE: the oracle's n_vocab is 128,000, not the header's
+131,072 - phase-6 logit comparisons must use the oracle's size.
+
+Remaining: trunk wiring (drive the gated pieces through an engine path against the oracle
+logits), then the tricks (expert row cache + mmap) and the measured tok/s comparison.
 
 ### Phase 0 - inventory (done, this document)
 Tensor names, quants, shapes and metadata read from the artifact with gguf-py. Regenerate with
