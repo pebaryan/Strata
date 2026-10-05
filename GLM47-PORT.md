@@ -80,7 +80,7 @@ gate below, exactly as llama.cpp's GLM5-Next graph was for phases 8-9 of the GLM
 | phase | work | gate |
 |---|---|---|
 | 0 | this inventory | tensor set + metadata match the header |
-| 1 | packer (`tools/glm47_pack.py`) | `strata-load --layout` reports 47 layers, 64 experts, stem at block 1, expert table byte-exact |
+| 1 ✅ | packer (`tools/glm47_pack.py`) | **PASSED** — `strata-load --layout --layout-layers 47`: 47 layers, 64 experts/layer, first expert block 1, 16.77 GB, dense stem block 0, Q4_K/Q6_K down mix |
 | 2 | arch guard + geometry (`deepseek2`) | reader loads the pack and reports the geometry; wrong-arch packs refuse |
 | 3 | MLA parity (incl. the new rope) | one MLA layer's intermediates logits-compared to the oracle |
 | 4 | router/MoE parity | routing ids+weights for random hidden states match the oracle (ids exact) |
@@ -98,6 +98,23 @@ gate below, exactly as llama.cpp's GLM5-Next graph was for phases 8-9 of the GLM
   same policy as qwen4exp/glm5next); check id-identity, not just weight tolerance.
 - **Mixed down-quant** — down mixes Q4_K and Q6_K per layer; the table supports it but the CUDA grouped
   path may want one format per call (fall back to per-layer grouping and measure if so).
+
+## Build notes (Windows, this box — needed before any gate can run)
+
+The base `strata` build here predates these, so they are build-config facts, not port code:
+
+- **CCCL / CUB vs MSVC.** `glm_indexer_device.cu` includes `<cub/...>`; CCCL emits a fatal `#error` under
+  MSVC's traditional preprocessor. Fixed by adding `/Zc:preprocessor` (CXX) and `-Xcompiler=/Zc:preprocessor`
+  (CUDA) in `CMakeLists.txt`, guarded by `if(MSVC)`.
+- **Compile-time expert geometry.** The CPU expert path is built for one geometry pair,
+  `STRATA_MODEL_H` / `STRATA_MODEL_FF` (`CMakeLists.txt:60-61`). The defaults are qwen4exp's (2560 / 640)
+  and reject a GLM pack ("activation larger than the pool's buffers"). **GLM-4.7-Flash must be built with
+  `-DSTRATA_MODEL_H=2048 -DSTRATA_MODEL_FF=1536`.** A Strata build therefore serves one model geometry;
+  a future clean fix is to drive these from the pack's manifest instead of a compile-time constant.
+- **`--layout-layers`.** `load_main.cpp:94` defaults `layout_layers = 46` (GLM-5.3). GLM-4.7 needs
+  `--layout-layers 47`. Same future fix: read `block_count` from the manifest.
+- Build recipe: `build_strata_local.bat` + the two `-D` values above; the CUDA v13.3 `bin/x64` must be on
+  `PATH` when running, or the exe exits immediately.
 
 ## What this branch does NOT do
 

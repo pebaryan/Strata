@@ -10,6 +10,14 @@
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.39 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
+# CCCL/CUB headers refuse MSVC's traditional preprocessor: they emit a fatal #error and ask for
+# /Zc:preprocessor.  The CUDA kernels (glm_indexer_device.cu -> CUB) hit this on Windows; host flags for
+# CUDA go through -Xcompiler, the same pattern strata_warnings uses for /W4 above.
+if(MSVC)
+  add_compile_options(
+    $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>)
+endif()
 # issue #31: release builds keep a PDB beside the exe (not shipped in it), so a minidump from a stalled engine can
 # be read back to the exact source line
 if(MSVC AND CMAKE_BUILD_TYPE STREQUAL "Release")
