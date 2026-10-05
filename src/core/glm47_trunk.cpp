@@ -2,6 +2,8 @@
 
 #include <cstring>
 
+#include "strata/core/glm_moe_native.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/glm_norm.hpp"
 
 namespace strata::core::glm {
@@ -71,6 +73,23 @@ bool glm47_trunk_forward(const Glm47TrunkLayer* layers, int n_layer,
                 return false;
             }
             glm::expert_ffn(ly.ffn_gate, ly.ffn_up, ly.ffn_down, ly.dense_g, ffv.data(), ffnout.data(), kClamp);
+        } else if (ly.moe_native_fmt && ly.moe_native_blob) {
+            // the native (pack-quantized) path: glm_stage_moe_native routes and computes BOTH the routed
+            // experts and the shared expert straight from the pack's blobs, so no expert is materialised.
+            // Router weights stay float (routing is float on every path).
+            if (!ly.moe_router || !ly.moe_probs_b || !ly.moe_g) {
+                err = "glm47_trunk_forward: native MoE layer " + std::to_string(l) + " lacks router weights";
+                return false;
+            }
+            const int k = ly.moe_g->n_used;
+            std::vector<int> nids((size_t) k, -1);
+            if (!glm_stage_moe_native(ffv.data(), ly.moe_router, ly.moe_probs_b, *ly.moe_g, l,
+                                      *ly.moe_native_fmt, ly.moe_native_blob, ly.moe_native_ctx,
+                                      ly.moe_g, ly.shexp, ly.shexp_types, kClamp, ffnout.data(), err,
+                                      nids.data())) {
+                return false;
+            }
+            if (ids_out) for (int i = 0; i < k; ++i) (*ids_out)[(size_t) l].push_back(nids[(size_t) i]);
         } else {
             if (!ly.moe_router || !ly.moe_probs_b || !ly.moe_g || !ly.shexp || !expert_fn) {
                 err = "glm47_trunk_forward: MoE layer " + std::to_string(l) + " lacks " +

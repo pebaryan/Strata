@@ -18,6 +18,9 @@
 //   python tools/glm47_trunk_reference.py --raw-fixture D:/tmp/glm47_trunk.bin [--layers 2] [--tokens 2]
 //   build/glm47_trunk_parity.exe D:/tmp/glm47_trunk.bin
 #include "strata/core/glm47_trunk.hpp"
+#include "strata/core/expert_source.hpp"
+#include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/glm_mla.hpp"
 #include "strata/kernels/glm_moe.hpp"
 #include "strata/kernels/glm_norm.hpp"
@@ -29,13 +32,20 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <map>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
 
 namespace glm = strata::kernels::glm;
 namespace cglm = strata::core::glm;
+
+/// The pack reader as the native stage wants it: a plain blob_fn (ExpertSource::blob in production).
+const uint8_t* moe_blob_adapter(void* ctx, int layer, int expert) {
+    return ((strata::core::ExpertSource*) ctx)->blob(layer, expert);
+}
 
 namespace {
 
@@ -312,10 +322,89 @@ int main(int argc, char** argv) {
     std::printf("  head    hn rel %.2e   logits rel %.2e   argmax %d (want %d)  %s\n",
                 d_hn, d_log, argmax, (int) e_argmax, argmax == e_argmax ? "PASS" : "FAIL");
 
+    // ---- the NATIVE (pack-quantized) routed-expert path, when a pack is named: --native <pack> --gguf <gguf>
+    //
+    // Everything above runs glm47_trunk_forward with FLOAT experts.  The model runs the routed experts from
+    // the pack's OWN quantized blobs (glm_stage_moe_native).  Drive the SAME trunk with that path: same
+    // input, same float router, so the ids must stay EXACT; the hidden state may move only by the expert
+    // quantization.  (The shared expert stays float here, to isolate the routed experts.)
+    bool native_ran = false, native_ok = true;
+    int nat_exact = 0, nat_total = 0;
+    double nat_hidden = 0.0;
+    const char* pack = nullptr, *gguf = nullptr;
+    for (int i = 2; i + 1 < argc; ++i) {
+        if (!std::strcmp(argv[i], "--native")) pack = argv[i + 1];
+        else if (!std::strcmp(argv[i], "--gguf")) gguf = argv[i + 1];
+    }
+    if (pack) {
+        std::string nerr;
+        std::map<int, int> gu_of, d_of;
+        { std::ifstream pf(std::string(pack) + "/native_experts.txt"); std::string line;
+          while (std::getline(pf, line)) {
+              if (line.empty() || line[0] == '#') continue;
+              std::istringstream is(line);
+              int64_t blk = -1, off = 0, nb = 0, go = 0, uo = 0, dob = 0; int gt = 0, dt = 0;
+              if (!(is >> blk >> gt >> dt >> off >> nb >> go >> uo >> dob)) continue;
+              gu_of[(int) blk] = gt; d_of[(int) blk] = dt;
+          } }
+        int E0 = 0, ff0 = 0;
+        for (int l = 0; l < L; ++l) if (layers[(size_t) l].kind == 1) { E0 = layers[(size_t) l].gg.n_expert; ff0 = layers[(size_t) l].gg.ff; break; }
+        strata::core::FileExpertSource src;
+        src.set_gguf(gguf ? gguf : "D:/aimodels/Huihui-GLM-4.7-Flash-abliterated.Q4_K_M.gguf");
+        std::vector<strata::kernels::cpu::NativeFmt> fmtv((size_t) L);
+        if (E0 == 0) {
+            std::printf("  native  no MoE layer in this fixture; nothing to drive\n");
+        } else if (!strata::kernels::cpu::expert_layout_load(pack, 47, E0, nerr, ne, ff0) ||
+                   !src.open(pack, 47, E0, nerr)) {
+            std::printf("  native  pack will not open: %s\n", nerr.c_str());
+            native_ok = false;
+        } else {
+            bool fmt_ok = true;
+            for (int l = 0; l < L && fmt_ok; ++l) {
+                if (layers[(size_t) l].kind != 1) continue;
+                auto gt = gu_of.find(l), dt = d_of.find(l);
+                if (gt == gu_of.end() || dt == d_of.end() ||
+                    !strata::kernels::cpu::native_fmt(gt->second, dt->second, ne, ff0, fmtv[(size_t) l], nerr)) {
+                    std::printf("  native  no fmt for layer %d: %s\n", l, nerr.c_str());
+                    fmt_ok = false; native_ok = false;
+                }
+            }
+            if (fmt_ok) {
+                std::vector<cglm::Glm47TrunkLayer> arr2(arr);
+                for (int l = 0; l < L; ++l) if (layers[(size_t) l].kind == 1) {
+                    arr2[(size_t) l].moe_native_fmt = &fmtv[(size_t) l];
+                    arr2[(size_t) l].moe_native_blob = &moe_blob_adapter;
+                    arr2[(size_t) l].moe_native_ctx = &src;
+                    arr2[(size_t) l].shexp_types = nullptr;   // float shared expert
+                }
+                std::vector<std::vector<float>> nc((size_t) L);
+                std::vector<float> nh((size_t) ne);
+                for (int t = 0; t < T; ++t) {
+                    std::vector<std::vector<int32_t>> nids;
+                    std::vector<std::vector<float>> nper;
+                    if (!cglm::glm47_trunk_forward(arr2.data(), L, mg, x0[(size_t) t].data(), t, eps, &nc, nullptr,
+                                                   nullptr, nullptr, nh.data(), &nids, &nper, nerr)) {
+                        std::printf("  native  trunk failed: %s\n", nerr.c_str()); native_ok = false; break;
+                    }
+                    if (t == T - 1) nat_hidden = rel_l2(nh, final_hidden);
+                    for (int l = 0; l < L; ++l) {
+                        if (layers[(size_t) l].kind != 1) continue;
+                        const std::vector<int32_t>& want = e_ids[{t, l}];
+                        int mism = 0;
+                        for (size_t i = 0; i < nids[(size_t) l].size(); ++i) mism += (nids[(size_t) l][i] != want[i]);
+                        ++nat_total; nat_exact += (mism == 0);
+                    }
+                }
+                native_ran = true;
+            }
+        }
+    }
+
     const bool h_ok = worst_h < 1e-4, hn_ok = d_hn < 1e-4, log_ok = d_log < 1e-4;
     const bool ids_ok = (ids_total > 0) && (ids_exact == ids_total);
     const bool am_ok = (argmax == e_argmax);
-    ok = ok && h_ok && hn_ok && log_ok && ids_ok && am_ok && has_teeth;
+    ok = ok && h_ok && hn_ok && log_ok && ids_ok && am_ok && has_teeth && native_ok;
+    if (native_ran && nat_total > 0) ok = ok && (nat_exact == nat_total);
 
     std::printf("  hidden  worst rel %.3e   %s\n", worst_h, h_ok ? "PASS" : "FAIL");
     std::printf("  hn      rel %.3e   %s\n", d_hn, hn_ok ? "PASS" : "FAIL");
@@ -324,6 +413,10 @@ int main(int argc, char** argv) {
     std::printf("  argmax  %s\n", am_ok ? "PASS" : "FAIL");
     std::printf("  teeth   one shared cache moves the hidden state by rel %.3e   %s\n",
                 teeth_h, has_teeth ? "PASS" : "FAIL");
+    if (native_ran)
+        std::printf("  native  pack blobs (routed experts): ids %d/%d exact   hidden vs the float path rel %.3e   %s\n",
+                    nat_exact, nat_total, nat_hidden,
+                    (nat_total > 0 && nat_exact == nat_total) ? "PASS" : "FAIL");
     std::printf("glm47_trunk_parity: %s\n", ok ? "PASS" : "FAIL");
     return ok ? 0 : 1;
 }

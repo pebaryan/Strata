@@ -19,6 +19,8 @@
 #include "strata/kernels/glm_mla.hpp"
 #include "strata/kernels/glm_moe.hpp"
 
+namespace strata::kernels::cpu { struct NativeFmt; }   // the pack's expert descriptor (glm_moe_native)
+
 namespace strata::core::glm {
 
 /// One block's weights.  The fields a block's kind does not need are left null and the loop rejects the
@@ -41,6 +43,16 @@ struct Glm47TrunkLayer {
     const float* moe_probs_b = nullptr;           ///< [n_expert]
     const kernels::glm::MoeGeometry* moe_g = nullptr;   ///< ff is the shared expert's width too
     const float* const* shexp = nullptr;          ///< {gate, up, down} of the +1 shared expert
+
+    // OPTIONAL native (pack-quantized) MoE.  When moe_native_fmt and moe_native_blob are set, the routed
+    // experts AND the shared expert are computed by the engine's native stage (glm_stage_moe_native)
+    // straight from the pack's blobs - the path the model actually runs, and the only way full depth is
+    // affordable (dequantising 644 experts per token is not).  moe_router/moe_probs_b stay float (routing
+    // is float on every path).  A gate leaves moe_native_fmt null and takes the float moe_forward branch.
+    const kernels::cpu::NativeFmt* moe_native_fmt = nullptr;
+    const uint8_t* (*moe_native_blob)(void*, int, int) = nullptr;
+    void* moe_native_ctx = nullptr;
+    const int* shexp_types = nullptr;             ///< {gate,up,down} GGML types of the shared expert, or null (float fallback)
 };
 
 /// `(ctx, layer, expert) -> {gate, up, down}` for an expert, or null if it has none.  The loop routes
