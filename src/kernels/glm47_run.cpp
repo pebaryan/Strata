@@ -28,7 +28,10 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
+#include <iostream>
 #include <mutex>
+#include <queue>
+#include <random>
 #include <thread>
 #include <unordered_map>
 
@@ -219,8 +222,8 @@ int main(int argc, char** argv) {
     const char* pack = "D:/aimodels/strata-pack-glm47";
     std::string tokens;
     int n_layer = N_LAYER, verbosity = 1, gen = 1;
-    bool bind_only = false, use_device = true, warm = false, dev_experts = true;
-    int selftest_attn = 0;
+    bool bind_only = false, use_device = true, warm = false, dev_experts = true, serve = false;
+    int selftest_attn = 0, serve_ctx = 4096;
     size_t exp_budget = 6ull << 30;   // device bytes for resident expert rows (sized to the free VRAM)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--gguf") && i + 1 < argc) gguf = argv[++i];
@@ -232,6 +235,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--quiet")) verbosity = 0;
         else if (!std::strcmp(argv[i], "--cpu")) use_device = false;
         else if (!std::strcmp(argv[i], "--selftest-attn") && i + 1 < argc) selftest_attn = std::atoi(argv[++i]);
+        else if (!std::strcmp(argv[i], "--serve")) serve = true;
+        else if (!std::strcmp(argv[i], "--ctx") && i + 1 < argc) serve_ctx = std::atoi(argv[++i]);
         else if (!std::strcmp(argv[i], "--warm")) warm = true;
         else if (!std::strcmp(argv[i], "--dev-experts")) dev_experts = true;
         else if (!std::strcmp(argv[i], "--no-dev-experts")) dev_experts = false;
@@ -420,7 +425,7 @@ int main(int argc, char** argv) {
     // ---- the prompt tokens -> hidden states ----
     std::vector<int> ids;
     { std::stringstream ss(tokens); std::string t; while (std::getline(ss, t, ',')) if (!t.empty()) ids.push_back(std::atoi(t.c_str())); }
-    if (ids.empty() && !bind_only) return die("no --tokens given") ? 0 : 1;
+    if (ids.empty() && !bind_only && !serve) return die("no --tokens given") ? 0 : 1;
 
     if (bind_only) {
         std::printf("  bind-only: %d tokens, embed rows %d x %d, head %d x %d, device projections %d/%d\n",
@@ -467,6 +472,113 @@ int main(int argc, char** argv) {
         ++feed_n;
         return ok;
     };
+
+    // ---- serve mode: the frontend (serve.server) drives this process over stdin/stdout ----
+    // Startup prints "READY <ctx> [stop]".  Then per request "GEN <max_new> [key=val ...] <id,id,...>" emits one
+    // "T <id>" line per token, ended by "DONE <gen> <prompt_tokens> <prompt_ms> <decode_ms> <finish>".  Keys:
+    // temperature, top_k, top_p, min_p, seed (temperature<=0 = greedy).  A reader thread watches stdin so a mid-
+    // decode "STOP" cancels; "QUIT" exits.  Each request replays its own prompt (fresh caches), so there is no
+    // conversation cache yet: correctness first, prefix reuse later.
+    if (serve) {
+        std::printf("READY %d stop\n", serve_ctx);
+        std::fflush(stdout);
+        const std::vector<int> stop_ids = { 154820, 154827, 154829 };   // <|endoftext|>, <|im_end|>, <|eom|>
+        std::mutex qm; std::condition_variable qc; std::queue<std::string> q; bool eof = false;
+        std::atomic<bool> stopping{false};
+        std::thread reader([&]{
+            std::string l;
+            while (std::getline(std::cin, l)) { { std::lock_guard<std::mutex> lk(qm); q.push(l); } qc.notify_one(); }
+            { std::lock_guard<std::mutex> lk(qm); eof = true; } qc.notify_one();
+        });
+        auto drain_stop = [&]{                     // between tokens: fold any pending STOP into `stopping`
+            std::lock_guard<std::mutex> lk(qm);
+            std::queue<std::string> keep;
+            while (!q.empty()) { std::string l = std::move(q.front()); q.pop();
+                if (l == "STOP") stopping.store(true); else keep.push(std::move(l)); }
+            std::swap(q, keep);
+        };
+        const auto msec = [](std::chrono::steady_clock::time_point a) {
+            return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count(); };
+        std::vector<std::pair<float, int>> cand((size_t) V);
+        for (;;) {
+            std::string line;
+            { std::unique_lock<std::mutex> lk(qm); qc.wait(lk, [&]{ return !q.empty() || eof; });
+              if (q.empty() && eof) break;
+              line = std::move(q.front()); q.pop(); }
+            std::fprintf(stderr, "[glm47-serve] req: \"%s\"\n", line.substr(0, 240).c_str()); std::fflush(stderr);
+            if (line == "QUIT") break;
+            if (line == "STOP") { stopping.store(true); continue; }
+            if (line.rfind("VRAM", 0) == 0) { std::printf("ERR vram: this engine's expert cache is not elastic\n"); std::fflush(stdout); continue; }
+            if (line.rfind("GEN ", 0) != 0) { std::printf("ERR expected: GEN <max_new> [key=val ...] <id,id,...>\n"); std::fflush(stdout); continue; }
+            stopping.store(false);
+            char* p = const_cast<char*>(line.c_str()) + 4;
+            const long long max_new = std::strtoll(p, &p, 10);
+            double temp = 0.0, top_p = 1.0, min_p = 0.0; int top_k = 20; unsigned long long seed = 0;
+            char* ids_start = p;                    // keys are all k=val; the ids (comma list) hold no '='
+            for (char* qq = p; *qq; ) {
+                while (*qq == ' ') ++qq;
+                if (*qq == '\0') { ids_start = qq; break; }
+                char* st = qq; while (*qq && *qq != ' ') ++qq;
+                const std::string tk(st, (size_t)(qq - st));
+                const size_t eq = tk.find('=');
+                if (eq == std::string::npos) { ids_start = st; break; }
+                const std::string k = tk.substr(0, eq); const double fv = std::strtod(tk.c_str() + eq + 1, nullptr);
+                if (k == "temperature") temp = fv; else if (k == "top_p") top_p = fv;
+                else if (k == "top_k") top_k = (int) fv; else if (k == "min_p") min_p = fv;
+                else if (k == "seed") seed = std::strtoull(tk.c_str() + eq + 1, nullptr, 10);
+            }
+            std::vector<int> rid;
+            for (char* qq = ids_start; *qq; ) {
+                char* st = qq; while (*qq && *qq != ',') ++qq;
+                if (qq > st) rid.push_back(std::atoi(st));
+                if (*qq == ',') ++qq;
+            }
+            if (max_new < 1 || rid.empty()) { std::printf("ERR bad request\n"); std::fflush(stdout); continue; }
+            for (auto& c : caches) c.clear();
+            const auto p0 = std::chrono::steady_clock::now();
+            int pos = 0; bool okp = true;
+            for (size_t i = 0; i < rid.size() && okp; ++i) {
+                okp = feed(rid[i], pos++);
+                if ((i & 63) == 63) { drain_stop(); if (stopping.load()) break; }
+            }
+            const double prompt_ms = msec(p0);
+            if (!okp) { std::printf("ERR prompt feed failed\n"); std::fflush(stdout); continue; }
+            std::mt19937_64 rng(seed ? seed : (unsigned long long) std::random_device{}());
+            const auto g0 = std::chrono::steady_clock::now();
+            int ngen = 0; std::string finish = "length";
+            for (int g = 0; g < max_new; ++g) {
+                drain_stop();
+                if (stopping.load()) { finish = "cancelled"; break; }
+                predict();                          // fills `logits`
+                int tok;
+                if (temp <= 0.0) {
+                    tok = (int)(std::max_element(logits.begin(), logits.end()) - logits.begin());
+                } else {
+                    for (int v = 0; v < V; ++v) cand[(size_t) v] = { logits[(size_t) v] / (float) temp, v };
+                    const int k0 = std::max(1, std::min(top_k, V));
+                    std::partial_sort(cand.begin(), cand.begin() + k0, cand.end(),
+                                      [](const std::pair<float, int>& a, const std::pair<float, int>& b) { return a.first > b.first; });
+                    const float mx = cand[0].first; double sum = 0.0;
+                    for (int i = 0; i < k0; ++i) { cand[(size_t) i].first = (float) std::exp(cand[(size_t) i].first - mx); sum += cand[(size_t) i].first; }
+                    int keep = k0;
+                    if (min_p > 0.0) { const double thr = min_p * (double) cand[0].first; for (int i = k0 - 1; i >= 1; --i) if ((double) cand[(size_t) i].first < thr) keep = i; }
+                    if (top_p < 1.0) { double acc = 0.0; for (int i = 0; i < keep; ++i) { acc += (double) cand[(size_t) i].first / sum; if (acc >= top_p) { keep = i + 1; break; } } }
+                    if (keep < 1) keep = 1;
+                    std::uniform_real_distribution<double> U(0.0, sum);
+                    const double r = U(rng); double acc = 0.0; tok = cand[0].second;
+                    for (int i = 0; i < keep; ++i) { acc += (double) cand[(size_t) i].first; if (r <= acc) { tok = cand[(size_t) i].second; break; } }
+                }
+                std::printf("T %d\n", tok); std::fflush(stdout); ++ngen;
+                bool eos = false; for (int s : stop_ids) if (tok == s) { eos = true; break; }
+                if (eos) { finish = "stop"; break; }
+                if (!feed(tok, pos++)) break;
+            }
+            std::printf("DONE %d %d %.1f %.1f %s\n", ngen, (int) rid.size(), prompt_ms, msec(g0), finish.c_str());
+            std::fflush(stdout);
+        }
+        reader.join();
+        return 0;
+    }
 
     // --selftest-attn N: grow a synthetic cache one row at a time to depth N and compare the device
     // decoupled-RoPE attention against the host loop at every depth.  The incremental resident-cache upload's
