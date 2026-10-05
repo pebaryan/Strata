@@ -204,6 +204,19 @@ add_executable(glm47_moe_parity src/kernels/glm47_moe_parity.cpp src/kernels/glm
 target_include_directories(glm47_moe_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(glm47_moe_parity PRIVATE -O2)
 
+# GLM-4.7-Flash full decoder-block parity (branch glm47-port): attn_norm -> MLA -> +x -> ffn_norm ->
+# MoE(+shexp) -> +x, composing the phase-3 MLA and phase-4 MoE with the two block norms (glm_norm.cpp)
+# and the residual wiring - the unit the 47-block trunk is made of.  Against tools/glm47_block_reference.py.
+add_executable(glm47_block_parity src/kernels/glm47_block_parity.cpp src/kernels/glm_mla.cpp
+               src/kernels/glm_moe.cpp src/kernels/glm_norm.cpp)
+target_include_directories(glm47_block_parity PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm47_block_parity PRIVATE -O2)
+# glm_mla.cpp references the CUDA MLA entry points (mla_forward tries the device path and falls back to
+# the host one), so this links the kernel library and cudart exactly as glm47_mla_parity does.
+if(STRATA_ENABLE_CUDA)
+  target_link_libraries(glm47_block_parity PRIVATE strata_kernels CUDA::cudart)
+endif()
+
 # Indexer parity (branch glm5next-port): the 4:1 key pool and the whole-pool selection, against
 # tools/glm5_indexer_reference.py.
 add_executable(glm_indexer_parity src/kernels/glm_indexer_parity.cpp src/kernels/glm_indexer.cpp)
