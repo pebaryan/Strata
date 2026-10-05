@@ -9,12 +9,17 @@
 // The host path is untouched and still the fallback: if no type is set, the hook is absent, or it fails,
 // mla_forward_rope falls back to its float GEMM (see glm_mla.cpp).  So a missing block degrades to slow,
 // never to wrong.
+#include "strata/core/glm_moe_native.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/glm_mla.hpp"
 #include "strata/kernels/glm_moe.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
 #include <chrono>
 #include <cuda_runtime.h>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace strata::kernels::glm {
 namespace {
@@ -140,6 +145,78 @@ bool glm47_native_ffn(const void* const* weights, const int* types, const MoeGeo
     const bool ok = ffn_impl(weights, types, g, x, out);
     g_ffn_ms += now_ms() - t0;
     return ok;
+}
+
+// ---- the routed experts on the device. ----
+//
+// The engine's device expert path is iq_mmvq, whose dispatch covers the IQ types and Q2_K but NOT the
+// k-quants; this model's experts are Q4_K (gate/up) and Q6_K (down), so glm_expert_layer_supported is false
+// and the stage falls back to the CPU.  native_mmvq - the kernel the MLA projections and the shared GLU
+// already use - DOES cover the k-quants, and a routed expert is the same GLU shape as the shared one:
+// gate = mmvq(gu, row); up = mmvq(gu, row + up_off); h = swiglu*quantise; out = mmvq(down, row + down_off).
+// A row is uploaded once per (layer, expert) and reused (FIFO eviction past the budget), so a hit costs no
+// PCIe traffic - the same residency rule the engine's ExpertRowCache applies, sized to whatever VRAM is free.
+namespace {
+struct ExpertRowDev {
+    struct Slot { void* dev = nullptr; size_t bytes = 0; };
+    std::unordered_map<int64_t, Slot> rows;
+    std::vector<int64_t> fifo;
+    size_t bytes = 0, budget = 0;
+    uint64_t hits = 0, misses = 0, evicted = 0;
+};
+ExpertRowDev& experts() { static ExpertRowDev c; return c; }
+
+bool expert_hook(void* ctx, int layer, int expert, const uint8_t* blob,
+                 const strata::kernels::cpu::NativeFmt& f, const float* x, float* out, std::string& err) {
+    ExpertRowDev* c = (ExpertRowDev*) ctx;
+    if (c == nullptr || blob == nullptr || x == nullptr || out == nullptr) { err = "expert hook: null argument"; return false; }
+    const int64_t key = ((int64_t) layer << 20) | (int64_t) expert;
+    uint8_t* row = nullptr;
+    auto it = c->rows.find(key);
+    if (it != c->rows.end()) { row = (uint8_t*) it->second.dev; ++c->hits; }
+    else {
+        const size_t nb = f.bytes;
+        while (c->budget != 0 && c->bytes + nb > c->budget && !c->fifo.empty()) {
+            const int64_t ev = c->fifo.front();
+            c->fifo.erase(c->fifo.begin());
+            auto e = c->rows.find(ev);
+            if (e == c->rows.end()) continue;
+            if (e->second.dev) cudaFree(e->second.dev);
+            c->bytes -= e->second.bytes;
+            c->rows.erase(e);
+            ++c->evicted;
+        }
+        void* dev = nullptr;
+        if (cudaMalloc(&dev, nb) != cudaSuccess) { err = "expert row cudaMalloc failed"; return false; }
+        if (cudaMemcpy(dev, blob, nb, cudaMemcpyHostToDevice) != cudaSuccess) {
+            cudaFree(dev); err = "expert row upload failed"; return false;
+        }
+        row = (uint8_t*) dev;
+        c->rows.emplace(key, ExpertRowDev::Slot{dev, nb});
+        c->fifo.push_back(key);
+        c->bytes += nb;
+        ++c->misses;
+    }
+    // the blob is [gate | up | down]; the two hidden projections sit at the layout's OWN offsets
+    const void* w[3] = { row, row + f.up_off, row + f.down_off };
+    const int t[3] = { f.gu_type, f.gu_type, f.d_type };
+    MoeGeometry g; g.n_embd = f.n_embd; g.ff = f.n_ff; g.clamp_exp = 0.0f; g.clamp_shexp = 0.0f;
+    return glm47_native_ffn(w, t, g, x, out, 0.0f);
+}
+}  // namespace
+
+void glm47_install_device_experts(size_t budget_bytes) {
+    ExpertRowDev& c = experts();
+    c.budget = budget_bytes;
+    strata::core::glm::glm_set_device_expert_ffn(expert_hook, &c);
+    strata::core::glm::glm_set_device_expert_native(true);
+}
+void glm47_device_expert_stats(uint64_t* hits, uint64_t* misses, uint64_t* evicted, size_t* bytes) {
+    const ExpertRowDev& c = experts();
+    if (hits) *hits = c.hits;
+    if (misses) *misses = c.misses;
+    if (evicted) *evicted = c.evicted;
+    if (bytes) *bytes = c.bytes;
 }
 
 // A one-shot quantized GEMV for the sites that are not MLA projections (the head, the dense stem, the

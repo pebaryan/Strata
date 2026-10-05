@@ -31,6 +31,7 @@ GlmDeviceMoeFfnFn g_device_moe_ffn = nullptr;
 GlmDeviceMoeBatchFfnFn g_device_moe_batch_ffn = nullptr;
 void* g_device_moe_ctx = nullptr;
 void* g_device_expert_ctx = nullptr;
+bool g_device_expert_native = false;   // the installed expert hook handles types iq_mmvq does not (the k-quants)
 }
 void glm_set_native_ffn(GlmNativeFfnFn fn) { g_native_ffn = fn; }
 void glm_set_native_ffn_batch(GlmNativeFfnBatchFn fn) { g_native_ffn_batch = fn; }
@@ -38,6 +39,7 @@ void glm_set_device_expert_ffn(GlmDeviceExpertFfnFn fn, void* ctx) {
     g_device_expert_ffn = fn;
     g_device_expert_ctx = ctx;
 }
+void glm_set_device_expert_native(bool enabled) { g_device_expert_native = enabled; }
 void glm_set_device_moe_ffn(GlmDeviceMoeFfnFn fn, void* ctx) {
     g_device_moe_ffn = fn;
     g_device_moe_ctx = ctx;
@@ -143,7 +145,8 @@ bool glm_stage_moe_native(const float* xn, const float* router, const float* pro
             float* expert_out = parts.data() + (size_t) i * g.n_embd;
             // Only dispatch pairs proven by iq_mmvq enter the CUDA path. The remaining expert formats stay on the
             // validated CPU path until their kernels exist; a CUDA failure for a supported pair is an error.
-            if (g_device_expert_ffn != nullptr && glm_expert_layer_supported(fmt.gu_type, fmt.d_type)) {
+            if (g_device_expert_ffn != nullptr &&
+                (g_device_expert_native || glm_expert_layer_supported(fmt.gu_type, fmt.d_type))) {
                 if (!g_device_expert_ffn(g_device_expert_ctx, layer, (int) ids[i], blob, fmt, xn, expert_out, err)) {
                     if (err.empty()) err = "glm_stage_moe_native: device expert FFN failed";
                     return false;

@@ -24,6 +24,10 @@ using GlmDeviceExpertFfnFn = bool (*)(void* ctx, int layer, int expert, const ui
                                       const kernels::cpu::NativeFmt& fmt, const float* x, float* out,
                                       std::string& err);
 void glm_set_device_expert_ffn(GlmDeviceExpertFfnFn fn, void* ctx);
+/// When set, the routed-expert stage tries the device expert hook even for type pairs iq_mmvq's dispatch does
+/// not cover (the k-quants): i.e. when the installed hook is a native_mmvq one rather than iq_mmvq's.  Default
+/// false, so the engine's own IQ-type models are unaffected.
+void glm_set_device_expert_native(bool enabled);
 using GlmDeviceMoeFfnFn = bool (*)(void* ctx, int layer, int n_experts, const int32_t* experts,
                                    const uint8_t* const* blobs, const float* weights,
                                    const kernels::cpu::NativeFmt& fmt, const float* x, float* out,

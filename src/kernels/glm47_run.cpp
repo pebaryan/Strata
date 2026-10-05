@@ -52,6 +52,8 @@ bool glm47_native_ffn(const void* const* weights, const int* types, const MoeGeo
                       const float* x, float* out, float clamp_limit);
 double glm47_project_ms();
 double glm47_ffn_ms();
+void glm47_install_device_experts(size_t budget_bytes);
+void glm47_device_expert_stats(uint64_t* hits, uint64_t* misses, uint64_t* evicted, size_t* bytes);
 }  // namespace strata::kernels::glm
 
 namespace {
@@ -152,7 +154,8 @@ int main(int argc, char** argv) {
     const char* pack = "D:/aimodels/strata-pack-glm47";
     std::string tokens;
     int n_layer = N_LAYER, verbosity = 1, gen = 1;
-    bool bind_only = false, use_device = true, warm = false;
+    bool bind_only = false, use_device = true, warm = false, dev_experts = false;
+    size_t exp_budget = 6ull << 30;   // device bytes for resident expert rows (sized to the free VRAM)
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--gguf") && i + 1 < argc) gguf = argv[++i];
         else if (!std::strcmp(argv[i], "--pack") && i + 1 < argc) pack = argv[++i];
@@ -163,6 +166,8 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(argv[i], "--quiet")) verbosity = 0;
         else if (!std::strcmp(argv[i], "--cpu")) use_device = false;
         else if (!std::strcmp(argv[i], "--warm")) warm = true;
+        else if (!std::strcmp(argv[i], "--dev-experts")) dev_experts = true;
+        else if (!std::strcmp(argv[i], "--exp-budget-mb") && i + 1 < argc) exp_budget = (size_t) std::atoi(argv[++i]) << 20;
     }
 
     std::printf("glm47_run: %d blocks (block 0 dense), n_embd %d, experts %d/%d, ff %d, %s\n",
@@ -288,6 +293,9 @@ int main(int argc, char** argv) {
     if (use_device && n_dev_proj > 0) glm::mla_set_rope_head_cuda(true);
     // install the native GLU: the shared expert runs on the device too
     if (use_device && n_dev_shexp > 0) cglm::glm_set_native_ffn(glm::glm47_native_ffn);
+    // install the routed-expert device path (native_mmvq over resident rows - the engine's own expert guard
+    // only admits the IQ types, which this model's k-quant experts are not)
+    if (use_device && dev_experts) glm::glm47_install_device_experts(exp_budget);
 
     // the engine's per-layer views
     std::vector<cglm::Glm47TrunkLayer> arr((size_t) n_layer);
@@ -396,6 +404,11 @@ int main(int argc, char** argv) {
         std::printf("  row cache: %llu hits / %llu misses, %.2f GiB assembled once\n",
                     (unsigned long long) rc.hits, (unsigned long long) rc.misses,
                     (double) rc.bytes / 1073741824.0);
+        uint64_t eh = 0, em = 0, ee = 0; size_t eb = 0;
+        glm::glm47_device_expert_stats(&eh, &em, &ee, &eb);
+        if (eh || em) std::printf("  expert rows on the device: %llu hits / %llu misses (%llu evicted), %.2f GiB\n",
+                                  (unsigned long long) eh, (unsigned long long) em, (unsigned long long) ee,
+                                  (double) eb / 1073741824.0);
     }
     std::printf("  top-5 (last):");
     for (int i = 0; i < 5; ++i) std::printf(" %d(%.3f)", order[(size_t) i], (double) logits[(size_t) order[(size_t) i]]);
