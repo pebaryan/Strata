@@ -93,8 +93,31 @@ greedy `29116 46 1914 262 3515 735` = "Vienna. So the answer is"; logits dumps a
   with the oracle's position-0 logits for token 325: max |err| 0.34 over 128k vocab, greedy
   argmax identical (1646), 3.9 s single-thread CPU.
 
-Remaining: a multi-token run (exercises RoPE/SWA/KV through the window), then the serving
-integration (pack index path, expert row cache + mmap) and the measured tok/s comparison.
+Serving integration is wired through `strata-kolibri`: it accepts the same `--serve --native ...
+--max-context ...` launch shape as the main engine, keeps per-layer KV state through prompt and
+decode, and speaks the server's `READY / GEN / T / DONE` protocol. The packer exports `tokenizer/`,
+so `serve.server` can expose it through the OpenAI and Anthropic endpoints. The first implementation
+uses the GGUF's mmap-backed expert tensors and the parity-gated CPU graph; moving dense projections
+and the routed-row cache onto the V100 remains the performance phase, not a serving prerequisite.
+
+Measured serving checks on this V100 host:
+
+- one-token pipe request, token 325: greedy token 1646, matching the phase-6 oracle; 4.5 s warm;
+- prompt `325,9255,279,18462,735` (`The capital of Austria is`): token 29116, matching patched
+  llama.cpp; 23.6 s prompt time;
+- `serve.server.StrataEngine` starts the executable, reads its INFO/READY lines, and completes the
+  request with the expected DONE telemetry;
+- `/v1/chat/completions` completed a real request through the exported tokenizer and chat template
+  (55 prompt tokens, one generated token, valid OpenAI response and usage/timing fields).
+
+Run the engine directly:
+
+```sh
+build-kolibri-gate/strata-kolibri --serve \
+  --pack /home/peb/moredata/strata-pack-kolibri \
+  --native /home/peb/moredata/models/Kolibri-1-GGUF/Kolibri-1-Q4_K_M.gguf \
+  --max-context 4096
+```
 
 ### Phase 0 - inventory (done, this document)
 Tensor names, quants, shapes and metadata read from the artifact with gguf-py. Regenerate with

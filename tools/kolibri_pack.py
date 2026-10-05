@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import subprocess
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
@@ -124,10 +125,6 @@ def main() -> int:
     # dense/index: the standalone index path serves every quantized tensor natively from the GGUF
     iq_pack.index_standalone(src, out, model, compat_bf16=args.compat_bf16)
 
-    # write the expert table last-but-one, then the manifest (the completion marker is native_experts.txt;
-    # keep iq_pack's convention: it is unlinked at the start and rewritten at the very end)
-    (out / "native_experts.txt").write_text(ne_text)
-
     manifest = kolibri_manifest(model, {
         "n_expert": n_expert,
         "total_bytes": total,
@@ -136,12 +133,19 @@ def main() -> int:
     })
     (out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
+    # The HTTP server tokenizes text before it reaches the engine.  A pack without this directory can
+    # pass every tensor gate and still cannot be served, so export it as part of the completion contract.
+    tokenizer = pathlib.Path(__file__).resolve().parent / "strata_tokenizer.py"
+    subprocess.run([sys.executable, str(tokenizer), "--gguf", str(src), "--out", str(out)], check=True)
+
     if args.experts_bin:
         raise SystemExit("--experts-bin: cutting experts.bin is not wired yet; the GGUF serves the "
                          "experts natively (native_experts.txt points at the shards), which is what "
                          "phase 2-6 use.  Extend iq_pack's cut for a single-file source if needed.")
 
-    print("pack: %s (native_experts.txt, index.txt, dense.bin, manifest.json)" % out)
+    # Completion marker last: setup must never accept a pack whose tokenizer/export was interrupted.
+    (out / "native_experts.txt").write_text(ne_text)
+    print("pack: %s (native_experts.txt, index.txt, dense.bin, manifest.json, tokenizer/)" % out)
     return 0
 
 

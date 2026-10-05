@@ -1151,6 +1151,11 @@ target_include_directories(kolibri_trunk_gate PRIVATE ${CMAKE_SOURCE_DIR}/includ
 add_executable(kolibri_multitoken_gate tools/kolibri_multitoken_gate.cpp src/kernels/glm_moe.cpp)
 target_include_directories(kolibri_multitoken_gate PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
+# Kolibri serving entrypoint: the parity-gated standard-attention trunk with persistent KV state,
+# exposed through Strata's READY/GEN/T/DONE engine protocol.
+add_executable(strata-kolibri tools/kolibri_serve.cpp src/kernels/glm_moe.cpp)
+target_include_directories(strata-kolibri PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
 # glm45_run (branch glm5next-port): THE PORT'S LAST STEP.  The engine's own 45-block trunk, from the pack,
 # ending in a token.  The acceptance test is argmax == 12089, not a per-layer float match, because the
 # engine accumulates the quantization of 43 routed blocks (~5% of rms worst element, measured).
