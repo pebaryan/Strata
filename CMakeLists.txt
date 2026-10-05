@@ -239,6 +239,18 @@ if(STRATA_ENABLE_CUDA)
   target_link_libraries(glm47_trunk_parity PRIVATE strata_engine CUDA::cudart)
 endif()
 
+# GLM-4.7-Flash RUNNER (branch glm47-port): binds every weight site of every block from the artifact
+# directly (glm47_read.hpp), runs the 47-block trunk with the pack's quantized experts, and prints the
+# head's argmax - the phase-5 end-to-end unit (diffed against the oracle's first generated token).
+add_executable(glm47_run src/kernels/glm47_run.cpp src/core/glm47_trunk.cpp src/core/glm_moe_native.cpp
+               src/kernels/glm47_parallel_shim.cpp src/kernels/glm_mla.cpp src/kernels/glm_moe.cpp
+               src/kernels/glm_norm.cpp)
+target_include_directories(glm47_run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(glm47_run PRIVATE -O2)
+if(STRATA_ENABLE_CUDA)
+  target_link_libraries(glm47_run PRIVATE strata_engine CUDA::cudart)
+endif()
+
 # Indexer parity (branch glm5next-port): the 4:1 key pool and the whole-pool selection, against
 # tools/glm5_indexer_reference.py.
 add_executable(glm_indexer_parity src/kernels/glm_indexer_parity.cpp src/kernels/glm_indexer.cpp)
