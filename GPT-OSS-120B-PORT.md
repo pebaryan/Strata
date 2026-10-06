@@ -157,12 +157,14 @@ sampling step. Comparing four rows against a locally instrumented pinned
 `llama-debug` run with the same context, batch, microbatch, threads, Flash
 Attention, sliding-window setting, layer count, and 42:58 split gave the same
 greedy IDs (`200005, 35644, 200008, 976`) at all four steps, but logits did not
-match: relative L2 was 0.1704, 0.0907, 0.0584, and 0.0782 (cosine similarity
-0.9860–0.9984). The first-row maximum absolute difference was 3.58. Repeating
-the runner capture produced a bit-identical first row. Thus the first sampled
-tokens agree, but full-vector and full-generation parity remain unresolved;
-more layer-level comparison is needed before attributing the gap to a specific
-kernel or execution setting.
+match: relative L2 was 0.1542, 0.1673, 0.0589, and 0.0698 (cosine similarity
+0.9880–0.9983). The first-row maximum absolute difference was 3.04. The
+reference used `--save-logits`, which disables `llama-debug`'s tensor-inspection
+callback; enabling that callback changed the reference logits, so it is not a
+neutral measurement path. Repeating the runner capture produced a bit-identical
+first row. Thus the first sampled tokens agree, but full-vector and
+full-generation parity remain unresolved; more layer-level comparison is
+needed before attributing the gap to a specific kernel or execution setting.
 
 The initial MXFP4 operator parity gate now runs one real 2,880×2,880 routed-expert
 matrix from the GGUF through `ggml_mul_mat` on CPU and CUDA0. Layer 0/expert 0
