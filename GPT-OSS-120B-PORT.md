@@ -132,7 +132,14 @@ prompt, generated 48 tokens, and reported 3.13 s prompt evaluation and 4.33 s
 decode evaluation (11.1 generated tokens/s). This is a single smoke test, not a
 speed or answer-quality claim. Multi-turn requests are accepted as a complete
 prompt each time; the adapter currently clears KV state rather than reusing a
-conversation cache.
+conversation cache. On 2026-10-06, the local 17-layer, 4,096-context,
+1,024-microbatch config passed another loopback `/health` and OpenAI Chat
+Completions check on the two RTX 5060 Ti machine: the arithmetic prompt returned
+`2` with 48 completion tokens. End-to-end HTTP time was 26.70 s on the first
+request and 6.92/6.87 s on two repeated requests. These wall times include
+prompt and decode work and are three observations, not a throughput benchmark.
+The temporary server was stopped after the check; GPU memory returned to its
+idle level.
 
 ## Current status
 
