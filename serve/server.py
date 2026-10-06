@@ -2205,6 +2205,25 @@ class Service:
             max_new = max(1, room)          # --fit-max-tokens: a shorter completion beats a 400
         return ids, kwargs.get("enable_thinking", True) is not False, max_new
 
+    def prepare_raw(self, ids, max_new=None):
+        """-> (ids, thinking, max_new) for a raw /v1/completions prompt: the ids arrive tokenized, so only the
+        context fit is checked (the same never-truncate rules prepare() applies to a chat prompt)."""
+        if not isinstance(ids, list) or not ids or not all(isinstance(t, int) and 0 <= t < 2**24 for t in ids):
+            raise ValueError("prompt: a non-empty list of token ids")
+        ctx = self.engine.max_context
+        if ctx <= 0:
+            ctx = getattr(self.engine, "known_ctx", 0)
+            if ctx <= 0:
+                raise EngineStarting("the engine is starting (a minute or two); try again shortly")
+        room = ctx - CTX_SLACK - len(ids)
+        if max_new is None or max_new <= 0 or room < 1:
+            if room < 1:
+                raise ValueError(f"prompt ({len(ids)} tokens) leaves no room to answer in the context ({ctx})")
+            max_new = room
+        elif max_new > room:
+            max_new = max(1, room)
+        return ids, False, max_new       # thinking off: a raw continuation has no template around it
+
     def _note(self, n, evs, st=None, rate=None):
         with self.status_lock:
             s = self.status if st is None else st
@@ -3150,12 +3169,14 @@ def make_handler(svc: Service):
                     except EngineDied as e:
                         self._json(503, {"error": {"type": "server_error", "message": str(e)}})
                     return
-                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses"):
+                if path in ("/v1/chat/completions", "/v1/messages", "/v1/responses", "/v1/completions"):
                     self.record = svc.begin_request(path, req)
                 if path == "/v1/responses":
                     self._responses(req)
                 elif path == "/v1/chat/completions":
                     self._openai(req)
+                elif path == "/v1/completions":
+                    self._openai_completions(req)
                 elif path == "/v1/messages":
                     self._anthropic(req)
                 elif path == "/v1/messages/count_tokens":
@@ -3541,6 +3562,45 @@ def make_handler(svc: Service):
             req = svc.with_shared(req, "anthropic")
             messages, tools, kw = anthropic_to_messages(req, svc.anthropic_think_unasked)
             self._json(200, {"input_tokens": len(svc.encode_prompt(messages, tools, kw))})
+
+        def _openai_completions(self, req):
+            """Raw POST /v1/completions (llama.cpp's shape): `prompt` as ids or text, plain continuation.
+            llama-benchy and llama.cpp's own clients drive this path; the chat APIs wrap it above."""
+            svc.load()
+            prompt = req.get("prompt")
+            if isinstance(prompt, list):
+                flat = []
+                for p in prompt if prompt and isinstance(prompt[0], list) else [prompt]:
+                    flat.extend(int(t) for t in p)
+                ids = flat
+            elif isinstance(prompt, str):
+                ids = svc.tok.encode(prompt, parse_special=True)
+            else:
+                raise ValueError("prompt: token ids or text")
+            if req.get("model") not in (None, svc.model):
+                raise ValueError(f"model not found: {req.get('model')}")
+            max_new = int(req.get("max_tokens") or req.get("n_predict") or 0)   # 0/-1: the rest of the context
+            ids, thinking, max_new = svc.prepare_raw(ids, max_new)
+            cancel = threading.Event()
+            self._watch_client(cancel)
+            cid, created = "cmpl-" + uuid.uuid4().hex[:24], int(time.time())
+            text, finish, usage = [], "stop", {}
+            for kind, x in svc.run(ids, thinking, None, max_new, req, cancel):
+                if kind == "event":
+                    if x.kind == "content" and x.text:
+                        text.append(x.text)
+                elif x is not None:
+                    finish = {"cancel": "stop"}.get(x["finish"], x["finish"])
+                    usage = {"prompt_tokens": len(ids), "completion_tokens": x["completion_tokens"],
+                             "total_tokens": len(ids) + x["completion_tokens"]}
+                    timings = x.get("timings")
+            body = {"id": cid, "object": "text_completion", "created": created,
+                    "model": svc.model_for(req), "choices": [{"index": 0, "text": "".join(text),
+                                                              "finish_reason": finish}],
+                    "usage": usage}
+            if timings:
+                body["timings"] = timings
+            self._json(200, body)
 
         def _anthropic(self, req):
             svc.load()
