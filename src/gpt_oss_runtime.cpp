@@ -32,6 +32,7 @@ struct Options {
     bool custom_tensor_split = false;
     float tensor_split[2] = {0.0f, 0.0f};
     int32_t dump_block = -1;
+    bool dump_all_layers = false;
     std::string dump_prefix;
     std::string dump_logits_path;
     bool serve = false;
@@ -40,8 +41,10 @@ struct Options {
 
 struct BlockDump {
     int32_t layer = -1;
+    bool all_layers = false;
     std::string prefix;
-    bool written[13] = {};
+    bool written[16] = {};
+    bool written_layers[36] = {};
     uint32_t q_rope_stage = 0;
     uint32_t k_rope_stage = 0;
 };
@@ -64,6 +67,9 @@ constexpr CaptureTarget kBlockTargets[] = {
     {"attn_out", "attn_out", 2880, 20, 1},
     {"ffn_inp", "ffn_inp", 2880, 20, 1},
     {"attn_post_norm", "attn_post_norm", 2880, 20, 1},
+    {"ffn_moe_logits", "ffn_moe_logits", 128, 20, 1},
+    {"ffn_moe_logits_biased", "ffn_moe_logits_biased", 128, 20, 1},
+    {"ffn_moe_probs_biased", "ffn_moe_probs_biased", 128, 20, 1},
     {"ffn_moe_topk", "ffn_moe_topk", 4, 20, 1},
     {"ffn_moe_weights_softmax", "ffn_moe_weights_softmax", 1, 4, 20},
     {"ffn_moe_out", "ffn_moe_out", 2880, 20, 1},
@@ -72,8 +78,39 @@ constexpr CaptureTarget kBlockTargets[] = {
 
 bool capture_block_tensor(ggml_tensor * tensor, bool ask, void * user_data) {
     auto & dump = *static_cast<BlockDump *>(user_data);
-    const std::string expected_suffix = "-" + std::to_string(dump.layer);
     const std::string name = tensor->name;
+    if (dump.all_layers && name.rfind("l_out-", 0) == 0 &&
+        tensor->ne[0] == 2880 && tensor->ne[1] == 20 && tensor->ne[2] == 1) {
+        const std::string_view suffix(name.data() + 6, name.size() - 6);
+        int32_t layer = -1;
+        const auto result = std::from_chars(suffix.data(), suffix.data() + suffix.size(), layer);
+        if (result.ec == std::errc{} && result.ptr == suffix.data() + suffix.size() && layer >= 0 && layer < 36) {
+            if (dump.written_layers[layer]) return false;
+            if (ask) return true;
+            const std::string path = dump.prefix + ".l_out-" + std::to_string(layer) + ".bin";
+            std::ofstream out(path, std::ios::binary | std::ios::trunc);
+            if (!out) {
+                std::cerr << "failed to write layer checkpoint: " << path << '\n';
+                return false;
+            }
+            const size_t bytes = ggml_nbytes(tensor);
+            std::vector<uint8_t> data(bytes);
+            ggml_backend_tensor_get(tensor, data.data(), 0, bytes);
+            const uint64_t header[] = {0x31544253, static_cast<uint64_t>(tensor->type),
+                static_cast<uint64_t>(bytes), static_cast<uint64_t>(tensor->ne[0]),
+                static_cast<uint64_t>(tensor->ne[1]), static_cast<uint64_t>(tensor->ne[2]),
+                static_cast<uint64_t>(tensor->ne[3]), static_cast<uint64_t>(tensor->nb[0]),
+                static_cast<uint64_t>(tensor->nb[1]), static_cast<uint64_t>(tensor->nb[2]),
+                static_cast<uint64_t>(tensor->nb[3])};
+            out.write(reinterpret_cast<const char *>(header), sizeof(header));
+            out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(bytes));
+            if (!out) return false;
+            dump.written_layers[layer] = true;
+            std::cerr << "captured " << name << " bytes=" << bytes << " -> " << path << '\n';
+            return true;
+        }
+    }
+    const std::string expected_suffix = "-" + std::to_string(dump.layer);
     for (size_t i = 0; i < std::size(kBlockTargets); ++i) {
         const auto & target = kBlockTargets[i];
         if (dump.written[i] || name != std::string(target.graph_name) + expected_suffix ||
@@ -141,7 +178,7 @@ void usage(const char * exe) {
     std::cerr << "Usage: " << exe
               << " --model FILE --prompt TEXT [--tokens N] [--gpu-layers N] [--context N]"
               << " [--ubatch N] [--tensor-split GPU0,GPU1] [--dump-block LAYER --dump-prefix PATH]"
-              << " [--dump-logits FILE]\n";
+              << " [--dump-all-layers --dump-prefix PATH] [--dump-logits FILE]\n";
 }
 
 bool parse_options(int argc, char ** argv, Options & o) {
@@ -149,6 +186,7 @@ bool parse_options(int argc, char ** argv, Options & o) {
         const std::string_view key(argv[i]);
         if (key == "--serve") { o.serve = true; continue; }
         if (key == "--tokenize-only") { o.tokenize_only = true; continue; }
+        if (key == "--dump-all-layers") { o.dump_all_layers = true; continue; }
         // The Python server adds its native engine's layer-split hint for multi-GPU
         // configs. This adapter uses llama.cpp tensor_split instead.
         if (key == "--layer-split") { if (i + 1 >= argc) return false; ++i; continue; }
@@ -183,8 +221,9 @@ bool parse_options(int argc, char ** argv, Options & o) {
             return false;
         }
     }
+    const bool has_dump = o.dump_block >= 0 || o.dump_all_layers;
     return !o.model.empty() && (o.serve || !o.prompt.empty()) &&
-        ((o.dump_block < 0 && o.dump_prefix.empty()) || (o.dump_block >= 0 && !o.dump_prefix.empty()));
+        (o.dump_block < 0 || !o.dump_all_layers) && (has_dump == !o.dump_prefix.empty());
 }
 
 struct ServeCommandQueue {
@@ -510,8 +549,9 @@ int main(int argc, char ** argv) {
     context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     context_params.no_perf = false;
     BlockDump block_dump;
-    if (options.dump_block >= 0) {
+    if (options.dump_block >= 0 || options.dump_all_layers) {
         block_dump.layer = options.dump_block;
+        block_dump.all_layers = options.dump_all_layers;
         block_dump.prefix = options.dump_prefix;
         context_params.cb_eval = capture_block_tensor;
         context_params.cb_eval_user_data = &block_dump;

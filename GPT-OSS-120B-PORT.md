@@ -170,8 +170,7 @@ reference used `--save-logits`, which disables `llama-debug`'s tensor-inspection
 callback; enabling that callback changed the reference logits, so it is not a
 neutral measurement path. Repeating the runner capture produced a bit-identical
 first row. Thus the first sampled tokens agree, but full-vector and
-full-generation parity remain unresolved; more layer-level comparison is
-needed before attributing the gap to a specific kernel or execution setting.
+full-generation parity remain unresolved.
 
 The initial MXFP4 operator parity gate now runs one real 2,880×2,880 routed-expert
 matrix from the GGUF through `ggml_mul_mat` on CPU and CUDA0. Layer 0/expert 0
@@ -182,17 +181,33 @@ GGUF slice/layout; it does not establish full-block, expert-routing, or full-mod
 parity. Run it with `build-gptoss\strata_gpt_oss_mxfp4_parity.exe
 D:\aimodels\gpt-oss\gpt-oss-120b-MXFP4.gguf [layer] [expert]`.
 
-The runtime also has an opt-in reference capture for a selected graph block. It
-records the formatted prompt token IDs, attention-normalized input, Q/K/V projections and Q/K RoPE outputs,
-attention output, post-attention norm, top-4 expert IDs, normalized expert
+The runtime also has opt-in reference captures for a selected graph block or
+all 36 layer outputs. A selected block records the formatted prompt token IDs,
+attention-normalized input, Q/K/V projections and Q/K RoPE outputs, attention
+output, post-attention norm, router logits, top-4 expert IDs, normalized expert
 weights, MoE output, and post-residual block output from llama.cpp's own named
 graph checkpoints. Captures use a binary header with GGML type, dimensions, byte
-count, and strides, followed by the tensor storage bytes;
-normal runs do not enable the evaluation callback. For example, add
+count, and strides, followed by the tensor storage bytes; normal runs do not
+enable the evaluation callback. For example, add
 `--dump-block 0 --dump-prefix build-gptoss\block0ref` to the runner command above.
+Use `--dump-all-layers --dump-prefix build-gptoss\alllayers` to capture each
+layer's post-residual output from one prompt evaluation.
 A local capture of the 20-token prompt produced finite F32 `2880×20` tensors at
 the hidden-state checkpoints. It is reference instrumentation; normal runs do not
 enable the callback.
+
+Comparing all layer outputs for the same 20-token prompt with matching selected
+checkpoints showed relative L2 errors of about `5e-8` and `7e-8` at layers 0 and
+1, `7.25e-4` at layer 2, `1.62e-2` at layer 3, and `1.23e-1` at layer 35. A
+matched layer-2 checkpoint comparison found Q/K/V projection errors below
+`1.3e-5` relative L2, but attention output at `3.00e-4`; the MoE output was
+`1.84e-3`. At layer 3, attention output error was `6.18e-3`; one of 80 routed
+expert IDs differed (token 15), and the MoE output error was `6.73e-2`. The
+router's raw-logit relative L2 was `1.69e-3`. This localizes the observed drift
+to accumulation beginning in the second sliding-window block and growing in
+subsequent blocks, but does not identify which kernel or setting causes it.
+These are measurements from one prompt and one GPU configuration, not universal
+error bounds.
 
 The first isolated MoE branch comparison now passes for prompt tokens 0, 5, and
 19. A Strata-side ggml graph uses the captured normalized activations, expert IDs,
