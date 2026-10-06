@@ -880,7 +880,9 @@ bool MtpDrafter::record_rest(int step_row, cudaStream_t cs, std::string& err) {
         } else {
         for (int t = 0; t < T; ++t) {
             bf16_gemv_fp32_mmvf(mixed_ + t * N, bf16("mlp.gate.weight"), logits_ + t * g.n_expert, (int) N, (int) g.n_expert, cs);
-            if (native_router_enabled()) native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K, cs);
+            if (native_router_enabled())
+                native_router_top10(logits_ + t * g.n_expert, ids_ + t * K, w_ + t * K,
+                                    (int) g.n_expert, cs);
             else router_top10(logits_ + t * g.n_expert, 1, (int) g.n_expert, (int) K, ids_ + t * K, w_ + t * K, cs);
         }
         }

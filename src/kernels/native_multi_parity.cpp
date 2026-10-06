@@ -75,7 +75,8 @@ int main(int argc, char**) {
             check(cudaMalloc(&d_w, (size_t) n * 10 * 4), "w");
             check(cudaMalloc(&d_wr, (size_t) n * 10 * 4), "wr");
             native_router_top10_multi(d_l, d_i, d_w, n, 512, st);
-            for (int t = 0; t < n; ++t) native_router_top10(d_l + (size_t) t * 512, d_ir + t * 10, d_wr + t * 10, st);
+            for (int t = 0; t < n; ++t)
+                native_router_top10(d_l + (size_t) t * 512, d_ir + t * 10, d_wr + t * 10, 512, st);
             check(cudaDeviceSynchronize(), "sync");
             const auto i1 = down(d_i, (size_t) n * 10), i2 = down(d_ir, (size_t) n * 10);
             const auto w1 = down(d_w, (size_t) n * 10), w2 = down(d_wr, (size_t) n * 10);

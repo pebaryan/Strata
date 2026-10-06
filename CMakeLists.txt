@@ -1564,5 +1564,5 @@ add_executable(strata-glm tools/glm45_run.cpp src/core/glm_trunk.cpp src/core/gl
                src/core/expert_row_cache.cpp src/core/glm_bind.cpp src/core/native_dense.cpp src/core/native_head.cpp
                src/core/expert_source.cpp src/core/expert_cache.cpp src/core/remote_experts.cpp src/kernels/glm_kda.cpp src/kernels/glm_moe.cpp
                src/kernels/glm_mla.cpp src/kernels/glm_hc.cpp src/kernels/cuda/quantize_act.cu)
-target_include_directories(strata-glm PRIVATE /include)
+target_include_directories(strata-glm PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata-glm PRIVATE strata_kernels strata_kernels_cpu CUDA::cudart)
