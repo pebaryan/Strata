@@ -22,6 +22,14 @@ constexpr int64_t kKvWidth = 8 * 64;
 constexpr size_t kHeaderWords = 11;
 constexpr uint64_t kMagic = 0x31544253;
 
+std::string tensor_name(int layer, const char* suffix) {
+    return "blk." + std::to_string(layer) + "." + suffix;
+}
+
+std::string capture_name(const std::string& prefix, const char* name, int layer) {
+    return prefix + "." + name + "-" + std::to_string(layer) + ".bin";
+}
+
 struct Capture {
     std::vector<uint8_t> bytes;
     uint64_t type = 0;
@@ -116,17 +124,19 @@ void compare_capture(const char* name, const std::vector<float>& actual, const C
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 3) { std::cerr << "Usage: " << argv[0] << " MODEL.gguf CAPTURE_PREFIX\n"; return 2; }
+    if (argc < 3 || argc > 4) { std::cerr << "Usage: " << argv[0] << " MODEL.gguf CAPTURE_PREFIX [LAYER]\n"; return 2; }
     try {
         const std::string prefix = argv[2];
-        const auto input_ref = read_capture(prefix + ".attn_norm-0.bin");
-        const auto q_pre_ref = read_capture(prefix + ".Qcur_pre_rope-0.bin");
-        const auto q_rope_ref = read_capture(prefix + ".Qcur_rope-0.bin");
-        const auto k_pre_ref = read_capture(prefix + ".Kcur_pre_rope-0.bin");
-        const auto k_rope_ref = read_capture(prefix + ".Kcur_rope-0.bin");
-        const auto v_ref = read_capture(prefix + ".Vcur-0.bin");
-        const auto ffn_inp_ref = read_capture(prefix + ".ffn_inp-0.bin");
-        const auto post_norm_ref = read_capture(prefix + ".attn_post_norm-0.bin");
+        const int layer = argc == 4 ? std::stoi(argv[3]) : 0;
+        if (layer < 0 || layer >= 36) throw std::runtime_error("layer must be in [0, 35]");
+        const auto input_ref = read_capture(capture_name(prefix, "attn_norm", layer));
+        const auto q_pre_ref = read_capture(capture_name(prefix, "Qcur_pre_rope", layer));
+        const auto q_rope_ref = read_capture(capture_name(prefix, "Qcur_rope", layer));
+        const auto k_pre_ref = read_capture(capture_name(prefix, "Kcur_pre_rope", layer));
+        const auto k_rope_ref = read_capture(capture_name(prefix, "Kcur_rope", layer));
+        const auto v_ref = read_capture(capture_name(prefix, "Vcur", layer));
+        const auto ffn_inp_ref = read_capture(capture_name(prefix, "ffn_inp", layer));
+        const auto post_norm_ref = read_capture(capture_name(prefix, "attn_post_norm", layer));
         std::ifstream token_file(prefix + ".tokens.txt");
         std::vector<int32_t> token_ids;
         int32_t token_id = 0;
@@ -146,27 +156,37 @@ int main(int argc, char** argv) {
         ggml_context* ctx = ggml_init(params);
         if (!ctx) throw std::runtime_error("ggml_init failed");
 
-        auto* q_w = make_weight(ctx, model, "blk.0.attn_q.weight", kHidden, kQWidth);
-        auto* k_w = make_weight(ctx, model, "blk.0.attn_k.weight", kHidden, kKvWidth);
-        auto* v_w = make_weight(ctx, model, "blk.0.attn_v.weight", kHidden, kKvWidth);
-        auto* q_b = make_bias(ctx, model, "blk.0.attn_q.bias", kQWidth);
-        auto* k_b = make_bias(ctx, model, "blk.0.attn_k.bias", kKvWidth);
-        auto* v_b = make_bias(ctx, model, "blk.0.attn_v.bias", kKvWidth);
-        auto* wo = make_weight(ctx, model, "blk.0.attn_output.weight", kQWidth, kHidden);
-        auto* wo_b = make_bias(ctx, model, "blk.0.attn_output.bias", kHidden);
-        auto* sinks = make_bias(ctx, model, "blk.0.attn_sinks.weight", 64);
-        const auto* emb_info = model.find("token_embd.weight");
-        if (!emb_info || emb_info->shape.size() != 2 || emb_info->shape[0] != kHidden)
-            throw std::runtime_error("unexpected token embedding matrix geometry");
-        auto* embeddings = make_weight(ctx, model, "token_embd.weight", kHidden, static_cast<int64_t>(emb_info->shape[1]));
+        const auto qn = tensor_name(layer, "attn_q.weight"), kn = tensor_name(layer, "attn_k.weight");
+        const auto vn = tensor_name(layer, "attn_v.weight"), qbn = tensor_name(layer, "attn_q.bias");
+        const auto kbn = tensor_name(layer, "attn_k.bias"), vbn = tensor_name(layer, "attn_v.bias");
+        const auto won = tensor_name(layer, "attn_output.weight"), wobn = tensor_name(layer, "attn_output.bias");
+        const auto sn = tensor_name(layer, "attn_sinks.weight"), an = tensor_name(layer, "attn_norm.weight");
+        const auto pn = tensor_name(layer, "post_attention_norm.weight");
+        auto* q_w = make_weight(ctx, model, qn, kHidden, kQWidth);
+        auto* k_w = make_weight(ctx, model, kn, kHidden, kKvWidth);
+        auto* v_w = make_weight(ctx, model, vn, kHidden, kKvWidth);
+        auto* q_b = make_bias(ctx, model, qbn, kQWidth);
+        auto* k_b = make_bias(ctx, model, kbn, kKvWidth);
+        auto* v_b = make_bias(ctx, model, vbn, kKvWidth);
+        auto* wo = make_weight(ctx, model, won, kQWidth, kHidden);
+        auto* wo_b = make_bias(ctx, model, wobn, kHidden);
+        auto* sinks = make_bias(ctx, model, sn, 64);
         auto* token_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kTokens);
-        auto* attn_norm_w = make_bias(ctx, model, "blk.0.attn_norm.weight", kHidden);
-        auto* post_norm_w = make_bias(ctx, model, "blk.0.post_attention_norm.weight", kHidden);
+        auto* attn_norm_w = make_bias(ctx, model, an, kHidden);
+        auto* post_norm_w = make_bias(ctx, model, pn, kHidden);
         auto* positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, kTokens);
         auto* mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, kTokens, kTokens, 64);
         auto* sink_scores = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, kTokens, 64);
         auto* sink_values = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, 64, 1, 64);
-        auto* layer_input = ggml_get_rows(ctx, embeddings, token_tensor);
+        ggml_tensor* embeddings = nullptr;
+        if (layer == 0) {
+            const auto* emb_info = model.find("token_embd.weight");
+            if (!emb_info || emb_info->shape.size() != 2 || emb_info->shape[0] != kHidden)
+                throw std::runtime_error("unexpected token embedding matrix geometry");
+            embeddings = make_weight(ctx, model, "token_embd.weight", kHidden, static_cast<int64_t>(emb_info->shape[1]));
+        }
+        auto* layer_input = layer == 0 ? ggml_get_rows(ctx, embeddings, token_tensor)
+                                       : ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kHidden, kTokens);
         auto* attn_norm = ggml_mul(ctx, ggml_rms_norm(ctx, layer_input, 1.0e-5f), attn_norm_w);
         auto* q2 = ggml_add(ctx, ggml_mul_mat(ctx, q_w, attn_norm), q_b);
         auto* k2 = ggml_add(ctx, ggml_mul_mat(ctx, k_w, attn_norm), k_b);
@@ -211,15 +231,24 @@ int main(int argc, char** argv) {
         ggml_build_forward_expand(graph, ffn_inp); ggml_build_forward_expand(graph, post_norm);
         ggml_backend_buffer_t buffer = ggml_backend_alloc_ctx_tensors(ctx, cpu);
         if (!buffer) throw std::runtime_error("CPU tensor allocation failed");
-        upload_model_tensor(q_w, model, "blk.0.attn_q.weight"); upload_model_tensor(k_w, model, "blk.0.attn_k.weight");
-        upload_model_tensor(v_w, model, "blk.0.attn_v.weight"); upload_model_tensor(q_b, model, "blk.0.attn_q.bias");
-        upload_model_tensor(k_b, model, "blk.0.attn_k.bias"); upload_model_tensor(v_b, model, "blk.0.attn_v.bias");
-        upload_model_tensor(wo, model, "blk.0.attn_output.weight"); upload_model_tensor(wo_b, model, "blk.0.attn_output.bias");
-        upload_model_tensor(sinks, model, "blk.0.attn_sinks.weight");
-        upload_model_tensor(embeddings, model, "token_embd.weight");
-        upload_model_tensor(attn_norm_w, model, "blk.0.attn_norm.weight");
-        upload_model_tensor(post_norm_w, model, "blk.0.post_attention_norm.weight");
-        ggml_backend_tensor_set(token_tensor, token_ids.data(), 0, token_ids.size()*sizeof(int32_t));
+        upload_model_tensor(q_w, model, qn); upload_model_tensor(k_w, model, kn);
+        upload_model_tensor(v_w, model, vn); upload_model_tensor(q_b, model, qbn);
+        upload_model_tensor(k_b, model, kbn); upload_model_tensor(v_b, model, vbn);
+        upload_model_tensor(wo, model, won); upload_model_tensor(wo_b, model, wobn);
+        upload_model_tensor(sinks, model, sn);
+        upload_model_tensor(attn_norm_w, model, an);
+        upload_model_tensor(post_norm_w, model, pn);
+        if (layer == 0) {
+            upload_model_tensor(embeddings, model, "token_embd.weight");
+            ggml_backend_tensor_set(token_tensor, token_ids.data(), 0, token_ids.size()*sizeof(int32_t));
+        }
+        std::vector<float> layer_input_values;
+        if (layer > 0) {
+            layer_input_values = dense_f32(read_capture(capture_name(prefix, "l_out", layer - 1)));
+            if (layer_input_values.size() != static_cast<size_t>(kHidden*kTokens))
+                throw std::runtime_error("previous layer output must be 2880x20");
+            ggml_backend_tensor_set(layer_input, layer_input_values.data(), 0, layer_input_values.size()*sizeof(float));
+        }
         std::vector<int32_t> pos(kTokens); for (int32_t i=0;i<kTokens;++i) pos[i]=i;
         ggml_backend_tensor_set(positions, pos.data(), 0, pos.size()*sizeof(int32_t));
         std::vector<float> mask_values(static_cast<size_t>(kTokens*kTokens*64));
@@ -250,11 +279,11 @@ int main(int argc, char** argv) {
         compare_capture("K_pre_rope", get(k3), k_pre_ref, worst_rel, worst_abs);
         compare_capture("K_rope", get(k_rope), k_rope_ref, worst_rel, worst_abs);
         compare_capture("V", get(v3), v_ref, worst_rel, worst_abs);
-        compare_capture("attention_output", get(attn_out), read_capture(prefix + ".attn_out-0.bin"), worst_rel, worst_abs);
+        compare_capture("attention_output", get(attn_out), read_capture(capture_name(prefix, "attn_out", layer)), worst_rel, worst_abs);
         compare_capture("ffn_inp", get(ffn_inp), ffn_inp_ref, worst_rel, worst_abs);
         compare_capture("attn_post_norm", get(post_norm), post_norm_ref, worst_rel, worst_abs);
-        write_capture(prefix + ".candidate.ffn_inp-0.bin", ffn_inp, cpu);
-        write_capture(prefix + ".candidate.attn_post_norm-0.bin", post_norm, cpu);
+        write_capture(prefix + ".candidate.ffn_inp-" + std::to_string(layer) + ".bin", ffn_inp, cpu);
+        write_capture(prefix + ".candidate.attn_post_norm-" + std::to_string(layer) + ".bin", post_norm, cpu);
         std::cout << "worst_max_abs=" << worst_abs << " worst_relative_l2=" << worst_rel
                   << " tolerance_max_abs=0.05 tolerance_relative_l2=0.003\n";
         ggml_backend_buffer_free(buffer); ggml_free(ctx); ggml_backend_free(cpu);

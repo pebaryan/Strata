@@ -168,6 +168,15 @@ capture; enabling that callback changes graph segmentation and is not a neutral
 measurement path. When configuring a separate upstream build for comparisons,
 match Strata's `-DGGML_OPENMP=OFF -DGGML_LLAMAFILE=OFF` settings.
 
+A third prompt containing 154 tokens crosses GPT-OSS's 128-token sliding-window
+boundary. With the same CPU build flags, 17 GPU layers, 42:58 split, context 512,
+batch 512, microbatch 128, four threads, Flash Attention, and full SWA cache, its
+32 raw full-vocabulary rows were also bit-for-bit identical between Strata and
+`llama-debug`: 6,434,816 F32 values, zero differences, and identical greedy IDs
+at all 32 steps. Both paths used the same 154 prompt token IDs. This verifies
+full-depth output parity on a prompt that exercises attention beyond the SWA
+window; it remains a three-prompt, 32-step sample, not a general guarantee.
+
 The initial MXFP4 operator parity gate now runs one real 2,880×2,880 routed-expert
 matrix from the GGUF through `ggml_mul_mat` on CPU and CUDA0. Layer 0/expert 0
 measured max absolute error `2.38e-7` and relative L2 `8.62e-8`; layer 17/expert 7
@@ -242,6 +251,17 @@ absolute error is `0.117939`. Router top-4 IDs match at all positions, with
 maximum weight error `4.52e-4`. This adds a second prompt to the diagnostic sample,
 not full-depth or production validation.
 
+The block diagnostic can also target layer 1, which uses full attention, and can
+capture its input from layer 0 in the same run as all layer outputs. On the
+arithmetic prompt, independently recomputed Q/K/V and RoPE tensors again matched
+exactly. The decomposed attention output differed by max absolute `0.0523634`
+and relative L2 `0.00223377`; its full-block input `ffn_inp` relative L2 was
+`0.000648015`, and post-attention norm relative L2 was `0.00153392`. The
+attention absolute error narrowly exceeds the diagnostic `0.05` threshold, so
+this decomposed graph reports FAIL; it is not the production path, which calls
+llama.cpp's graph directly. This 20-token diagnostic by itself does not cross
+the 128-token SWA boundary.
+
 Reproduce after capturing the block:
 
 ```powershell
@@ -254,8 +274,16 @@ for ($i = 0; $i -lt 20; $i++) {
 }
 ```
 
+For a layer-1 diagnostic, add both `--dump-block 1` and `--dump-all-layers` to
+the runner capture command, then pass the layer number to the comparison tool:
+
+```powershell
+build-gptoss\strata_gpt_oss_attention_parity.exe `
+  D:\aimodels\gpt-oss\gpt-oss-120b-MXFP4.gguf build-gptoss\block1full 1
+```
+
 Run
-`build-gptoss\strata_gpt_oss_attention_parity.exe MODEL.gguf CAPTURE_PREFIX`
+`build-gptoss\strata_gpt_oss_attention_parity.exe MODEL.gguf CAPTURE_PREFIX [LAYER]`
 after making the same capture.
 
 The earlier 17-layer configuration loaded the GGUF with 33,512 MiB in the CPU

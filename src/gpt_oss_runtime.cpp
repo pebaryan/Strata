@@ -55,6 +55,7 @@ struct CaptureTarget {
     int64_t ne0;
     int64_t ne1;
     int64_t ne2;
+    bool optional = false;
 };
 
 constexpr CaptureTarget kBlockTargets[] = {
@@ -68,8 +69,8 @@ constexpr CaptureTarget kBlockTargets[] = {
     {"ffn_inp", "ffn_inp", 2880, 20, 1},
     {"attn_post_norm", "attn_post_norm", 2880, 20, 1},
     {"ffn_moe_logits", "ffn_moe_logits", 128, 20, 1},
-    {"ffn_moe_logits_biased", "ffn_moe_logits_biased", 128, 20, 1},
-    {"ffn_moe_probs_biased", "ffn_moe_probs_biased", 128, 20, 1},
+    {"ffn_moe_logits_biased", "ffn_moe_logits_biased", 128, 20, 1, true},
+    {"ffn_moe_probs_biased", "ffn_moe_probs_biased", 128, 20, 1, true},
     {"ffn_moe_topk", "ffn_moe_topk", 4, 20, 1},
     {"ffn_moe_weights_softmax", "ffn_moe_weights_softmax", 1, 4, 20},
     {"ffn_moe_out", "ffn_moe_out", 2880, 20, 1},
@@ -106,6 +107,7 @@ bool capture_block_tensor(ggml_tensor * tensor, bool ask, void * user_data) {
             out.write(reinterpret_cast<const char *>(data.data()), static_cast<std::streamsize>(bytes));
             if (!out) return false;
             dump.written_layers[layer] = true;
+            if (dump.layer == layer) dump.written[std::size(kBlockTargets) - 1] = true;
             std::cerr << "captured " << name << " bytes=" << bytes << " -> " << path << '\n';
             return true;
         }
@@ -223,7 +225,7 @@ bool parse_options(int argc, char ** argv, Options & o) {
     }
     const bool has_dump = o.dump_block >= 0 || o.dump_all_layers;
     return !o.model.empty() && (o.serve || !o.prompt.empty()) &&
-        (o.dump_block < 0 || !o.dump_all_layers) && (has_dump == !o.dump_prefix.empty());
+        (has_dump == !o.dump_prefix.empty());
 }
 
 struct ServeCommandQueue {
@@ -663,8 +665,11 @@ int main(int argc, char ** argv) {
     llama_free(context);
     llama_model_free(model);
     llama_backend_free();
-    if (options.dump_block >= 0 && !std::all_of(std::begin(block_dump.written), std::end(block_dump.written),
-                                                [](bool written) { return written; })) {
+    bool block_capture_complete = true;
+    for (size_t i = 0; i < std::size(kBlockTargets); ++i) {
+        if (!kBlockTargets[i].optional && !block_dump.written[i]) block_capture_complete = false;
+    }
+    if (options.dump_block >= 0 && !block_capture_complete) {
         std::cerr << "block capture incomplete; one or more reference tensors were not observed\n";
         return 1;
     }
