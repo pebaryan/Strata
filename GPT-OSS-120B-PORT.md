@@ -131,6 +131,14 @@ single block and prompt pass the current gate, with a visible but bounded
 fused-versus-decomposed attention difference. It does not establish accuracy on
 other prompts or parity through all 36 layers.
 
+A second 20-token prompt, “Explain why the sky looks blue in one sentence. Keep
+it simple.”, also passes the same block-0 checks at all 20 positions. Its
+decomposed attention output differs by max absolute `0.023993` and relative L2
+`0.001577`; the full block's worst relative L2 is `0.00204637` and worst max
+absolute error is `0.117939`. Router top-4 IDs match at all positions, with
+maximum weight error `4.52e-4`. This adds a second prompt to the diagnostic sample,
+not full-depth or production validation.
+
 Reproduce after capturing the block:
 
 ```powershell
