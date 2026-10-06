@@ -38,6 +38,16 @@ def joined(evs, kind):
 
 
 class Parser(unittest.TestCase):
+    def test_gpt_oss_channel_markers_separate_reasoning_from_final(self):
+        p = OutputParser(thinking=True, gpt_oss=True)
+        evs = []
+        for piece in ("<|channel|>", "analysis", "<|message|>", "check the arithmetic",
+                      "<|end|>", "<|start|>", "assistant", "<|channel|>", "final", "<|message|>", "2"):
+            evs += p.feed(piece)
+        evs += p.finish()
+        self.assertEqual(joined(evs, "reasoning"), "check the arithmetic")
+        self.assertEqual(joined(evs, "content"), "2")
+
     def test_a_declared_call_in_the_reasoning_is_a_call(self):
         text = "before\n" + CALL + "\n</think>\n\nanswer"      # at a line start, nothing but whitespace after it (#1058)
         for width in (1, 2, 7, 100_000):

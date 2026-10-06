@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -45,6 +46,7 @@ class ChatTemplate:
         env = ImmutableSandboxedEnvironment(trim_blocks=True, lstrip_blocks=True, extensions=["jinja2.ext.loopcontrols"])
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
+        env.globals["strftime_now"] = time.strftime
         self.source = Path(path).read_text(encoding="utf-8")
         self.template = env.from_string(self.source)
 
@@ -590,8 +592,13 @@ class OutputParser:
     """Incremental parser of the model's text. Feed deltas; get events. A tag split across deltas is held back
     until it is complete, so clients never see `<tool_` or `</thi`."""
 
-    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False):
+    def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
+                 gpt_oss: bool = False):
         self.state = "reasoning" if thinking else "content"
+        self.gpt_oss = gpt_oss
+        self.gpt_oss_header: str | None = None
+        self.gpt_oss_start = False
+        self.gpt_oss_start_text = ""
         self.buf = ""
         self.lead = False
         self.schemas = {t.get("name"): t for t in tools or []}
@@ -775,6 +782,61 @@ class OutputParser:
         return best
 
     def feed(self, delta: str) -> list[Event]:
+        if not self.gpt_oss:
+            return self._feed_text(delta)
+        out: list[Event] = []
+        while delta:
+            if self.gpt_oss_start:
+                start_text = self.gpt_oss_start_text + delta
+                if len(start_text) < len("assistant") and "assistant".startswith(start_text):
+                    self.gpt_oss_start_text = start_text
+                    return out
+                if start_text.startswith("assistant"):
+                    delta = start_text[len("assistant"):]
+                    self.gpt_oss_start = False
+                    self.gpt_oss_start_text = ""
+                    continue
+                out += self._feed_text("<|start|>" + start_text)
+                self.gpt_oss_start = False
+                self.gpt_oss_start_text = ""
+                continue
+            if self.gpt_oss_header is not None:
+                header = self.gpt_oss_header + delta
+                end = header.find("<|message|>")
+                if end < 0:
+                    if len(header) > 64:
+                        out += self._feed_text("<|channel|>" + header)
+                        self.gpt_oss_header = None
+                    else:
+                        self.gpt_oss_header = header
+                    return out
+                channel = header[:end].strip()
+                if channel in ("analysis", "justify", "confidence", "summary"):
+                    self.state = "reasoning"
+                else:
+                    self.state, self.lead = "content", True
+                self.gpt_oss_header = None
+                delta = header[end + len("<|message|>"):]
+                continue
+            if delta.startswith("<|start|>"):
+                delta = delta[len("<|start|>"):]
+                self.gpt_oss_start = True
+                self.gpt_oss_start_text = ""
+                continue
+            marker = delta.find("<|channel|>")
+            if marker >= 0:
+                if marker:
+                    out += self._feed_text(delta[:marker])
+                delta = delta[marker + len("<|channel|>"):]
+                self.gpt_oss_header = ""
+                continue
+            delta = delta.replace("<|end|>", "")
+            if delta:
+                out += self._feed_text(delta)
+            return out
+        return out
+
+    def _feed_text(self, delta: str) -> list[Event]:
         self.buf += delta
         out: list[Event] = []
         while True:

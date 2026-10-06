@@ -63,6 +63,69 @@ The live machine probe found two RTX 5060 Ti devices (16,283 MiB available to CU
 13.3 and MSVC 19.44 are installed. The previous RTX 5070/12 GB figures elsewhere in Strata's benchmark
 docs refer to a different PC and are not this port's target.
 
+## First Strata API serving path
+
+The resident `strata_gpt_oss --serve` adapter now speaks Strata's existing line
+protocol. `serve/server.py` remains the HTTP/API process; it starts one resident
+GPT-OSS engine, passes token IDs, and streams token IDs back. The adapter keeps
+the model loaded between requests, clears per-request KV state, supports STOP,
+and uses the pinned llama.cpp graph and CUDA kernels. The server config can set
+`temperature`, `top_k`, `top_p`, `min_p`, repetition/frequency/presence penalties,
+and `seed`; it does not enable batching, disk sessions, vision, or tool calling
+for this adapter yet.
+
+GPT-OSS declares the `gpt-4o` tokenizer pre-tokenizer, not Qwen35. The exporter
+and Strata API tokenizer now select the pinned llama.cpp GPT4O pattern by the
+GGUF `tokenizer.ggml.pre` value. The extracted tokenizer passed its round-trip
+corpus, and on the same fully rendered GPT-OSS prompt Python and llama.cpp
+produced exactly the same 81 token IDs. The server strips GPT-OSS channel and
+message boundaries into reasoning/content events and recognizes `<|return|>`
+as the turn-ending token.
+
+For a local build, configure with `-DSTRATA_GPT_OSS_RUNTIME=ON` and the existing
+CUDA/native-experts options, then build `strata_gpt_oss`. Extract the GGUF's
+tokenizer and template:
+
+```powershell
+python tools/strata_tokenizer.py `
+  --gguf D:\aimodels\gpt-oss\gpt-oss-120b-MXFP4.gguf `
+  --out build-gptoss\gptoss-serve --check
+```
+
+Use a Strata server config with the equivalent of these fields (adjust absolute
+paths for the checkout and model):
+
+```json
+{
+  "exe": "D:/code/Strata-gpt-oss-120b/build-gptoss/strata_gpt_oss.exe",
+  "args": ["--model", "D:/aimodels/gpt-oss/gpt-oss-120b-MXFP4.gguf",
+           "--gpu-layers", "17", "--context", "512", "--ubatch", "128",
+           "--tensor-split", "0.42,0.58"],
+  "cwd": "D:/code/Strata-gpt-oss-120b",
+  "backend": "cuda",
+  "gpu": [0, 1],
+  "tokenizer": "D:/code/Strata-gpt-oss-120b/build-gptoss/gptoss-serve/tokenizer",
+  "model_name": "gpt-oss-120b"
+}
+```
+
+Start only on loopback unless an API key is configured:
+
+```powershell
+python -m serve.server --engine strata `
+  --config build-gptoss\gptoss-serve\strata.json --host 127.0.0.1 --port 8095
+```
+
+The local service passed `/health`, OpenAI Chat Completions, and Anthropic
+Messages smoke tests. Both API dialects returned text `2` and routed the
+reasoning separately for “What is 1 + 1? Answer with one digit only.” The OpenAI
+run used an 81-token prompt, generated 19 tokens, and reported 27.9 s prompt
+evaluation and 2.9 s decode evaluation (about 6.5 generated tokens/s) on the two
+RTX 5060 Ti cards with 17/36 layers offloaded. This is a single smoke test, not a
+speed or answer-quality claim. Multi-turn requests are accepted as a complete
+prompt each time; the adapter currently clears KV state rather than reusing a
+conversation cache.
+
 ## Current status
 
 Phase 0 is passed for the local GGUF. The pinned llama.cpp/ggml CUDA baseline and

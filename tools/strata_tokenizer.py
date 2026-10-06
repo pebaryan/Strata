@@ -63,6 +63,18 @@ QWEN35_PATTERN = (
     r"|\s+"
 )
 
+# llama.cpp's LLAMA_VOCAB_PRE_TYPE_GPT4O (the pre-tokenizer in GPT-OSS's GGUF).
+# Keep this distinct from Qwen35: GPT4O groups runs of up to three digits and
+# uses case-aware letter splits, while Qwen35 treats combining marks as letters.
+GPT4O_PATTERN = (
+    r"[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+"
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+((?=[\p{L}])([^A-Z]))*"
+    r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?"
+    r"|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+PRE_PATTERNS = {"qwen35": QWEN35_PATTERN, "gpt-4o": GPT4O_PATTERN}
+
 
 class Tokenizer:
     def __init__(self, tokens: list[str], merges: list[str], token_types: list[int] | None = None,
@@ -86,7 +98,10 @@ class Tokenizer:
             if parts[0] not in self.ids or parts[1] not in self.ids:
                 raise ValueError("merge %d names a token outside the vocabulary: %r" % (i, m))
             self.ranks[(parts[0], parts[1])] = i
-        self._re = regex.compile(QWEN35_PATTERN)
+        pattern = PRE_PATTERNS.get(pre)
+        if pattern is None:
+            raise ValueError("unsupported tokenizer pre-tokenizer %r" % pre)
+        self._re = regex.compile(pattern)
 
         # The literals matched directly instead of being run through BPE.  GGUF token types: 3 = CONTROL,
         # 4 = USER_DEFINED.  The two classes behave DIFFERENTLY and llama.cpp's own tokenizer settled which:
@@ -205,7 +220,8 @@ class Tokenizer:
 
     def _encode_plain(self, text: str) -> list[int]:
         out: list[int] = []
-        for piece in self._re.findall(text):
+        for match in self._re.finditer(text):
+            piece = match.group(0)
             mapped = "".join(BYTE_TO_UNICODE[b] for b in piece.encode("utf-8"))
             for tok in self._bpe(mapped):
                 i = self.ids.get(tok)
@@ -282,8 +298,9 @@ def extract(gguf_path, out_dir) -> dict:
         "add_bos_token": False,
         # The pattern is SHIPPED, not recomputed by the reader: it is transcribed from llama.cpp for the
         # declared `pre` type, and a C++ port that re-derived it would be free to get `\p{M}` wrong again.
-        "pre_pattern": QWEN35_PATTERN,
-        "pre_pattern_source": ".ref/llama.cpp src/llama-vocab.cpp L396 (LLAMA_VOCAB_PRE_TYPE_QWEN35)",
+        "pre_pattern": PRE_PATTERNS[tk.pre],
+        "pre_pattern_source": (".ref/llama.cpp src/llama-vocab.cpp LLAMA_VOCAB_PRE_TYPE_" +
+                               ("GPT4O" if tk.pre == "gpt-4o" else "QWEN35")),
     }
     (out / "vocab.json").write_text(json.dumps(tk.ids, ensure_ascii=False), encoding="utf-8")
     (out / "merges.txt").write_text("\n".join("%s %s" % k for k, _ in

@@ -2,16 +2,22 @@
 #include "ggml-backend.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cmath>
 #include <fstream>
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <mutex>
+#include <queue>
+#include <sstream>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -27,6 +33,8 @@ struct Options {
     float tensor_split[2] = {0.0f, 0.0f};
     int32_t dump_block = -1;
     std::string dump_prefix;
+    bool serve = false;
+    bool tokenize_only = false;
 };
 
 struct BlockDump {
@@ -137,6 +145,11 @@ void usage(const char * exe) {
 bool parse_options(int argc, char ** argv, Options & o) {
     for (int i = 1; i < argc; ++i) {
         const std::string_view key(argv[i]);
+        if (key == "--serve") { o.serve = true; continue; }
+        if (key == "--tokenize-only") { o.tokenize_only = true; continue; }
+        // The Python server adds its native engine's layer-split hint for multi-GPU
+        // configs. This adapter uses llama.cpp tensor_split instead.
+        if (key == "--layer-split") { if (i + 1 >= argc) return false; ++i; continue; }
         if (i + 1 >= argc) return false;
         const std::string_view value(argv[++i]);
         if (key == "--model") o.model.assign(value);
@@ -165,8 +178,169 @@ bool parse_options(int argc, char ** argv, Options & o) {
             return false;
         }
     }
-    return !o.model.empty() && !o.prompt.empty() &&
+    return !o.model.empty() && (o.serve || !o.prompt.empty()) &&
         ((o.dump_block < 0 && o.dump_prefix.empty()) || (o.dump_block >= 0 && !o.dump_prefix.empty()));
+}
+
+struct ServeCommandQueue {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::queue<std::string> commands;
+    std::atomic<bool> stop{false};
+};
+
+int serve_model(llama_model * model, const Options & options) {
+    const uint32_t n_ctx = options.context;
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = n_ctx;
+    params.n_batch = std::min<uint32_t>(2048, n_ctx);
+    params.n_ubatch = std::min(options.ubatch, params.n_batch);
+    params.n_seq_max = 1;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    params.no_perf = false;
+    llama_context * context = llama_init_from_model(model, params);
+    if (!context) {
+        std::cout << "ERR could not create GPT-OSS context\n" << std::flush;
+        return 1;
+    }
+
+    ServeCommandQueue input;
+    std::thread reader([&input] {
+        std::string line;
+        while (std::getline(std::cin, line)) {
+            if (line == "STOP") input.stop.store(true);
+            {
+                std::lock_guard lock(input.mutex);
+                input.commands.push(std::move(line));
+            }
+            input.ready.notify_one();
+        }
+        {
+            std::lock_guard lock(input.mutex);
+            input.commands.push("QUIT");
+        }
+        input.ready.notify_one();
+    });
+    auto next_command = [&input] {
+        std::unique_lock lock(input.mutex);
+        input.ready.wait(lock, [&input] { return !input.commands.empty(); });
+        std::string line = std::move(input.commands.front());
+        input.commands.pop();
+        return line;
+    };
+
+    std::cout << "READY " << n_ctx << " stop\n" << std::flush;
+    bool quit = false;
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    while (!quit) {
+        const std::string line = next_command();
+        if (line == "QUIT") break;
+        if (line == "STOP") { input.stop.store(false); continue; }
+        std::istringstream fields(line);
+        std::string command;
+        int32_t max_new = 0;
+        fields >> command >> max_new;
+        if (command != "GEN" || max_new < 1 || max_new > 4096) {
+            std::cout << "ERR expected GEN <max_new> [sampling keys] <token ids>\n" << std::flush;
+            continue;
+        }
+
+        float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
+        float repeat_penalty = 1.0f, frequency_penalty = 0.0f, presence_penalty = 0.0f;
+        int32_t top_k = 0, penalty_last_n = 0;
+        uint32_t seed = LLAMA_DEFAULT_SEED;
+        std::string word, token_list;
+        while (fields >> word) {
+            const size_t eq = word.find('=');
+            if (eq == std::string::npos) { token_list = word; break; }
+            const std::string key = word.substr(0, eq);
+            const std::string_view val(word.data() + eq + 1, word.size() - eq - 1);
+            if (key == "temperature") parse_f32(val, temperature);
+            else if (key == "top_p") parse_f32(val, top_p);
+            else if (key == "min_p") parse_f32(val, min_p);
+            else if (key == "penalty_repeat") parse_f32(val, repeat_penalty);
+            else if (key == "penalty_freq") parse_f32(val, frequency_penalty);
+            else if (key == "penalty_present") parse_f32(val, presence_penalty);
+            else if (key == "top_k") parse_i32(val, top_k);
+            else if (key == "penalty_last_n") parse_i32(val, penalty_last_n);
+            else if (key == "seed") parse_u32(val, seed);
+        }
+        std::vector<llama_token> prompt;
+        std::istringstream token_fields(token_list);
+        while (std::getline(token_fields, word, ',')) {
+            int32_t token = -1;
+            if (!parse_i32(word, token) || token < 0 || token >= llama_vocab_n_tokens(vocab)) {
+                prompt.clear();
+                break;
+            }
+            prompt.push_back(token);
+        }
+        if (prompt.empty() || prompt.size() + static_cast<size_t>(max_new) > n_ctx) {
+            std::cout << "ERR prompt is empty, invalid, or exceeds the configured context\n" << std::flush;
+            continue;
+        }
+
+        input.stop.store(false);
+        llama_memory_clear(llama_get_memory(context), true);
+        llama_sampler_chain_params chain_params = llama_sampler_chain_default_params();
+        chain_params.no_perf = true;
+        llama_sampler * sampler = llama_sampler_chain_init(chain_params);
+        if (penalty_last_n > 0 && (repeat_penalty != 1.0f || frequency_penalty != 0.0f || presence_penalty != 0.0f))
+            llama_sampler_chain_add(sampler, llama_sampler_init_penalties(llama_vocab_n_tokens(vocab), penalty_last_n,
+                repeat_penalty, frequency_penalty, presence_penalty));
+        if (top_k > 0) llama_sampler_chain_add(sampler, llama_sampler_init_top_k(top_k));
+        if (top_p < 1.0f) llama_sampler_chain_add(sampler, llama_sampler_init_top_p(top_p, 1));
+        if (min_p > 0.0f) llama_sampler_chain_add(sampler, llama_sampler_init_min_p(min_p, 1));
+        if (temperature > 0.0f) {
+            llama_sampler_chain_add(sampler, llama_sampler_init_temp(temperature));
+            llama_sampler_chain_add(sampler, llama_sampler_init_dist(seed));
+        } else {
+            llama_sampler_chain_add(sampler, llama_sampler_init_greedy());
+        }
+
+        const auto prompt_start = std::chrono::steady_clock::now();
+        llama_batch batch = llama_batch_get_one(prompt.data(), static_cast<int32_t>(prompt.size()));
+        const int32_t prompt_rc = llama_decode(context, batch);
+        llama_synchronize(context);
+        const double prompt_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - prompt_start).count();
+        if (prompt_rc != 0) {
+            llama_sampler_free(sampler);
+            std::cout << "ERR llama.cpp prompt decode failed with status " << prompt_rc << "\n" << std::flush;
+            continue;
+        }
+        std::cout << "PP " << prompt.size() << ' ' << prompt.size() << ' ' << prompt_ms << ' '
+                  << (prompt_ms > 0 ? prompt.size() * 1000.0 / prompt_ms : 0.0) << "\n" << std::flush;
+
+        int32_t generated = 0;
+        double decode_ms = 0.0;
+        std::string finish = "length";
+        for (; generated < max_new; ++generated) {
+            if (input.stop.load()) { finish = "cancel"; break; }
+            const llama_token token = llama_sampler_sample(sampler, context, -1);
+            std::cout << "T " << token << "\n" << std::flush;
+            if (llama_vocab_is_eog(vocab, token)) { ++generated; finish = "stop"; break; }
+            if (generated + 1 >= max_new) { ++generated; break; }
+            batch = llama_batch_get_one(const_cast<llama_token *>(&token), 1);
+            const auto decode_start = std::chrono::steady_clock::now();
+            const int32_t rc = llama_decode(context, batch);
+            llama_synchronize(context);
+            decode_ms += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - decode_start).count();
+            if (rc != 0) { finish = "cancel"; break; }
+        }
+        llama_sampler_free(sampler);
+        std::cout << "DONE " << generated << ' ' << prompt.size() << ' ' << prompt_ms << ' '
+                  << decode_ms << ' ' << finish << " 0 0 0\n" << std::flush;
+    }
+    {
+        std::lock_guard lock(input.mutex);
+        input.commands.push("QUIT");
+    }
+    input.ready.notify_one();
+    if (reader.joinable()) reader.join();
+    llama_free(context);
+    return 0;
 }
 
 } // namespace
@@ -185,6 +359,7 @@ int main(int argc, char ** argv) {
 
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = options.gpu_layers;
+    model_params.vocab_only = options.tokenize_only;
     model_params.split_mode = LLAMA_SPLIT_MODE_LAYER;
     std::vector<float> tensor_split;
     if (options.custom_tensor_split) {
@@ -203,6 +378,39 @@ int main(int argc, char ** argv) {
         std::cerr << "failed to load GPT-OSS model: " << options.model << '\n';
         llama_backend_free();
         return 1;
+    }
+
+    if (options.tokenize_only) {
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const int32_t needed = -llama_tokenize(vocab, options.prompt.data(),
+            static_cast<int32_t>(options.prompt.size()), nullptr, 0, true, true);
+        if (needed <= 0) {
+            std::cerr << "failed to size prompt tokenization\n";
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+        std::vector<llama_token> tokens(static_cast<size_t>(needed));
+        const int32_t count = llama_tokenize(vocab, options.prompt.data(),
+            static_cast<int32_t>(options.prompt.size()), tokens.data(), needed, true, true);
+        if (count < 0) {
+            std::cerr << "failed to tokenize prompt\n";
+            llama_model_free(model);
+            llama_backend_free();
+            return 1;
+        }
+        for (int32_t i = 0; i < count; ++i) std::cout << (i ? " " : "") << tokens[i];
+        std::cout << '\n';
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
+
+    if (options.serve) {
+        const int result = serve_model(model, options);
+        llama_model_free(model);
+        llama_backend_free();
+        return result;
     }
 
     const char * chat_template = llama_model_chat_template(model, nullptr);
