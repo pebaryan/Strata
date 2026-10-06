@@ -99,7 +99,7 @@ paths for the checkout and model):
 {
   "exe": "D:/code/Strata-gpt-oss-120b/build-gptoss/strata_gpt_oss.exe",
   "args": ["--model", "D:/aimodels/gpt-oss/gpt-oss-120b-MXFP4.gguf",
-           "--gpu-layers", "17", "--context", "4096", "--ubatch", "64",
+           "--gpu-layers", "17", "--context", "4096", "--ubatch", "1024",
            "--tensor-split", "0.42,0.58"],
   "cwd": "D:/code/Strata-gpt-oss-120b",
   "backend": "cuda",
@@ -119,7 +119,7 @@ python -m serve.server --engine strata `
 The local service passed `/health`, OpenAI Chat Completions, and Anthropic
 Messages smoke tests. Both API dialects returned text `2` and routed the
 reasoning separately for “What is 1 + 1? Answer with one digit only.” A repeat
-OpenAI check at the documented 17-layer/4,096-context setting used an 81-token
+OpenAI check at 17 layers, 4,096 context, and microbatch 64 used an 81-token
 prompt, generated 48 tokens, and reported 3.13 s prompt evaluation and 4.33 s
 decode evaluation (11.1 generated tokens/s). This is a single smoke test, not a
 speed or answer-quality claim. Multi-turn requests are accepted as a complete
@@ -241,6 +241,29 @@ workspace setup; at 19 layers and balanced split, weight allocation failed on
 CUDA0 requesting 16,462 MiB when 16,311 MiB was available. Leave VRAM headroom
 for other applications; these configurations are not guarantees under GPU load.
 
+A repeated OpenAI API check at 17 layers, context 4,096, microbatch 64, and
+split `0.42,0.58` returned “Jupiter” on all three requests. The first request
+reported 28.8 s prompt and 5.45 s decode evaluation; the next two reported
+3.29/3.02 s prompt and 3.39/3.31 s decode evaluation, or 12.1/12.4 generated
+tokens/s. The large first-request outlier means startup/warm-up and steady-state
+numbers must be reported separately; this three-request sample is not a general
+benchmark. Changing only the split to `0.5,0.5` at the same 17-layer/4,096/
+64-token-batch setting repeatedly failed when CUDA0 could not allocate its
+cuBLAS workspace. Keep the asymmetric split for this context on this machine.
+
+With the same 741-token prompt and 17-layer `0.42,0.58` split, increasing
+`--ubatch` from 128 to 256, 512, and 1,024 reduced the second-request prompt
+time from 10.68 s to 6.82 s, 5.78 s, and 3.77 s, respectively. Decode was
+8.8–9.2 generated tokens/s in these single steady-state samples. At 1,024, both
+4,096 and 8,192 context served the request successfully; at 8,192, the second
+request took 4.80 s for the 741-token prompt and 5.32 s to decode 47 tokens.
+That 8,192-context process used about 14,973 MiB and 14,955 MiB on the two
+16,311-MiB cards, so leave the safer 4,096 context as the default. Use
+`--ubatch 1024` to improve long-prompt prefill on this setup, but benchmark your
+own prompt mix; these are small single-machine samples, not a general speed
+claim. Greedy runs returned the same short answer while generating different
+reasoning lengths, so this is not a token-for-token parity result.
+
 Reproduce the working runner configuration after building with
 `STRATA_GPT_OSS_RUNTIME=ON` from a Visual Studio developer prompt:
 
@@ -248,7 +271,7 @@ Reproduce the working runner configuration after building with
 build-gptoss\strata_gpt_oss.exe `
   --model D:\aimodels\gpt-oss\gpt-oss-120b-MXFP4.gguf `
   --prompt "What is 1 + 1? Answer with one digit only." `
-  --tokens 32 --gpu-layers 17 --context 4096 --ubatch 64 `
+  --tokens 32 --gpu-layers 17 --context 4096 --ubatch 1024 `
   --tensor-split 0.42,0.58
 ```
 
