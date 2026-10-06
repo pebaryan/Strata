@@ -263,9 +263,22 @@ mapped buffer, 13,170 MiB on CUDA0, and 13,757 MiB on CUDA1. It generated 32
 tokens successfully. The runner's synchronized llama.cpp counters report 15,915
 ms for 20 prompt tokens and 7,095 ms for 31 subsequent decode runs (about 1.26
 prompt tokens/s and 4.37 decode runs/s). Under the same settings, the upstream
-CLI reported 1.5 prompt tokens/s and 1.9 generation tokens/s. The output pieces
-match, but the throughput summaries do not; the timing discrepancy is unresolved,
-so there is no speed claim. The test response itself is not a quality evaluation.
+CLI reported 1.5 prompt tokens/s and 1.9 generation tokens/s. Those older
+512-context/128-microbatch timing summaries did not agree, so they do not support
+a speed claim. The test response itself is not a quality evaluation.
+
+A later controlled comparison used the same 20-token arithmetic prompt, 17 GPU
+layers, 42:58 split, 4,096 context, batch 2,048, microbatch 1,024, four CPU
+threads, Flash Attention on, full SWA cache, and 31 decode runs on both paths.
+On this two-RTX-5060-Ti PC, two Strata runs measured prompt evaluation at 13.46
+and 16.25 s and decode at 6.29 and 7.49 s. Two upstream `llama-completion` runs
+measured prompt at 15.91 and 15.96 s and decode at 6.82 and 7.04 s. The median
+prompt times were 14.86 s for Strata and 15.94 s for upstream; median decode
+times were 6.89 and 6.93 s. This is only two runs per path and shows substantial
+Strata run-to-run variation, so it does not establish a reliable speedup. An
+initial upstream attempt used a 23-token prompt and was excluded. Candidate logs
+are `build-gptoss/perf-candidate-ub1024-{1,2}.log`; upstream logs are
+`build-gptoss/perf-upstream-ub1024-exact20-{1,2}.log`.
 
 The automatic split succeeds at 16 GPU layers, but fails during compute-buffer
 allocation at 17. Explicit `--tensor-split 0.42,0.58` makes 17 layers work. This
