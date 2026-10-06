@@ -146,31 +146,27 @@ idle level.
 Phase 0 is passed for the local GGUF. The pinned llama.cpp/ggml CUDA baseline and
 the Strata-linked `strata_gpt_oss` runner both build for `sm_120`. The runner uses
 the pinned llama.cpp C API for model loading, chat formatting, tokenization, graph
-construction, sampling, and execution; it adds no model kernels. With the same
-model, 20-token formatted prompt, greedy sampling, context 512, microbatch 128,
-and 17 GPU layers split 42:58, the runner and upstream CLI in `--no-jinja` mode
-were previously reported to emit the same 32 special-token pieces. A controlled
-rerun with the same 20-token chat prefix, context 512, microbatch 128, 17 GPU
-layers, 42:58 split, greedy sampling, and Flash Attention forced on did not
-reproduce that result: the outputs shared the reasoning prefix but diverged
-before token 32 (`One digit: "` in the runner versus `One digit only:` in the
-CLI). The runner's logged prompt IDs match the manually rendered chat string.
-The default Jinja CLI mode is not a parity target for this C API harness,
-because it formats the assistant prefix differently. A follow-up comparison
-then matched all four greedy token IDs, though not their logits, as detailed
-below; full-generation parity is therefore not established. The direct runner's
-opt-in `--dump-logits FILE` writes one raw F32 vocabulary row before each greedy
-sampling step. Comparing four rows against a locally instrumented pinned
-`llama-debug` run with the same context, batch, microbatch, threads, Flash
-Attention, sliding-window setting, layer count, and 42:58 split gave the same
-greedy IDs (`200005, 35644, 200008, 976`) at all four steps, but logits did not
-match: relative L2 was 0.1542, 0.1673, 0.0589, and 0.0698 (cosine similarity
-0.9880–0.9983). The first-row maximum absolute difference was 3.04. The
-reference used `--save-logits`, which disables `llama-debug`'s tensor-inspection
-callback; enabling that callback changed the reference logits, so it is not a
-neutral measurement path. Repeating the runner capture produced a bit-identical
-first row. Thus the first sampled tokens agree, but full-vector and
-full-generation parity remain unresolved.
+construction, sampling, and execution; it adds no model kernels. An apparent
+generation mismatch was traced to a reference-build mismatch: the Strata-linked
+ggml CPU backend was compiled with `GGML_OPENMP=OFF` and `GGML_LLAMAFILE=OFF`,
+while the initial upstream baseline had both options on. With 17 GPU layers,
+the earlier layers execute on CPU, so those builds were not an equivalent
+reference. Rebuilding the pinned baseline with both options off removed the
+mismatch.
+
+The direct runner's opt-in `--dump-logits FILE` writes one raw F32 vocabulary
+row before each greedy sampling step. For two fixed 20-token prompts (the
+arithmetic prompt and “Explain why the sky looks blue in one sentence. Keep it
+simple.”), the first 32 runner rows were bit-for-bit identical to the pinned
+`llama-debug` reference after matching CPU flags, GPU layer count, 42:58 split,
+context, batch, microbatch, thread counts, Flash Attention, and SWA settings.
+That is 64 identical vocabulary rows, each 201,088 F32 values; the greedy token
+IDs also matched at every position. The 32-token raw-prompt run through upstream
+`llama-completion` with top-k 1 emitted the same arithmetic response prefix.
+Disable the debug tensor-inspection callback with `--save-logits` for logit
+capture; enabling that callback changes graph segmentation and is not a neutral
+measurement path. When configuring a separate upstream build for comparisons,
+match Strata's `-DGGML_OPENMP=OFF -DGGML_LLAMAFILE=OFF` settings.
 
 The initial MXFP4 operator parity gate now runs one real 2,880×2,880 routed-expert
 matrix from the GGUF through `ggml_mul_mat` on CPU and CUDA0. Layer 0/expert 0
@@ -196,18 +192,12 @@ A local capture of the 20-token prompt produced finite F32 `2880×20` tensors at
 the hidden-state checkpoints. It is reference instrumentation; normal runs do not
 enable the callback.
 
-Comparing all layer outputs for the same 20-token prompt with matching selected
-checkpoints showed relative L2 errors of about `5e-8` and `7e-8` at layers 0 and
-1, `7.25e-4` at layer 2, `1.62e-2` at layer 3, and `1.23e-1` at layer 35. A
-matched layer-2 checkpoint comparison found Q/K/V projection errors below
-`1.3e-5` relative L2, but attention output at `3.00e-4`; the MoE output was
-`1.84e-3`. At layer 3, attention output error was `6.18e-3`; one of 80 routed
-expert IDs differed (token 15), and the MoE output error was `6.73e-2`. The
-router's raw-logit relative L2 was `1.69e-3`. This localizes the observed drift
-to accumulation beginning in the second sliding-window block and growing in
-subsequent blocks, but does not identify which kernel or setting causes it.
-These are measurements from one prompt and one GPU configuration, not universal
-error bounds.
+An earlier layer-by-layer comparison, made before matching the CPU build flags,
+reported growing differences from layer 2 onward. Those intermediate error
+measurements are superseded: they compared different CPU backend configurations
+and are not evidence of a kernel error. The all-layer capture remains available
+for future diagnostics under matched builds; the two-prompt full-vocabulary
+comparison above is the current parity result.
 
 The first isolated MoE branch comparison now passes for prompt tokens 0, 5, and
 19. A Strata-side ggml graph uses the captured normalized activations, expert IDs,
@@ -311,8 +301,10 @@ That 8,192-context process used about 14,973 MiB and 14,955 MiB on the two
 16,311-MiB cards, so leave the safer 4,096 context as the default. Use
 `--ubatch 1024` to improve long-prompt prefill on this setup, but benchmark your
 own prompt mix; these are small single-machine samples, not a general speed
-claim. Greedy runs returned the same short answer while generating different
-reasoning lengths, so this is not a token-for-token parity result.
+claim. Earlier API smoke requests used different prompt formatting and generation
+settings, so their reasoning lengths are not a controlled parity comparison. The
+matched greedy-logit comparisons above establish exact parity for the two tested
+prompts and 32 decode steps; broader prompt and long-run parity remains untested.
 
 Reproduce the working runner configuration after building with
 `STRATA_GPT_OSS_RUNTIME=ON` from a Visual Studio developer prompt:
