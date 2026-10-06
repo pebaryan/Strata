@@ -74,6 +74,14 @@ and uses the pinned llama.cpp graph and CUDA kernels. The server config can set
 and `seed`; it does not enable batching, disk sessions, vision, or tool calling
 for this adapter yet.
 
+Prompt prefill is split into chunks no larger than llama.cpp's `n_batch`, while
+still using its ordinary graph and kernels. This avoids the former hard failure
+when a request prompt exceeded the runtime's 2,048-token batch limit. The
+one-shot runner uses the same chunking. A 2,281-token API prompt at 4,096
+context returned the expected answer; the same long prompt also completed in
+the one-shot runner. Longer prompts remain bounded by context minus the
+requested output tokens.
+
 GPT-OSS declares the `gpt-4o` tokenizer pre-tokenizer, not Qwen35. The exporter
 and Strata API tokenizer now select the pinned llama.cpp GPT4O pattern by the
 GGUF `tokenizer.ggml.pre` value. The extracted tokenizer passed its round-trip

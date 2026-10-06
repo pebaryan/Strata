@@ -299,8 +299,17 @@ int serve_model(llama_model * model, const Options & options) {
         }
 
         const auto prompt_start = std::chrono::steady_clock::now();
-        llama_batch batch = llama_batch_get_one(prompt.data(), static_cast<int32_t>(prompt.size()));
-        const int32_t prompt_rc = llama_decode(context, batch);
+        int32_t prompt_rc = 0;
+        size_t prompt_offset = 0;
+        while (prompt_offset < prompt.size()) {
+            const size_t remaining = prompt.size() - prompt_offset;
+            const int32_t chunk_size = static_cast<int32_t>(
+                std::min<size_t>(params.n_batch, remaining));
+            llama_batch batch = llama_batch_get_one(prompt.data() + prompt_offset, chunk_size);
+            prompt_rc = llama_decode(context, batch);
+            if (prompt_rc != 0) break;
+            prompt_offset += static_cast<size_t>(chunk_size);
+        }
         llama_synchronize(context);
         const double prompt_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - prompt_start).count();
@@ -312,6 +321,7 @@ int serve_model(llama_model * model, const Options & options) {
         std::cout << "PP " << prompt.size() << ' ' << prompt.size() << ' ' << prompt_ms << ' '
                   << (prompt_ms > 0 ? prompt.size() * 1000.0 / prompt_ms : 0.0) << "\n" << std::flush;
 
+        llama_batch batch{};
         int32_t generated = 0;
         double decode_ms = 0.0;
         std::string finish = "length";
@@ -521,7 +531,7 @@ int main(int argc, char ** argv) {
     }
     std::cerr << '\n';
 
-    llama_batch batch = llama_batch_get_one(tokens.data(), static_cast<int32_t>(tokens.size()));
+    llama_batch batch{};
     llama_token next_token = LLAMA_TOKEN_NULL;
     int32_t generated = 0;
     double prompt_eval_ms = 0.0;
@@ -529,7 +539,22 @@ int main(int argc, char ** argv) {
     double sampling_ms = 0.0;
     for (; generated < options.predict; ++generated) {
         const auto decode_start = std::chrono::steady_clock::now();
-        const int32_t rc = llama_decode(context, batch);
+        int32_t rc = 0;
+        if (generated == 0) {
+            size_t prompt_offset = 0;
+            while (prompt_offset < tokens.size()) {
+                const size_t remaining = tokens.size() - prompt_offset;
+                const int32_t chunk_size = static_cast<int32_t>(
+                    std::min<size_t>(context_params.n_batch, remaining));
+                batch = llama_batch_get_one(tokens.data() + prompt_offset, chunk_size);
+                rc = llama_decode(context, batch);
+                if (rc != 0) break;
+                prompt_offset += static_cast<size_t>(chunk_size);
+            }
+        } else {
+            batch = llama_batch_get_one(&next_token, 1);
+            rc = llama_decode(context, batch);
+        }
         // CUDA execution can be asynchronous; synchronize before stopping the
         // per-evaluation timer so the measurement includes device work.
         llama_synchronize(context);
@@ -556,7 +581,6 @@ int main(int argc, char ** argv) {
         std::cout.write(piece, bytes);
         std::cout.flush();
         std::cerr << "generated_token_id=" << next_token << '\n';
-        batch = llama_batch_get_one(&next_token, 1);
     }
     std::cout << '\n';
     std::cerr << "generated_count=" << generated << '\n';
