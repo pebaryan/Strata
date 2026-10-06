@@ -571,10 +571,12 @@ int main(int argc, char ** argv) {
             std::cerr << "llama_decode failed with status " << rc << '\n';
             break;
         }
-        if (generated == 0 && !options.dump_logits_path.empty()) {
+        if (!options.dump_logits_path.empty()) {
             const int32_t n_logits = llama_vocab_n_tokens(vocab);
-            const float * logits = llama_get_logits_ith(context, static_cast<int32_t>(tokens.size() - 1));
-            std::ofstream output(options.dump_logits_path, std::ios::binary | std::ios::trunc);
+            const int32_t logits_index = generated == 0 ? static_cast<int32_t>(tokens.size() - 1) : -1;
+            const float * logits = llama_get_logits_ith(context, logits_index);
+            const auto mode = std::ios::binary | (generated == 0 ? std::ios::trunc : std::ios::app);
+            std::ofstream output(options.dump_logits_path, mode);
             if (!logits || !output) {
                 std::cerr << "failed to open logits or output file: " << options.dump_logits_path << '\n';
                 break;
@@ -585,7 +587,8 @@ int main(int argc, char ** argv) {
                 std::cerr << "failed while writing logits: " << options.dump_logits_path << '\n';
                 break;
             }
-            std::cerr << "dumped_logits=" << n_logits << " path=" << options.dump_logits_path << '\n';
+            std::cerr << "dumped_logits=" << n_logits << " position=" << generated
+                      << " path=" << options.dump_logits_path << '\n';
         }
         const auto sample_start = std::chrono::steady_clock::now();
         next_token = llama_sampler_sample(sampler, context, -1);

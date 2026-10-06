@@ -148,10 +148,21 @@ layers, 42:58 split, greedy sampling, and Flash Attention forced on did not
 reproduce that result: the outputs shared the reasoning prefix but diverged
 before token 32 (`One digit: "` in the runner versus `One digit only:` in the
 CLI). The runner's logged prompt IDs match the manually rendered chat string.
-Thus full-generation parity is not currently established; the earlier result is
-provisional until per-position logits and all runtime settings are compared.
 The default Jinja CLI mode is not a parity target for this C API harness,
-because it formats the assistant prefix differently.
+because it formats the assistant prefix differently. A follow-up comparison
+then matched all four greedy token IDs, though not their logits, as detailed
+below; full-generation parity is therefore not established. The direct runner's
+opt-in `--dump-logits FILE` writes one raw F32 vocabulary row before each greedy
+sampling step. Comparing four rows against a locally instrumented pinned
+`llama-debug` run with the same context, batch, microbatch, threads, Flash
+Attention, sliding-window setting, layer count, and 42:58 split gave the same
+greedy IDs (`200005, 35644, 200008, 976`) at all four steps, but logits did not
+match: relative L2 was 0.1704, 0.0907, 0.0584, and 0.0782 (cosine similarity
+0.9860–0.9984). The first-row maximum absolute difference was 3.58. Repeating
+the runner capture produced a bit-identical first row. Thus the first sampled
+tokens agree, but full-vector and full-generation parity remain unresolved;
+more layer-level comparison is needed before attributing the gap to a specific
+kernel or execution setting.
 
 The initial MXFP4 operator parity gate now runs one real 2,880×2,880 routed-expert
 matrix from the GGUF through `ggml_mul_mat` on CPU and CUDA0. Layer 0/expert 0
