@@ -29,6 +29,8 @@ struct Options {
     int32_t gpu_layers = 12;
     uint32_t context = 512;
     uint32_t ubatch = 512;
+    ggml_type cache_type_k = GGML_TYPE_F16;
+    ggml_type cache_type_v = GGML_TYPE_F16;
     bool custom_tensor_split = false;
     float tensor_split[2] = {0.0f, 0.0f};
     int32_t dump_block = -1;
@@ -176,10 +178,19 @@ bool parse_f32(std::string_view s, float & value) {
     return result.ec == std::errc{} && result.ptr == s.data() + s.size() && std::isfinite(value);
 }
 
+bool parse_cache_type(std::string_view s, ggml_type & type) {
+    if (s == "f16") type = GGML_TYPE_F16;
+    else if (s == "q4_0") type = GGML_TYPE_Q4_0;
+    else if (s == "q8_0") type = GGML_TYPE_Q8_0;
+    else return false;
+    return true;
+}
+
 void usage(const char * exe) {
     std::cerr << "Usage: " << exe
               << " --model FILE --prompt TEXT [--tokens N] [--gpu-layers N] [--context N]"
-              << " [--ubatch N] [--tensor-split GPU0,GPU1] [--dump-block LAYER --dump-prefix PATH]"
+              << " [--ubatch N] [--cache-type-k f16|q4_0|q8_0] [--cache-type-v f16|q4_0|q8_0]"
+              << " [--tensor-split GPU0,GPU1] [--dump-block LAYER --dump-prefix PATH]"
               << " [--dump-all-layers --dump-prefix PATH] [--dump-logits FILE]\n";
 }
 
@@ -204,6 +215,10 @@ bool parse_options(int argc, char ** argv, Options & o) {
             if (!parse_u32(value, o.context) || o.context < 16) return false;
         } else if (key == "--ubatch") {
             if (!parse_u32(value, o.ubatch) || o.ubatch < 1) return false;
+        } else if (key == "--cache-type-k") {
+            if (!parse_cache_type(value, o.cache_type_k)) return false;
+        } else if (key == "--cache-type-v") {
+            if (!parse_cache_type(value, o.cache_type_v)) return false;
         } else if (key == "--tensor-split") {
             const size_t comma = value.find(',');
             if (comma == std::string_view::npos ||
@@ -241,6 +256,8 @@ int serve_model(llama_model * model, const Options & options) {
     params.n_ctx = n_ctx;
     params.n_batch = std::min<uint32_t>(2048, n_ctx);
     params.n_ubatch = std::min(options.ubatch, params.n_batch);
+    params.type_k = options.cache_type_k;
+    params.type_v = options.cache_type_v;
     params.n_seq_max = 1;
     params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     params.no_perf = false;
@@ -249,6 +266,8 @@ int serve_model(llama_model * model, const Options & options) {
         std::cout << "ERR could not create GPT-OSS context\n" << std::flush;
         return 1;
     }
+    std::cerr << "kv_cache_types=K:" << ggml_type_name(params.type_k)
+              << " V:" << ggml_type_name(params.type_v) << '\n';
 
     ServeCommandQueue input;
     std::thread reader([&input] {
@@ -548,6 +567,8 @@ int main(int argc, char ** argv) {
     context_params.n_batch = std::min<uint32_t>(2048, context_params.n_ctx);
     context_params.n_ubatch = std::min(options.ubatch, context_params.n_batch);
     context_params.n_seq_max = 1;
+    context_params.type_k = options.cache_type_k;
+    context_params.type_v = options.cache_type_v;
     context_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
     context_params.no_perf = false;
     BlockDump block_dump;
@@ -565,6 +586,8 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
+    std::cerr << "kv_cache_types=K:" << ggml_type_name(context_params.type_k)
+              << " V:" << ggml_type_name(context_params.type_v) << '\n';
 
     llama_sampler_chain_params sampler_params = llama_sampler_chain_default_params();
     sampler_params.no_perf = true;

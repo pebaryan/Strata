@@ -1095,6 +1095,20 @@ if(STRATA_NATIVE_EXPERTS)
     # Unlike Strata's native engine build, the initial adapter delegates its graph
     # to llama.cpp, so ggml-cuda must provide the existing CUDA implementations.
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
+    # The GPT-OSS runner exposes Q4/Q8 KV-cache choices. Compile llama.cpp's
+    # existing mixed-type FlashAttention variants so Q4_0/Q8_0 do not fall back
+    # to converting the cache to F16 on every attention call.
+    if(NOT DEFINED GGML_CUDA_FA_QUANTS OR GGML_CUDA_FA_QUANTS STREQUAL "")
+      set(_strata_fa_quants "q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16")
+    else()
+      set(_strata_fa_quants "${GGML_CUDA_FA_QUANTS}")
+    endif()
+    if(NOT _strata_fa_quants STREQUAL "all")
+      list(APPEND _strata_fa_quants q4_0-q8_0 q8_0-q4_0)
+      list(REMOVE_DUPLICATES _strata_fa_quants)
+      set(GGML_CUDA_FA_QUANTS "${_strata_fa_quants}" CACHE STRING
+          "K-V FlashAttention types compiled by ggml-cuda" FORCE)
+    endif()
   else()
     set(GGML_CUDA OFF CACHE BOOL "" FORCE)
   endif()

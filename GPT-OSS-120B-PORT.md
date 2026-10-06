@@ -375,6 +375,35 @@ measure actual allocation and usable context before making a fit claim. The
 runner currently accepts one user message; multi-turn history and tool calls
 remain pending.
 
+### Long context and quantized KV cache
+
+The runner accepts `--cache-type-k` and `--cache-type-v` with `f16`, `q4_0`, or
+`q8_0`. F16 remains the default. When the GPT-OSS runtime is enabled, CMake
+includes llama.cpp's existing CUDA FlashAttention combinations for Q4_0/Q8_0
+KV, including mixed K/V types; the runner does not add a separate attention
+kernel. This avoids the tested mixed-cache fallback that converted K and V to
+F16.
+
+On this two-RTX-5060-Ti machine, context 32,768 with `--ubatch 1024`, 17 GPU
+layers, split `0.42,0.58`, and K=Q4_0/V=Q8_0 initialized and generated through
+the resident API. The API accepted a 9,083-token rendered prompt and completed
+the request. Direct runner smoke tests also initialized Q4_0/Q4_0 and
+Q8_0/Q8_0 at context 32,768. These verify operation at the tested settings;
+they are not a claim that every 32K prompt or workload fits or that Q4/Q8 is
+bit-identical to F16. The regular 4,096-context/F16 server profile remains
+unchanged.
+
+Example runner options:
+
+```text
+--gpu-layers 17 --context 32768 --ubatch 1024
+--tensor-split 0.42,0.58 --cache-type-k q4_0 --cache-type-v q8_0
+```
+
+The measured resident API request used `max_tokens=64` and returned 42
+completion tokens in 47.9 s, including a 9,083-token prompt. Treat this as a
+single-machine smoke measurement, not a throughput benchmark.
+
 ## References used for the contract
 
 - OpenAI model config: `https://huggingface.co/openai/gpt-oss-120b/blob/main/config.json`
