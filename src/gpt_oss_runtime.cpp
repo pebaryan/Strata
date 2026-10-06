@@ -33,6 +33,7 @@ struct Options {
     float tensor_split[2] = {0.0f, 0.0f};
     int32_t dump_block = -1;
     std::string dump_prefix;
+    std::string dump_logits_path;
     bool serve = false;
     bool tokenize_only = false;
 };
@@ -139,7 +140,8 @@ bool parse_f32(std::string_view s, float & value) {
 void usage(const char * exe) {
     std::cerr << "Usage: " << exe
               << " --model FILE --prompt TEXT [--tokens N] [--gpu-layers N] [--context N]"
-              << " [--ubatch N] [--tensor-split GPU0,GPU1] [--dump-block LAYER --dump-prefix PATH]\n";
+              << " [--ubatch N] [--tensor-split GPU0,GPU1] [--dump-block LAYER --dump-prefix PATH]"
+              << " [--dump-logits FILE]\n";
 }
 
 bool parse_options(int argc, char ** argv, Options & o) {
@@ -174,6 +176,9 @@ bool parse_options(int argc, char ** argv, Options & o) {
         } else if (key == "--dump-prefix") {
             o.dump_prefix.assign(value);
             if (o.dump_prefix.empty()) return false;
+        } else if (key == "--dump-logits") {
+            o.dump_logits_path.assign(value);
+            if (o.dump_logits_path.empty()) return false;
         } else {
             return false;
         }
@@ -565,6 +570,22 @@ int main(int argc, char ** argv) {
         if (rc != 0) {
             std::cerr << "llama_decode failed with status " << rc << '\n';
             break;
+        }
+        if (generated == 0 && !options.dump_logits_path.empty()) {
+            const int32_t n_logits = llama_vocab_n_tokens(vocab);
+            const float * logits = llama_get_logits_ith(context, static_cast<int32_t>(tokens.size() - 1));
+            std::ofstream output(options.dump_logits_path, std::ios::binary | std::ios::trunc);
+            if (!logits || !output) {
+                std::cerr << "failed to open logits or output file: " << options.dump_logits_path << '\n';
+                break;
+            }
+            output.write(reinterpret_cast<const char *>(logits),
+                         static_cast<std::streamsize>(n_logits) * sizeof(float));
+            if (!output) {
+                std::cerr << "failed while writing logits: " << options.dump_logits_path << '\n';
+                break;
+            }
+            std::cerr << "dumped_logits=" << n_logits << " path=" << options.dump_logits_path << '\n';
         }
         const auto sample_start = std::chrono::steady_clock::now();
         next_token = llama_sampler_sample(sampler, context, -1);
