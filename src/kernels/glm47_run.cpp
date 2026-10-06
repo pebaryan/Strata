@@ -63,6 +63,10 @@ double glm47_ffn_ms();
 void glm47_install_device_experts(size_t budget_bytes);
 void glm47_device_expert_stats(uint64_t* hits, uint64_t* misses, uint64_t* evicted, size_t* bytes);
 size_t glm47_device_free_vram();
+bool glm47_trunk_forward_device(const strata::core::glm::Glm47TrunkLayer* layers, int n_layer,
+                                const MlaGeometry& g, const float* x, int pos, float eps,
+                                std::vector<std::vector<float>>* caches, void* expert_ctx, float* out,
+                                std::vector<std::vector<int32_t>>* ids_out, char* err, size_t err_cap);
 }  // namespace strata::kernels::glm
 
 namespace {
@@ -382,11 +386,16 @@ int main(int argc, char** argv) {
     if (use_device && n_dev_proj > 0) glm::mla_set_rope_head_cuda(true);
     if (use_device) glm::mla_set_rope_attention_cuda(true);
     // OFF by default: the block is bit-exact at cache depth 1-2 but a residual divergence appears past that, so it is
-    // opt-in (STRATA_GLM_MLA_BLOCK=1) until that is fixed.
+    // opt-in (STRATA_GLM_MLA_BLOCK=1) until that is fixed.  The device trunk, though, IS the block's path - it calls
+    // mla_block_launch_cuda directly - so STRATA_GLM_TRUNK_DEV=1 turns the block on too (when it is not already set),
+    // which also makes the runner's own host loop an apples-to-apples reference for the trunk's verification.
     const char* mla_block_env = std::getenv("STRATA_GLM_MLA_BLOCK");
-    if (use_device && mla_block_env && mla_block_env[0] == '1') {
+    const bool trunk_dev = use_device && std::getenv("STRATA_GLM_TRUNK_DEV") && std::getenv("STRATA_GLM_TRUNK_DEV")[0] == '1';
+    if (use_device && (trunk_dev || (mla_block_env && mla_block_env[0] == '1'))) {
         glm::mla_set_device_attention(true);
         glm::mla_set_device_block(true);
+        if (trunk_dev && !(mla_block_env && mla_block_env[0] == '1'))
+            std::printf("  STRATA_GLM_TRUNK_DEV=1: device MLA block enabled (the trunk's attention path)\n");
     }
     // fan the MLA's head loop out across the worker pool (bit-exact: each head is an independent serial pass).
     // STRATA_GLM_MLA_SERIAL=1 keeps the serial loop, for an A/B on a noisy machine.
@@ -466,6 +475,16 @@ int main(int argc, char** argv) {
         if (tok < 0 || (size_t) tok * N_EMBD + N_EMBD > tok_emb.size()) return false;
         std::vector<float> x(tok_emb.begin() + (size_t) tok * N_EMBD,
                              tok_emb.begin() + (size_t) (tok + 1) * N_EMBD);
+        if (trunk_dev) {
+            // STRATA_GLM_TRUNK_DEV=1: the token's whole depth is chained on the device (src/kernels/glm47_device.cpp).
+            char terr[512] = {};
+            if (!glm::glm47_trunk_forward_device(arr.data(), n_layer, mg, x.data(), pos, EPS, &caches, &rc,
+                                                 hidden.data(), nullptr, terr, sizeof(terr))) {
+                std::fprintf(stderr, "glm47_run: device trunk failed: %s\n", terr);
+                return false;
+            }
+            return true;
+        }
         std::string terr;
         return cglm::glm47_trunk_forward(arr.data(), n_layer, mg, x.data(), pos, EPS, &caches, nullptr,
                                          nullptr, nullptr, hidden.data(), nullptr, nullptr, terr);
