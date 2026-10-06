@@ -141,6 +141,14 @@ prompt and decode work and are three observations, not a throughput benchmark.
 The temporary server was stopped after the check; GPU memory returned to its
 idle level.
 
+A fresh loopback check on the rebuilt runner at port 8,096 also passed `/health`
+with `loaded=true`, `max_context=4096`, and model `gpt-oss-120b`. The first
+OpenAI request was intentionally limited to 32 tokens and ended during reasoning
+without content; a repeated request with a 64-token limit returned content `2`
+and 48 completion tokens for the same 81-token prompt in 7.57 s. The temporary
+service was stopped cleanly and GPU memory returned to its prior level. This is
+a single warm request, not a throughput benchmark.
+
 ## Current status
 
 Phase 0 is passed for the local GGUF. The pinned llama.cpp/ggml CUDA baseline and
