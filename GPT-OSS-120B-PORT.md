@@ -99,7 +99,7 @@ paths for the checkout and model):
 {
   "exe": "D:/code/Strata-gpt-oss-120b/build-gptoss/strata_gpt_oss.exe",
   "args": ["--model", "D:/aimodels/gpt-oss/gpt-oss-120b-MXFP4.gguf",
-           "--gpu-layers", "17", "--context", "512", "--ubatch", "128",
+           "--gpu-layers", "17", "--context", "4096", "--ubatch", "64",
            "--tensor-split", "0.42,0.58"],
   "cwd": "D:/code/Strata-gpt-oss-120b",
   "backend": "cuda",
@@ -118,10 +118,10 @@ python -m serve.server --engine strata `
 
 The local service passed `/health`, OpenAI Chat Completions, and Anthropic
 Messages smoke tests. Both API dialects returned text `2` and routed the
-reasoning separately for “What is 1 + 1? Answer with one digit only.” The OpenAI
-run used an 81-token prompt, generated 19 tokens, and reported 27.9 s prompt
-evaluation and 2.9 s decode evaluation (about 6.5 generated tokens/s) on the two
-RTX 5060 Ti cards with 17/36 layers offloaded. This is a single smoke test, not a
+reasoning separately for “What is 1 + 1? Answer with one digit only.” A repeat
+OpenAI check at the documented 17-layer/4,096-context setting used an 81-token
+prompt, generated 48 tokens, and reported 3.13 s prompt evaluation and 4.33 s
+decode evaluation (11.1 generated tokens/s). This is a single smoke test, not a
 speed or answer-quality claim. Multi-turn requests are accepted as a complete
 prompt each time; the adapter currently clears KV state rather than reusing a
 conversation cache.
@@ -218,7 +218,7 @@ Run
 `build-gptoss\strata_gpt_oss_attention_parity.exe MODEL.gguf CAPTURE_PREFIX`
 after making the same capture.
 
-The working 17-layer configuration loaded the GGUF with 33,512 MiB in the CPU
+The earlier 17-layer configuration loaded the GGUF with 33,512 MiB in the CPU
 mapped buffer, 13,170 MiB on CUDA0, and 13,757 MiB on CUDA1. It generated 32
 tokens successfully. The runner's synchronized llama.cpp counters report 15,915
 ms for 20 prompt tokens and 7,095 ms for 31 subsequent decode runs (about 1.26
@@ -228,11 +228,18 @@ match, but the throughput summaries do not; the timing discrepancy is unresolved
 so there is no speed claim. The test response itself is not a quality evaluation.
 
 The automatic split succeeds at 16 GPU layers, but fails during compute-buffer
-allocation at 17. Explicit `--tensor-split 0.42,0.58` makes 17 layers work. At 18
-layers with that split, model weights load but context setup fails on CUDA1: even
-with `--ubatch 128`, cuBLAS cannot create a handle with the remaining VRAM. Thus
-17 layers is the highest tested working setting for the current 512 context and
-machine state; do not treat it as a guarantee under additional GPU load.
+allocation at 17. Explicit `--tensor-split 0.42,0.58` makes 17 layers work. This
+setting passed direct-run tests at context 4,096 and 8,192 with microbatch 64;
+the 8,192 test evaluated a 20-token prompt in 15.74 s and one decode step in
+0.329 s. The 4,096 setting also passed a full Strata API smoke test and is the
+documented default to leave more memory headroom. At 18 layers, balanced split
+`0.5,0.5` and microbatch 64 worked at context 512 and a 32-token direct-run test
+reported 5.12 s over 31 decode runs (6.05 runs/s), versus 7.28 s (4.26 runs/s)
+at 17 layers with the same balanced split. These are single runs, not a reliable
+performance comparison. At 18 layers, context 4,096 failed during CUDA
+workspace setup; at 19 layers and balanced split, weight allocation failed on
+CUDA0 requesting 16,462 MiB when 16,311 MiB was available. Leave VRAM headroom
+for other applications; these configurations are not guarantees under GPU load.
 
 Reproduce the working runner configuration after building with
 `STRATA_GPT_OSS_RUNTIME=ON` from a Visual Studio developer prompt:
@@ -241,7 +248,7 @@ Reproduce the working runner configuration after building with
 build-gptoss\strata_gpt_oss.exe `
   --model D:\aimodels\gpt-oss\gpt-oss-120b-MXFP4.gguf `
   --prompt "What is 1 + 1? Answer with one digit only." `
-  --tokens 32 --gpu-layers 17 --context 512 --ubatch 128 `
+  --tokens 32 --gpu-layers 17 --context 4096 --ubatch 64 `
   --tensor-split 0.42,0.58
 ```
 
@@ -251,8 +258,8 @@ resident. This is a two-GPU/PCIe port; do not assume peer-to-peer or unified
 memory. Phase 1 remains open: capture baseline token IDs/logits directly over
 representative prompts and investigate the throughput-counter discrepancy, then
 measure actual allocation and usable context before making a fit claim. The
-runner currently accepts one user message; multi-turn history, tool calls, and
-Strata server integration are still pending.
+runner currently accepts one user message; multi-turn history and tool calls
+remain pending.
 
 ## References used for the contract
 
