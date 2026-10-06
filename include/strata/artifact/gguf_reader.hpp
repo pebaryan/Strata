@@ -9,8 +9,8 @@
 // because gguf-py cannot represent type 42 / Q2_0). Per P1.S2 it must:
 //   * mmap the file and parse header, metadata KV (ALL value types incl. arrays), tensor directory
 //   * be multi-shard aware (split.* keys)
-//   * carry an architecture guard: general.architecture == "qwen4exp" and the compiled-in constants
-//     must match, refusing with a precise error otherwise
+//   * keep the engine architecture guard (qwen4exp) precise, with separate metadata/tensor
+//     contract checks available to diagnostics for other explicitly named artifacts
 //   * have no ggml dependency
 //
 // This file is the reader plus a `--check` mode that validates it the way the Python one is
@@ -31,6 +31,7 @@
 #include <set>
 #include <stdexcept>
 #include <algorithm>
+#include <cmath>
 
 #include "strata/artifact/gguf_split.hpp"
 
@@ -209,6 +210,10 @@ inline bool block_geometry(uint32_t t, int& elems, int& bytes) {
     case 24:   // I8: raw bytes (the FP8 PLE table of tools/ple_fp8_pack.py)
         elems = 1;
         bytes = 1;
+        return true;
+    case 39:   // MXFP4: 32 E2M1 values plus one E8M0 scale byte (pinned ggml block_mxfp4)
+        elems = 32;
+        bytes = 17;
         return true;
     case 42:
         elems = 64;
@@ -601,6 +606,111 @@ inline std::string check_architecture(const GgufFile& g, const Qwen4ExpGuard& wa
             return std::string(r.key) + " = " + std::to_string(v->u) + ", expected " + std::to_string(r.want);
     }
     return {}; // empty == ok
+}
+
+// A metadata-only admission gate for the GPT-OSS-120B port. This deliberately does not
+// make the Qwen engine accept another architecture; it records the exact graph geometry
+// the first GPT-OSS block adapter is expected to support.
+inline std::string check_gpt_oss_120b_architecture(const GgufFile& g) {
+    const MetaValue* arch = g.get("general.architecture");
+    if (!arch) return "missing general.architecture";
+    if (arch->s != "gpt-oss") return "architecture is '" + arch->s + "', expected 'gpt-oss'";
+
+    struct NumericReq { const char* key; double expected; };
+    const NumericReq reqs[] = {
+        {"gpt-oss.block_count", 36},
+        {"gpt-oss.context_length", 131072},
+        {"gpt-oss.embedding_length", 2880},
+        {"gpt-oss.feed_forward_length", 2880},
+        {"gpt-oss.attention.head_count", 64},
+        {"gpt-oss.attention.head_count_kv", 8},
+        {"gpt-oss.rope.scaling.factor", 32},
+        {"gpt-oss.rope.scaling.original_context_length", 4096},
+        {"gpt-oss.rope.freq_base", 150000},
+        {"gpt-oss.attention.layer_norm_rms_epsilon", 1.0e-5},
+        {"gpt-oss.expert_count", 128},
+        {"gpt-oss.expert_used_count", 4},
+        {"gpt-oss.attention.key_length", 64},
+        {"gpt-oss.attention.value_length", 64},
+        {"gpt-oss.attention.sliding_window", 128},
+        {"gpt-oss.expert_feed_forward_length", 2880},
+    };
+    for (const auto& req : reqs) {
+        const MetaValue* value = g.get(req.key);
+        if (!value) return std::string("missing ") + req.key;
+        if (!value->is_num()) return std::string(req.key) + " is not numeric";
+        const double tolerance = (std::max)(1.0e-9, std::abs(req.expected) * 1.0e-7);
+        if (std::abs(value->num() - req.expected) > tolerance)
+            return std::string(req.key) + " = " + std::to_string(value->num()) +
+                   ", expected " + std::to_string(req.expected);
+    }
+    const MetaValue* rope_type = g.get("gpt-oss.rope.scaling.type");
+    if (!rope_type) return "missing gpt-oss.rope.scaling.type";
+    if (rope_type->type != MetaType::STRING || rope_type->s != "yarn")
+        return "gpt-oss.rope.scaling.type is not 'yarn'";
+    return {};
+}
+
+// Exact tensor contract for the downloaded MXFP4 GGUF: keep its expert format and
+// projection orientation explicit before any Strata loader or graph consumes it.
+inline std::string check_gpt_oss_120b_tensors(const GgufFile& g) {
+    struct TensorReq {
+        const char* name;
+        uint32_t type;
+        std::vector<uint64_t> shape;
+    };
+    const TensorReq global[] = {
+        {"output.weight", 8, {2880, 201088}},
+        {"output_norm.weight", 0, {2880}},
+        {"token_embd.weight", 8, {2880, 201088}},
+    };
+    for (const auto& req : global) {
+        const TensorInfo* tensor = g.find(req.name);
+        if (!tensor) return std::string("missing tensor ") + req.name;
+        if (tensor->type != req.type)
+            return std::string(req.name) + " has type " + tensor->type_name() + ", expected " + ggml_type_name(req.type);
+        if (tensor->shape != req.shape)
+            return std::string(req.name) + " has an unexpected shape";
+        if (tensor_payload_bytes(*tensor) == 0)
+            return std::string(req.name) + " has an invalid payload geometry";
+    }
+
+    const TensorReq block[] = {
+        {"attn_k.bias", 0, {512}},
+        {"attn_k.weight", 8, {2880, 512}},
+        {"attn_norm.weight", 0, {2880}},
+        {"attn_output.bias", 0, {2880}},
+        {"attn_output.weight", 8, {4096, 2880}},
+        {"attn_q.bias", 0, {4096}},
+        {"attn_q.weight", 8, {2880, 4096}},
+        {"attn_sinks.weight", 0, {64}},
+        {"attn_v.bias", 0, {512}},
+        {"attn_v.weight", 8, {2880, 512}},
+        {"ffn_down_exps.bias", 0, {2880, 128}},
+        {"ffn_down_exps.weight", 39, {2880, 2880, 128}},
+        {"ffn_gate_exps.bias", 0, {2880, 128}},
+        {"ffn_gate_exps.weight", 39, {2880, 2880, 128}},
+        {"ffn_gate_inp.bias", 0, {128}},
+        {"ffn_gate_inp.weight", 0, {2880, 128}},
+        {"ffn_up_exps.bias", 0, {2880, 128}},
+        {"ffn_up_exps.weight", 39, {2880, 2880, 128}},
+        {"post_attention_norm.weight", 0, {2880}},
+    };
+    for (uint32_t layer = 0; layer < 36; ++layer) {
+        const std::string prefix = "blk." + std::to_string(layer) + ".";
+        for (const auto& req : block) {
+            const std::string name = prefix + req.name;
+            const TensorInfo* tensor = g.find(name);
+            if (!tensor) return "missing tensor " + name;
+            if (tensor->type != req.type)
+                return name + " has type " + tensor->type_name() + ", expected " + ggml_type_name(req.type);
+            if (tensor->shape != req.shape) return name + " has an unexpected shape";
+            if (tensor_payload_bytes(*tensor) == 0) return name + " has an invalid payload geometry";
+        }
+    }
+    if (g.tensors().size() != 687)
+        return "tensor count is " + std::to_string(g.tensors().size()) + ", expected 687";
+    return {};
 }
 
 } // namespace strata

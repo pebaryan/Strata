@@ -6,10 +6,11 @@
 #ifndef STRATA_GGUF_MAIN_DISABLED
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::printf("usage: gguf_reader <file.gguf> [--check]\n");
+        std::printf("usage: gguf_reader <file.gguf> [--check|--check-gpt-oss-120b]\n");
         return 2;
     }
     const bool check = (argc > 2 && std::string(argv[2]) == "--check");
+    const bool check_gpt_oss = (argc > 2 && std::string(argv[2]) == "--check-gpt-oss-120b");
     try {
         strata::GgufFile g(argv[1]);
         std::printf("%s\n", argv[1]);
@@ -17,14 +18,16 @@ int main(int argc, char** argv) {
                     g.tensors().size(), g.metadata().size(), (unsigned long long)g.data_start(),
                     (unsigned long long)g.file_size());
 
-        if (check) {
+        if (check || check_gpt_oss) {
             // Independent expectations, all established by earlier phases.
             size_t n_blk = 0;
             for (const auto& t : g.tensors())
                 if (t.name.rfind("blk.", 0) == 0) ++n_blk;
             std::printf("  blk.* tensors %zu   globals %zu\n", n_blk, g.tensors().size() - n_blk);
-            std::printf("  Q2_0 %llu   BF16 %llu   F32 %llu\n", (unsigned long long)g.count_type("Q2_0"),
-                        (unsigned long long)g.count_type("BF16"), (unsigned long long)g.count_type("F32"));
+            if (check) {
+                std::printf("  Q2_0 %llu   BF16 %llu   F32 %llu\n", (unsigned long long)g.count_type("Q2_0"),
+                            (unsigned long long)g.count_type("BF16"), (unsigned long long)g.count_type("F32"));
+            }
 
             // Every tensor's byte size must land inside the gap to the next tensor's offset, since
             // GGUF aligns every tensor. That is the same bracket test tools/verify_q2_0_geometry.py
@@ -54,9 +57,12 @@ int main(int argc, char** argv) {
                 if (!(nb <= end && end < nb + 32)) ++bad;
             }
             std::printf("  geometry bracket: %zu out of range, %zu types unknown\n", bad, unknown);
-            const std::string err = strata::check_architecture(g);
+            std::string err = check_gpt_oss ? strata::check_gpt_oss_120b_architecture(g)
+                                            : strata::check_architecture(g);
+            if (check_gpt_oss && err.empty()) err = strata::check_gpt_oss_120b_tensors(g);
             std::printf("  architecture guard: %s\n", err.empty() ? "PASS" : ("FAIL - " + err).c_str());
             if (bad) return 1;
+            if (check_gpt_oss && !err.empty()) return 1;
         }
         return 0;
     } catch (const std::exception& e) {

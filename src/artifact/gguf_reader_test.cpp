@@ -60,6 +60,34 @@ std::filesystem::path write_gguf(const std::vector<std::string>& names) {
 int main() {
     std::printf("gguf_reader_test\n");
     {
+        int elems = 0, bytes = 0;
+        strata::TensorInfo tensor;
+        tensor.name = "blk.0.ffn_gate_exps.weight";
+        tensor.shape = {64, 3};
+        tensor.type = 39;
+        check(strata::ggml_type_name(39) == std::string("MXFP4"), "GGUF type 39 is named MXFP4");
+        check(strata::block_geometry(39, elems, bytes) && elems == 32 && bytes == 17,
+              "MXFP4 uses 32 values in a 17-byte block");
+        check(strata::tensor_payload_bytes(tensor) == 102,
+              "MXFP4 tensor byte count uses the pinned block geometry");
+        tensor.shape[0] = 63;
+        check(strata::tensor_payload_bytes(tensor) == 0,
+              "MXFP4 tensor rejects rows that are not whole blocks");
+    }
+    {
+        const auto path = write_gguf({"weight"});
+        std::string err;
+        try {
+            strata::GgufFile g(path.string());
+            err = strata::check_gpt_oss_120b_architecture(g);
+        } catch (const std::exception& e) {
+            err = e.what();
+        }
+        std::filesystem::remove(path);
+        check(err == "missing general.architecture",
+              "GPT-OSS-120B metadata gate refuses a GGUF without an architecture");
+    }
+    {
         const auto path = write_gguf({"blk.0.attn_q.weight", "blk.0.attn_k.weight"});
         std::string err;
         size_t n = 0;
