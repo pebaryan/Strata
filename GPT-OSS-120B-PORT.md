@@ -142,8 +142,15 @@ the pinned llama.cpp C API for model loading, chat formatting, tokenization, gra
 construction, sampling, and execution; it adds no model kernels. With the same
 model, 20-token formatted prompt, greedy sampling, context 512, microbatch 128,
 and 17 GPU layers split 42:58, the runner and upstream CLI in `--no-jinja` mode
-emitted the same 32 special-token pieces. The runner logged all generated token
-IDs. The default Jinja CLI mode is not a parity target for this C API harness,
+were previously reported to emit the same 32 special-token pieces. A controlled
+rerun with the same 20-token chat prefix, context 512, microbatch 128, 17 GPU
+layers, 42:58 split, greedy sampling, and Flash Attention forced on did not
+reproduce that result: the outputs shared the reasoning prefix but diverged
+before token 32 (`One digit: "` in the runner versus `One digit only:` in the
+CLI). The runner's logged prompt IDs match the manually rendered chat string.
+Thus full-generation parity is not currently established; the earlier result is
+provisional until per-position logits and all runtime settings are compared.
+The default Jinja CLI mode is not a parity target for this C API harness,
 because it formats the assistant prefix differently.
 
 The initial MXFP4 operator parity gate now runs one real 2,880×2,880 routed-expert
